@@ -92,7 +92,7 @@ RECV_TIMEOUT = 5
 CHAIN_CONFIGS = {
     "robinhood": {
         "stream_chain_name": "robinhood",
-        "rpc_url": f"https://robinhood-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY_ROBINHOOD}",
+        "rpc_url": f"https://eth-mainnet.g.alchemy.com/v2/alch_kqboG3bQKj5DYmfxcvUGH}",
         "max_gas_fee_usd": float(os.environ.get("ADVANCED_MAX_GAS_USD_ROBINHOOD", "0.05")),
     },
     "ethereum": {
