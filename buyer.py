@@ -119,6 +119,7 @@ class MintResult:
     detail: str | None = None
     rpc: str | None = None
     target: str | None = None
+    quantity_used: int | None = None
 
 
 class OpenSeaClient:
@@ -139,7 +140,7 @@ class OpenSeaClient:
                 "X-API-KEY": self.api_key,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "OpenSea-Mint-Guardian/3.0",
+                "User-Agent": "OpenSea-Mint-Guardian/4.2",
             })
             self._local.session = session
         return session
@@ -157,10 +158,18 @@ class OpenSeaClient:
     def get_chains(self) -> dict[str, Any]:
         return self._request("GET", "/chains")
 
-    def get_drops(self, drop_type: str, chain: str | None, limit: int = 20) -> dict[str, Any]:
+    def get_drops(
+        self,
+        drop_type: str,
+        chain: str | None,
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
         params: dict[str, Any] = {"type": drop_type, "limit": max(1, min(limit, 100))}
         if chain:
             params["chains"] = chain
+        if cursor:
+            params["cursor"] = cursor
         return self._request("GET", "/drops", params=params)
 
     def get_drop(self, slug: str) -> dict[str, Any]:
@@ -387,6 +396,50 @@ def _http_status(exc: requests.HTTPError) -> int | None:
     return exc.response.status_code if exc.response is not None else None
 
 
+def _build_mint_best_quantity(
+    opensea: OpenSeaClient,
+    slug: str,
+    address: str,
+    desired_quantity: int,
+) -> tuple[dict[str, Any], int]:
+    """Build mint data using the highest quantity OpenSea accepts.
+
+    If the requested quantity is above a per-wallet or remaining-supply limit,
+    OpenSea returns HTTP 422. We first probe quantity=1 to distinguish a real
+    eligibility failure from a quantity-limit failure, then binary-search the
+    highest accepted quantity. This keeps API calls logarithmic instead of
+    trying every quantity one by one.
+    """
+    desired = max(1, min(int(desired_quantity), 100))
+    try:
+        return opensea.build_mint(slug, address, desired), desired
+    except requests.HTTPError as original:
+        if _http_status(original) != 422 or desired <= 1:
+            raise
+
+        # If even one token is rejected, the wallet/stage itself is not mintable.
+        try:
+            best_payload = opensea.build_mint(slug, address, 1)
+        except requests.HTTPError:
+            raise original
+
+        best = 1
+        low, high = 2, desired - 1
+        while low <= high:
+            mid = (low + high) // 2
+            try:
+                payload = opensea.build_mint(slug, address, mid)
+                best = mid
+                best_payload = payload
+                low = mid + 1
+            except requests.HTTPError as exc:
+                if _http_status(exc) == 422:
+                    high = mid - 1
+                    continue
+                raise
+        return best_payload, best
+
+
 def check_eligibility(opensea: OpenSeaClient, slug: str, wallet: WalletConfig, quantity: int) -> EligibilityResult:
     """Preflight through OpenSea. Does not sign or broadcast anything."""
     try:
@@ -434,8 +487,9 @@ def mint_drop(
     address = Web3.to_checksum_address(account.address)
     w3 = rpc_pool.primary
 
+    requested_quantity = max(1, min(int(quantity), 100))
     try:
-        mint_payload = opensea.build_mint(slug, address, quantity)
+        mint_payload, quantity_used = _build_mint_best_quantity(opensea, slug, address, requested_quantity)
         target, calldata, value = normalize_mint_tx(mint_payload)
     except requests.HTTPError as exc:
         code = _http_status(exc)
@@ -450,8 +504,14 @@ def mint_drop(
         return MintResult(False, "bad_mint_payload", detail=str(exc))
 
     mint_value_native = Decimal(value) / Decimal(10**18)
-    # V4: paid mints require an explicit per-watch wallet selection.
-    # Free mints are never blocked by this flag.
+    # Paid policy is checked before wallet-selection logic. This is important
+    # for V4.2 auto-discovery, which is strictly free-only and must never open
+    # a paid-selection flow. Manual watches with allow_paid=True still require
+    # explicit wallet selection before any paid transaction is signed.
+    if value > 0 and not allow_paid:
+        return MintResult(False, "paid_not_allowed", mint_value_native=mint_value_native, target=target,
+                          detail=f"Paid mint refused by policy: {mint_value_native} {native_symbol(rpc_pool.chain)}",
+                          quantity_used=quantity_used)
     if value > 0 and not paid_wallet_allowed:
         return MintResult(
             False,
@@ -459,16 +519,15 @@ def mint_drop(
             mint_value_native=mint_value_native,
             target=target,
             detail=f"Paid mint requires wallet selection: {mint_value_native} {native_symbol(rpc_pool.chain)}",
+            quantity_used=quantity_used,
         )
-    if value > 0 and not allow_paid:
-        return MintResult(False, "paid_not_allowed", mint_value_native=mint_value_native, target=target,
-                          detail=f"Paid mint refused by policy: {mint_value_native} {native_symbol(rpc_pool.chain)}")
     if max_mint_price_native > 0 and mint_value_native > max_mint_price_native:
         return MintResult(False, "mint_price_too_high", mint_value_native=mint_value_native, target=target,
-                          detail=f"Mint price {mint_value_native} > cap {max_mint_price_native}")
+                          detail=f"Mint price {mint_value_native} > cap {max_mint_price_native}",
+                          quantity_used=quantity_used)
     if allowed_targets and target.lower() not in allowed_targets:
         return MintResult(False, "target_not_allowed", mint_value_native=mint_value_native, target=target,
-                          detail=f"Refused target contract {target}")
+                          detail=f"Refused target contract {target}", quantity_used=quantity_used)
 
     try:
         nonce = int(w3.eth.get_transaction_count(address, "pending"))
@@ -496,28 +555,33 @@ def mint_drop(
                 return MintResult(False, "gas_price_unavailable", mint_value_native=mint_value_native,
                                   gas_cost_native=gas_cost_native, gas_cost_usd=None,
                                   total_max_native=total_max_native, target=target,
-                                  detail="USD gas budget is enabled but native/USD price is unavailable")
+                                  detail="USD gas budget is enabled but native/USD price is unavailable",
+                                  quantity_used=quantity_used)
             if gas_cost_usd > max_gas_usd:
                 return MintResult(False, "gas_usd_too_high", mint_value_native=mint_value_native,
                                   gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd,
                                   total_max_native=total_max_native, target=target,
-                                  detail=f"Estimated max gas ${gas_cost_usd:.6f} > USD cap ${max_gas_usd}")
+                                  detail=f"Estimated max gas ${gas_cost_usd:.6f} > USD cap ${max_gas_usd}",
+                                  quantity_used=quantity_used)
 
         if max_gas_native > 0 and gas_cost_native > max_gas_native:
             return MintResult(False, "gas_too_high", mint_value_native=mint_value_native,
                               gas_cost_native=gas_cost_native, total_max_native=total_max_native, target=target,
-                              detail=f"Estimated max gas {gas_cost_native} > cap {max_gas_native}")
+                              detail=f"Estimated max gas {gas_cost_native} > cap {max_gas_native}",
+                              quantity_used=quantity_used)
         if max_total_native > 0 and total_max_native > max_total_native:
             return MintResult(False, "total_spend_too_high", mint_value_native=mint_value_native,
                               gas_cost_native=gas_cost_native, total_max_native=total_max_native, target=target,
-                              detail=f"Estimated total max {total_max_native} > cap {max_total_native}")
+                              detail=f"Estimated total max {total_max_native} > cap {max_total_native}",
+                              quantity_used=quantity_used)
 
         balance = int(w3.eth.get_balance(address))
         needed = gas_cost_wei + value
         if balance < needed:
             return MintResult(False, "insufficient_balance", mint_value_native=mint_value_native,
                               gas_cost_native=gas_cost_native, total_max_native=total_max_native, target=target,
-                              detail=f"Wallet balance {balance} wei < estimated requirement {needed} wei")
+                              detail=f"Wallet balance {balance} wei < estimated requirement {needed} wei",
+                              quantity_used=quantity_used)
 
         tx = {**base_tx, "gas": gas_limit, **fees}
         signed = account.sign_transaction(tx)
@@ -533,6 +597,9 @@ def mint_drop(
             total_max_native=total_max_native,
             rpc=rpc_url,
             target=target,
+            quantity_used=quantity_used,
+            detail=(f"Quantity adjusted from {requested_quantity} to {quantity_used}." if quantity_used != requested_quantity else None),
         )
     except Exception as exc:
-        return MintResult(False, "rpc_or_tx_error", mint_value_native=mint_value_native, target=target, detail=str(exc))
+        return MintResult(False, "rpc_or_tx_error", mint_value_native=mint_value_native, target=target, detail=str(exc),
+                          quantity_used=locals().get("quantity_used"))

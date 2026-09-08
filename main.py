@@ -211,6 +211,94 @@ def stage_has_paid_price(stage: dict[str, Any]) -> bool:
     return False
 
 
+def _numeric_value(value: Any) -> Decimal | None:
+    if value is None or value is False:
+        return None
+    if isinstance(value, dict):
+        for key in ("value", "raw", "wei", "amount", "price", "mintPrice", "mint_price"):
+            if key in value:
+                parsed = _numeric_value(value.get(key))
+                if parsed is not None:
+                    return parsed
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            return Decimal(str(value))
+        except Exception:
+            return None
+    if isinstance(value, str):
+        match = re.search(r"-?\d+(?:\.\d+)?", value.replace(",", ""))
+        if not match:
+            return None
+        try:
+            return Decimal(match.group(0))
+        except Exception:
+            return None
+    return None
+
+
+def stage_is_explicitly_free(stage: dict[str, Any]) -> bool:
+    """Return True only when the stage exposes a numeric zero price.
+
+    Auto discovery is deliberately fail-closed: an unknown/missing price is
+    never treated as free. The final mint builder still independently refuses
+    any transaction whose value is greater than zero.
+    """
+    for key in ("price", "mintPrice", "mint_price"):
+        if key in stage:
+            value = _numeric_value(stage.get(key))
+            return value is not None and value == 0
+    return False
+
+
+def stage_is_active(stage: dict[str, Any], now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    start = stage_start(stage)
+    end = stage_end(stage)
+    return (start is None or start <= now) and (end is None or end > now)
+
+
+def active_free_wallet_limit(drop: dict[str, Any]) -> int | None:
+    limits = [
+        limit for stage in get_stages(drop)
+        if stage_is_active(stage) and stage_is_explicitly_free(stage)
+        for limit in [max_per_wallet(stage)] if limit
+    ]
+    return max(limits) if limits else None
+
+
+def has_active_free_stage(drop: dict[str, Any]) -> bool:
+    return any(stage_is_active(stage) and stage_is_explicitly_free(stage) for stage in get_stages(drop))
+
+
+def _first_int(payload: dict[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        value = payload.get(key)
+        try:
+            if value is not None:
+                return int(value)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def remaining_supply(drop: dict[str, Any]) -> int | None:
+    maximum = _first_int(drop, "maxSupply", "max_supply")
+    total = _first_int(drop, "totalSupply", "total_supply", "minted", "mintedSupply", "minted_supply")
+    if maximum is None or total is None:
+        return None
+    return max(0, maximum - total)
+
+
+def pagination_cursor(payload: dict[str, Any]) -> str | None:
+    for key in ("next", "next_cursor", "nextCursor", "cursor"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    data = payload.get("data")
+    return pagination_cursor(data) if isinstance(data, dict) else None
+
+
 def chain_label(chain: str) -> str:
     return {
         "ethereum": "إيثيريوم",
@@ -410,6 +498,9 @@ class Candidate:
     paid_selection_confirmed: bool = False
     paid_wallet_addresses: set[str] = field(default_factory=set)
     paid_selection_notified: bool = False
+    auto_discovered: bool = False
+    last_seen_auto: float = 0.0
+    remaining_supply: int | None = None
 
     def submitted_count(self) -> int:
         return sum(1 for s in self.wallets.values() if s.submitted)
@@ -605,6 +696,20 @@ class Bot:
         self.receipt_check_seconds = max(2.0, env_float("RECEIPT_CHECK_SECONDS", 5.0))
         self.max_parallel_wallets = max(1, env_int("MAX_PARALLEL_WALLETS", 10))
         self.drop_limit = max(1, min(env_int("DROP_LIMIT", 25), 100))
+
+        # V4.2 automatic free-mint discovery. The list scan itself runs every
+        # 15 seconds by default; manual links remain persistent watches.
+        self.auto_free_enabled = env_bool("AUTO_FREE_MINTS", True)
+        self.auto_free_scan_seconds = max(5.0, env_float("AUTO_FREE_SCAN_SECONDS", 15.0))
+        self.auto_free_drop_limit = max(1, min(env_int("AUTO_FREE_DROP_LIMIT", 100), 100))
+        self.auto_free_initial_pages = max(1, min(env_int("AUTO_FREE_INITIAL_PAGES", 3), 10))
+        self.auto_free_detail_workers = max(1, min(env_int("AUTO_FREE_DETAIL_WORKERS", 8), 20))
+        self.auto_free_notify_discovery = env_bool("AUTO_FREE_NOTIFY_DISCOVERY", False)
+        self.auto_free_candidate_ttl = max(30.0, env_float("AUTO_FREE_CANDIDATE_TTL", 90.0))
+        configured_types = csv_values(os.getenv("AUTO_FREE_DROP_TYPES", "recently_minted,featured,upcoming"))
+        self.auto_free_drop_types = [x for x in configured_types if x in {"recently_minted", "featured", "upcoming"}] or ["recently_minted", "featured", "upcoming"]
+        self.auto_discovery_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.auto_discovery_thread: threading.Thread | None = None
         self.paused = env_bool("START_PAUSED", False)
 
         self.wallets: list[WalletConfig] = []
@@ -668,6 +773,13 @@ class Bot:
                 qty = candidate.quantity_override or wallet.quantity or self.quantity_default
                 if candidate.wallet_limit:
                     qty = min(qty, candidate.wallet_limit)
+                if candidate.remaining_supply is not None and candidate.remaining_supply > 0:
+                    qty = min(qty, candidate.remaining_supply)
+                if candidate.auto_discovered and key not in candidate.wallets:
+                    latest = self.store.latest_mint_status(candidate.slug, wallet.address)
+                    if latest in {"submitted", "confirmed"}:
+                        # Never auto-mint the same drop twice after a restart.
+                        continue
                 if key in candidate.wallets:
                     # Keep candidate state in sync after rename/quantity changes.
                     state = candidate.wallets[key]
@@ -857,6 +969,7 @@ class Bot:
         allow_paid: bool,
         max_mint_price_native: Decimal,
         quantity_override: int | None = None,
+        auto_discovered: bool = False,
     ) -> tuple[bool, str, Candidate | None]:
         chain = self.detect_chain(slug, drop, chain_hint)
         if not chain:
@@ -873,18 +986,36 @@ class Bot:
             candidate = Candidate(
                 slug=slug, chain=chain, source=source, allow_paid=allow_paid,
                 max_mint_price_native=max_mint_price_native, quantity_override=quantity_override,
+                auto_discovered=auto_discovered,
+                last_seen_auto=time.time() if auto_discovered else 0.0,
             )
             self.candidates[key] = candidate
-        candidate.source = source
-        candidate.allow_paid = allow_paid
-        candidate.max_mint_price_native = max_mint_price_native
-        candidate.quantity_override = quantity_override
+        elif auto_discovered and not candidate.auto_discovered:
+            # A manually watched project keeps its manual policy/source.
+            candidate.last_seen_auto = time.time()
+        else:
+            candidate.source = source
+            candidate.allow_paid = allow_paid
+            candidate.max_mint_price_native = max_mint_price_native
+            candidate.quantity_override = quantity_override
+            if not auto_discovered:
+                # Sending a link manually promotes a previously auto-discovered
+                # candidate into a persistent/manual watch.
+                candidate.auto_discovered = False
+        if auto_discovered and candidate.auto_discovered:
+            candidate.last_seen_auto = time.time()
         candidate.stage_lines = lines
         candidate.public_start = public_start
         candidate.next_stage_start = next_start
-        candidate.wallet_limit = wallet_limit
+        # For auto-free we can safely use the active free stage limit. Manual
+        # watches may have several stages with different limits, so do not cap
+        # them using a limit from the wrong stage; buyer.py will probe OpenSea
+        # and find the highest quantity actually accepted for that wallet.
+        candidate.wallet_limit = active_free_wallet_limit(drop) if candidate.auto_discovered else None
+        candidate.remaining_supply = remaining_supply(drop)
         candidate.has_paid_stage = has_paid_stage
-        candidate.paid_detected = candidate.paid_detected or has_paid_stage
+        if not candidate.auto_discovered:
+            candidate.paid_detected = candidate.paid_detected or has_paid_stage
         candidate.next_refresh = time.time() + self._refresh_interval(candidate)
         self.sync_wallets_into_candidates()
 
@@ -977,6 +1108,10 @@ class Bot:
                 log.warning("Could not restore watch %s: %s", slug, exc)
 
     def refresh_candidate(self, candidate: Candidate) -> None:
+        # Auto-free candidates are refreshed by the dedicated 15-second
+        # discovery worker. Avoid extra 3-second GET /drops/{slug} calls.
+        if candidate.auto_discovered:
+            return
         if time.time() < candidate.next_refresh:
             return
         try:
@@ -990,6 +1125,141 @@ class Bot:
         except Exception as exc:
             log.debug("Refresh %s failed: %s", candidate.slug, exc)
             candidate.next_refresh = time.time() + self.fast_stage_refresh_seconds
+
+    # ---------- automatic free-mint discovery ----------
+    def _auto_free_scan_once(self, deep: bool = False) -> None:
+        if not self.auto_free_enabled:
+            return
+        chain_query = ",".join(opensea_chain_name(c) for c in self.enabled_chains)
+        slugs: dict[str, str | None] = {}
+        pages = self.auto_free_initial_pages if deep else 1
+
+        for drop_type in self.auto_free_drop_types:
+            cursor: str | None = None
+            for _page in range(pages):
+                if STOP:
+                    return
+                try:
+                    payload = self.opensea.get_drops(
+                        drop_type, chain_query, self.auto_free_drop_limit, cursor=cursor
+                    )
+                except Exception as exc:
+                    log.debug("Auto-free list scan failed type=%s: %s", drop_type, exc)
+                    break
+                for item in find_list(payload, "drops", "results", "items"):
+                    slug = get_slug(item)
+                    if not slug:
+                        continue
+                    hints = [c for c in extract_known_chains(item) if c in self.enabled_chains]
+                    slugs.setdefault(slug, hints[0] if hints else None)
+                cursor = pagination_cursor(payload)
+                if not cursor:
+                    break
+
+        if not slugs:
+            return
+
+        def fetch(item: tuple[str, str | None]):
+            slug, hint = item
+            try:
+                drop = self.opensea.get_drop(slug)
+                remain = remaining_supply(drop)
+                is_free = has_active_free_stage(drop) and not (remain is not None and remain <= 0)
+                hints = [c for c in extract_known_chains(drop) if c in self.enabled_chains]
+                chain_hint = hints[0] if hints else hint
+                return {"slug": slug, "drop": drop, "chain_hint": chain_hint, "active_free": is_free}
+            except Exception as exc:
+                log.debug("Auto-free detail scan failed %s: %s", slug, exc)
+                return None
+
+        workers = min(self.auto_free_detail_workers, len(slugs))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(fetch, item) for item in slugs.items()]
+            for future in as_completed(futures):
+                found = future.result()
+                if found is not None:
+                    self.auto_discovery_queue.put(found)
+
+    def _auto_free_worker(self) -> None:
+        deep = True
+        while not STOP:
+            started = time.time()
+            try:
+                self._auto_free_scan_once(deep=deep)
+            except Exception:
+                log.exception("Auto-free discovery scan failed")
+            deep = False
+            sleep_for = max(0.25, self.auto_free_scan_seconds - (time.time() - started))
+            deadline = time.time() + sleep_for
+            while not STOP and time.time() < deadline:
+                time.sleep(min(0.5, deadline - time.time()))
+
+    def start_auto_free_discovery(self) -> None:
+        if not self.auto_free_enabled or self.auto_discovery_thread is not None:
+            return
+        self.auto_discovery_thread = threading.Thread(
+            target=self._auto_free_worker,
+            name="auto-free-discovery",
+            daemon=True,
+        )
+        self.auto_discovery_thread.start()
+        log.info("Auto Free Mint enabled | scan every %.1fs | types=%s | limit=%s",
+                 self.auto_free_scan_seconds, ",".join(self.auto_free_drop_types), self.auto_free_drop_limit)
+
+    def drain_auto_discovery(self) -> None:
+        while True:
+            try:
+                item = self.auto_discovery_queue.get_nowait()
+            except queue.Empty:
+                break
+            slug = str(item["slug"])
+            drop = item["drop"]
+            hint = item.get("chain_hint")
+            active_free = bool(item.get("active_free", True))
+            # If this is already a manual watch, the manual candidate already
+            # attempts any free stage automatically; do not change its policy.
+            existing = next((c for c in self.candidates.values() if c.slug.lower() == slug.lower()), None)
+            if existing and not existing.auto_discovered:
+                existing.last_seen_auto = time.time()
+                continue
+            if not active_free:
+                if existing and existing.auto_discovered:
+                    has_pending = any(st.submitted and not st.confirmed and not st.final for st in existing.wallets.values())
+                    if not has_pending:
+                        self.candidates.pop(f"{existing.chain}:{existing.slug}", None)
+                continue
+
+            before = existing is not None
+            ok, _message, candidate = self.register_drop(
+                slug, drop, hint, "auto-free",
+                allow_paid=False,
+                max_mint_price_native=Decimal("0"),
+                auto_discovered=True,
+            )
+            if not ok or not candidate:
+                continue
+            candidate.last_seen_auto = time.time()
+            if not before and self.auto_free_notify_discovery:
+                self.notify_all(
+                    f"🆓 تم اكتشاف Free Mint تلقائيًا\n"
+                    f"المشروع: {candidate.slug}\n"
+                    f"الشبكة: {chain_label(candidate.chain)}\n"
+                    f"المحافظ النشطة: {len(candidate.wallets)}\n"
+                    f"الحد المكتشف/المحفظة: {candidate.wallet_limit or 'غير محدد'}\n"
+                    f"المتبقي من المعروض: {candidate.remaining_supply if candidate.remaining_supply is not None else 'غير معروف'}\n"
+                    "سيحاول البوت التنفيذ تلقائيًا ضمن حد رسوم الغاز المضبوط."
+                )
+
+    def cleanup_auto_candidates(self) -> None:
+        now = time.time()
+        for key, candidate in list(self.candidates.items()):
+            if not candidate.auto_discovered:
+                continue
+            has_pending_receipt = any(s.submitted and not s.confirmed and not s.final for s in candidate.wallets.values())
+            if has_pending_receipt:
+                continue
+            if candidate.last_seen_auto and now - candidate.last_seen_auto > self.auto_free_candidate_ttl:
+                self.candidates.pop(key, None)
 
     # ---------- eligibility + mint execution ----------
     def eligibility_matrix(self, candidate: Candidate) -> str:
@@ -1033,6 +1303,15 @@ class Bot:
         state.last_notified_status = status
         if status in {"not_mintable_yet", "not_active_yet", "paid_wallet_selection_required"}:
             return
+        # Auto discovery can evaluate many drops every scan. Routine skips are
+        # intentionally silent to avoid flooding Telegram; successful submitted
+        # and confirmed mints are still always announced.
+        if candidate.auto_discovered and status in {
+            "precondition_failed", "rate_limited", "gas_too_high", "gas_usd_too_high",
+            "gas_price_unavailable", "mint_price_too_high", "total_spend_too_high",
+            "paid_not_allowed", "target_not_allowed"
+        }:
+            return
         labels = {
             "precondition_failed": "❌ المحفظة غير مؤهلة للمرحلة الحالية",
             "rate_limited": "⏳ OpenSea قيّدت الطلب مؤقتًا",
@@ -1058,6 +1337,8 @@ class Bot:
             )
 
     def notify_paid_selection(self, candidate: Candidate) -> None:
+        if candidate.auto_discovered:
+            return
         if candidate.paid_selection_confirmed or candidate.paid_selection_notified:
             return
         candidate.paid_selection_notified = True
@@ -1113,6 +1394,8 @@ class Bot:
                 state.last_detail = result.detail
                 if result.ok:
                     state.submitted = True
+                    if result.quantity_used:
+                        state.quantity = result.quantity_used
                     state.tx_hash = result.tx_hash
                     state.mint_value_native = result.mint_value_native
                     state.receipt_next_check = time.time() + self.receipt_check_seconds
@@ -1125,6 +1408,7 @@ class Bot:
                         tx_hash=result.tx_hash,
                         mint_value_native=str(result.mint_value_native),
                         gas_max_native=str(result.gas_cost_native),
+                        quantity=state.quantity,
                         detail=result.detail,
                     )
                     url = explorer_tx_url(candidate.chain, result.tx_hash or "")
@@ -1196,6 +1480,7 @@ class Bot:
                     status="confirmed",
                     tx_hash=state.tx_hash,
                     mint_value_native=str(state.mint_value_native) if state.mint_value_native is not None else None,
+                    quantity=state.quantity,
                 )
                 self.notify_all(
                     f"✅ تم تأكيد الـMint بنجاح\n"
@@ -1236,9 +1521,10 @@ class Bot:
         total = len(self.store.list_wallets(enabled_only=False))
         self.telegram.send(
             chat_id,
-            "🤖 OpenSea Mint Guardian V4\n\n"
-            "أرسل رابط OpenSea لأي Drop/Collection وسأراقب مراحل الـMint وموعد الفتح.\n"
-            "• المنت المجاني: لجميع المحافظ النشطة تلقائيًا.\n"
+            "🤖 OpenSea Mint Guardian V4.2\n\n"
+            f"🆓 البحث التلقائي عن Free Mint: {'مفعّل' if self.auto_free_enabled else 'متوقف'} — كل {self.auto_free_scan_seconds:g} ثانية\n"
+            "أرسل رابط OpenSea فقط عندما تريد مراقبة مشروع محدد وموعد فتح الـPublic.\n"
+            "• المنتات المجانية المكتشفة: لجميع المحافظ النشطة تلقائيًا.\n"
             "• المنت المدفوع: لن يُنفذ إلا للمحافظ التي تختارها أنت.\n\n"
             f"المحافظ: {active} نشطة من أصل {total}\n"
             f"المراقبات الحالية: {len(self.candidates)}",
@@ -1332,8 +1618,9 @@ class Bot:
                     paid = "🚫 تم اختيار تجاهل المراحل المدفوعة"
             else:
                 paid = "🆓 لا توجد مرحلة مدفوعة مكتشفة"
+            source_icon = "🤖🆓" if candidate.auto_discovered else "🎯"
             lines.append(
-                f"\n• {candidate.slug} | {chain_label(candidate.chain)}\n"
+                f"\n{source_icon} {candidate.slug} | {chain_label(candidate.chain)}\n"
                 f"Public: {format_ts(candidate.public_start, self.display_tz)}\n"
                 f"تم الإرسال: {candidate.submitted_count()}/{len(candidate.wallets)} | "
                 f"تم التأكيد: {candidate.confirmed_count()}\n"
@@ -1350,6 +1637,9 @@ class Bot:
             f"أقصى Gas: {'بدون حد' if self.max_gas_native <= 0 else self.max_gas_native}\n"
             f"أقصى إجمالي للعملية: {'بدون حد' if self.max_total_native <= 0 else self.max_total_native}\n"
             f"استراتيجية الغاز: {self.gas_strategy}\n"
+            f"سقف الغاز بالدولار: ${self.max_gas_usd}\n"
+            f"Auto Free Mint: {'مفعّل' if self.auto_free_enabled else 'متوقف'} — كل {self.auto_free_scan_seconds:g} ثانية\n"
+            f"تنبيه اكتشاف كل Free Mint: {'مفعّل' if self.auto_free_notify_discovery else 'صامت حتى التنفيذ'}\n"
             f"المحافظ المتوازية: {self.max_parallel_wallets}\n"
             f"الاستعداد قبل الفتح: {self.preopen_probe_seconds} ثانية"
         )
@@ -1915,19 +2205,27 @@ class Bot:
     # ---------- main loop ----------
     def run(self) -> None:
         start_health_server()
-        log.info("Mint Guardian V4 starting")
+        log.info("Mint Guardian V4.2 starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
-        log.info("Wallets: %s | paid=%s | gas cap=%s | mint price cap=%s", len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_mint_price_default)
+        log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
+                 len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
         if self.telegram.enabled:
             self.telegram.start()
         self.bootstrap_watches()
-        self.notify_all("🟢 OpenSea Mint Guardian V4 يعمل الآن على Railway.\nتمت استعادة المراقبات والمحافظ النشطة بنجاح.")
+        self.start_auto_free_discovery()
+        self.notify_all(
+            "🟢 OpenSea Mint Guardian V4.2 يعمل الآن على Railway.\n"
+            f"البحث التلقائي عن الـFree Mint: {'مفعّل كل ' + format(self.auto_free_scan_seconds, 'g') + ' ثانية' if self.auto_free_enabled else 'متوقف'}.\n"
+            "تمت استعادة المراقبات والمحافظ النشطة بنجاح."
+        )
         for candidate in self.candidates.values():
             if candidate.paid_detected and not candidate.paid_selection_confirmed:
                 self.notify_paid_selection(candidate)
 
         while not STOP:
             self.drain_commands()
+            self.drain_auto_discovery()
+            self.cleanup_auto_candidates()
             for candidate in list(self.candidates.values()):
                 self.refresh_candidate(candidate)
                 self.try_candidate(candidate)

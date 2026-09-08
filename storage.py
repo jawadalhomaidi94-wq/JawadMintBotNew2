@@ -98,6 +98,7 @@ class SecureStore:
                     tx_hash TEXT,
                     mint_value_native TEXT,
                     gas_max_native TEXT,
+                    quantity INTEGER,
                     detail TEXT
                 );
 
@@ -111,6 +112,8 @@ class SecureStore:
         self._ensure_column("watches", "paid_detected", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("watches", "paid_selection_confirmed", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("watches", "paid_wallets_json", "TEXT NOT NULL DEFAULT '[]'")
+        # V4.2: record the actual quantity accepted by OpenSea.
+        self._ensure_column("mint_history", "quantity", "INTEGER")
 
     def encrypt(self, private_key: str) -> bytes:
         return self.fernet.encrypt(private_key.encode("utf-8"))
@@ -339,6 +342,7 @@ class SecureStore:
         tx_hash: str | None = None,
         mint_value_native: str | None = None,
         gas_max_native: str | None = None,
+        quantity: int | None = None,
         detail: str | None = None,
     ) -> None:
         with self.lock, self.conn:
@@ -346,14 +350,33 @@ class SecureStore:
                 """
                 INSERT INTO mint_history(
                     created_at,slug,chain,wallet_name,wallet_address,status,tx_hash,
-                    mint_value_native,gas_max_native,detail
-                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    mint_value_native,gas_max_native,quantity,detail
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     time.time(), slug, chain, wallet_name, wallet_address, status, tx_hash,
-                    mint_value_native, gas_max_native, (detail or "")[:1500],
+                    mint_value_native, gas_max_native, (int(quantity) if quantity is not None else None),
+                    (detail or "")[:1500],
                 ),
             )
+
+    def latest_mint_status(self, slug: str, wallet_address: str) -> str | None:
+        """Return the latest persisted status for this drop + wallet.
+
+        Used by auto-discovery to avoid minting the same drop twice after a
+        Railway restart. A later reverted row correctly overrides an older
+        submitted row.
+        """
+        with self.lock:
+            row = self.conn.execute(
+                """
+                SELECT status FROM mint_history
+                WHERE slug=? COLLATE NOCASE AND wallet_address=? COLLATE NOCASE
+                ORDER BY created_at DESC, id DESC LIMIT 1
+                """,
+                (slug, wallet_address),
+            ).fetchone()
+        return str(row["status"]) if row else None
 
     def recent_history(self, limit: int = 15) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 100))
