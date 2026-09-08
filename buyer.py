@@ -141,7 +141,7 @@ class OpenSeaClient:
                 "X-API-KEY": self.api_key,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "OpenSea-Mint-Guardian/4.4",
+                "User-Agent": "OpenSea-Mint-Guardian/4.5",
             })
             self._local.session = session
         return session

@@ -26,7 +26,7 @@ class SecureStore:
     """SQLite persistence + Fernet encryption for wallet private keys.
 
     The DB is designed to live on a Railway Volume. Schema migrations are
-    intentionally additive so V3/V4 databases continue to work with V4.4.
+    intentionally additive so V3/V4 databases continue to work with V4.5.
     """
 
     def __init__(self, db_path: str, encryption_key: str):
@@ -705,6 +705,30 @@ class SecureStore:
                 (now, (reason or "finished")[:500], now, project_key),
             )
             return cur.rowcount > 0
+
+    def free_mint_summary(self, limit: int = 30) -> list[dict[str, Any]]:
+        """Aggregate confirmed zero-cost mints by logical project."""
+        limit = max(1, min(int(limit), 100))
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT
+                    slug, chain, contract_address,
+                    MAX(created_at) AS last_confirmed_at,
+                    COALESCE(SUM(COALESCE(quantity,0)),0) AS total_quantity,
+                    COUNT(DISTINCT wallet_address) AS wallet_count,
+                    GROUP_CONCAT(DISTINCT wallet_name) AS wallet_names
+                FROM mint_history
+                WHERE status='confirmed'
+                  AND mint_value_native IS NOT NULL
+                  AND ABS(CAST(mint_value_native AS REAL)) < 0.000000000000000001
+                GROUP BY slug COLLATE NOCASE, chain COLLATE NOCASE, COALESCE(contract_address,'') COLLATE NOCASE
+                ORDER BY last_confirmed_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def recent_history(self, limit: int = 15) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 100))

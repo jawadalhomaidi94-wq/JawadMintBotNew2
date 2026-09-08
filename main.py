@@ -781,14 +781,31 @@ class TelegramController(threading.Thread):
         self.allowed_chat_ids = set(csv_values(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS")))
         self.allow_any = env_bool("TELEGRAM_ALLOW_ANY_CHAT", False)
         self.offset = 0
-        self.session = requests.Session()
+        # Long-polling and outbound Telegram actions use separate sessions.
+        # requests.Session is not guaranteed to be thread-safe and V4.4 used
+        # the same object from the polling thread and background notification
+        # threads, which could make /start and callbacks appear unresponsive.
+        self.poll_session = requests.Session()
+        self.action_session = requests.Session()
+        self.action_lock = threading.Lock()
 
     @property
     def enabled(self) -> bool:
         return bool(self.token)
 
     def api(self, method: str, **data: Any) -> dict[str, Any]:
-        response = self.session.post(f"https://api.telegram.org/bot{self.token}/{method}", data=data, timeout=35)
+        with self.action_lock:
+            response = self.action_session.post(
+                f"https://api.telegram.org/bot{self.token}/{method}", data=data, timeout=35
+            )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
+
+    def poll(self, **data: Any) -> dict[str, Any]:
+        response = self.poll_session.post(
+            f"https://api.telegram.org/bot{self.token}/getUpdates", data=data, timeout=35
+        )
         response.raise_for_status()
         payload = response.json()
         return payload if isinstance(payload, dict) else {}
@@ -808,7 +825,8 @@ class TelegramController(threading.Thread):
         try:
             self.api("sendMessage", **data)
         except Exception as exc:
-            log.debug("Telegram send failed: %s", exc)
+            detail = getattr(getattr(exc, "response", None), "text", "") or str(exc)
+            log.warning("Telegram send failed: %s", detail[:500])
 
     def edit(self, chat_id: str | int, message_id: int, text: str, buttons: list[list[tuple[str, str]]] | None = None) -> None:
         data: dict[str, Any] = {
@@ -823,9 +841,12 @@ class TelegramController(threading.Thread):
             })
         try:
             self.api("editMessageText", **data)
-        except Exception:
-            # Editing can fail if Telegram sees no content change; this is harmless.
-            pass
+        except Exception as exc:
+            detail = getattr(getattr(exc, "response", None), "text", "") or str(exc)
+            if "message is not modified" in detail.lower():
+                return
+            log.warning("Telegram edit failed; sending a fresh message instead: %s", detail[:500])
+            self.send(chat_id, text, buttons)
 
     def answer_callback(self, callback_id: str, text: str = "") -> None:
         try:
@@ -843,6 +864,16 @@ class TelegramController(threading.Thread):
         return self.allow_any or chat_id in self.allowed_chat_ids
 
     def setup_commands(self) -> None:
+        # Force long-polling mode and discard stale callbacks from older
+        # deployments. This prevents a leftover webhook/backlog from blocking
+        # /start or the inline menu after a Railway redeploy.
+        try:
+            self.api("deleteWebhook", drop_pending_updates="true")
+            me = self.api("getMe")
+            username = ((me.get("result") or {}).get("username") or "unknown") if isinstance(me, dict) else "unknown"
+            log.info("Telegram polling ready | bot=@%s", username)
+        except Exception as exc:
+            log.warning("Telegram initialization warning: %s", exc)
         commands = [
             {"command": "start", "description": "فتح القائمة الرئيسية"},
             {"command": "wallets", "description": "عرض وإدارة المحافظ"},
@@ -851,6 +882,8 @@ class TelegramController(threading.Thread):
             {"command": "watch", "description": "إضافة رابط منت للمراقبة"},
             {"command": "eligibility", "description": "فحص أهلية رابط للمحافظ النشطة"},
             {"command": "chains", "description": "حالة الشبكات والـRPC"},
+            {"command": "free", "description": "المنتات المجانية التي تم أخذها"},
+            {"command": "paid", "description": "المنتات المدفوعة المحفوظة"},
             {"command": "history", "description": "سجل عمليات الـMint"},
             {"command": "pause", "description": "إيقاف تنفيذ المعاملات مع استمرار المراقبة"},
             {"command": "resume", "description": "استئناف تنفيذ المعاملات"},
@@ -865,8 +898,7 @@ class TelegramController(threading.Thread):
         self.setup_commands()
         while not STOP:
             try:
-                payload = self.api(
-                    "getUpdates",
+                payload = self.poll(
                     offset=self.offset,
                     timeout=25,
                     allowed_updates='["message","callback_query"]',
@@ -882,6 +914,7 @@ class TelegramController(threading.Thread):
                         chat_id = str(chat.get("id", ""))
                         if not chat_id or not self.authorized(chat_id):
                             continue
+                        log.info("Telegram callback received | chat_id=%s | data=%s", chat_id, str(cb.get("data", ""))[:80])
                         self.bot.command_queue.put({
                             "type": "callback",
                             "chat_id": chat_id,
@@ -901,6 +934,13 @@ class TelegramController(threading.Thread):
                     if not self.authorized(chat_id):
                         self.send(chat_id, f"⛔ هذه المحادثة غير مصرح لها بالتحكم في البوت.\nمعرّف المحادثة: {chat_id}")
                         continue
+                    normalized_command = text.split()[0].lower().split("@", 1)[0] if text.split() else ""
+                    if normalized_command in {"/start", "/menu", "/help"}:
+                        log.info("Telegram %s received | chat_id=%s", normalized_command, chat_id)
+                        # Serve the main menu directly from the polling thread so
+                        # heavy mint/stage work cannot starve /start.
+                        self.bot.send_menu(chat_id)
+                        continue
                     self.bot.command_queue.put({
                         "type": "message",
                         "chat_id": chat_id,
@@ -909,7 +949,7 @@ class TelegramController(threading.Thread):
                         "text": text,
                     })
             except Exception as exc:
-                log.debug("Telegram polling error: %s", exc)
+                log.warning("Telegram polling error: %s", exc)
                 time.sleep(2)
 
 
@@ -2431,40 +2471,36 @@ class Bot:
         return min(candidates, key=lambda p: float(p.get("start") or now))
 
     def maybe_offer_paid_public(self, candidate: Candidate) -> None:
+        """Register a paid Public stage silently.
+
+        V4.5 intentionally does not push paid-mint prompts to Telegram. Paid
+        projects are saved and shown only when the user opens the dedicated
+        ``💳 المنتات المدفوعة`` section.
+        """
         plan = self.find_paid_public_plan(candidate)
         if not plan:
             return
         stage_key = str(plan.get("key") or "")
-        # A saved decision is stage-specific. A later paid public stage gets a
-        # fresh prompt rather than inheriting an old approval.
-        if candidate.paid_stage_key == stage_key and candidate.paid_decision in {"confirmed", "declined"}:
-            return
-        if candidate.paid_offer_notified_stage_key == stage_key:
-            return
+        previous_stage_key = candidate.paid_stage_key
         candidate.paid_detected = True
         candidate.paid_stage_key = stage_key
         candidate.paid_stage_start = float(plan["start"]) if plan.get("start") is not None else None
-        candidate.paid_decision = "pending"
-        candidate.paid_offer_notified_stage_key = stage_key
+        if previous_stage_key and previous_stage_key != stage_key:
+            # Approval is stage-specific: never reuse an old paid approval on a
+            # new price/time stage. The user must confirm the new stage again.
+            candidate.paid_decision = "pending"
+            candidate.paid_selection_confirmed = False
+            candidate.paid_wallet_addresses.clear()
+            candidate.paid_wallet_quantities.clear()
+        elif not candidate.paid_decision:
+            candidate.paid_decision = "pending"
         candidate.watch_kind = "auto_stage" if candidate.auto_discovered else candidate.watch_kind
         self.ensure_candidate_watch_persisted(candidate)
         self.store.set_watch_paid_plan(
-            candidate.slug, {}, decision="pending", stage_key=stage_key,
-            stage_start=candidate.paid_stage_start, paid_detected=True,
+            candidate.slug, candidate.paid_wallet_quantities,
+            decision=candidate.paid_decision or "pending",
+            stage_key=stage_key, stage_start=candidate.paid_stage_start, paid_detected=True,
         )
-        text = (
-            f"💳 تم اكتشاف Public Mint مدفوع مجدول\n\n"
-            f"المشروع: {candidate.slug}\n"
-            f"الشبكة: {chain_label(candidate.chain)}\n"
-            f"المرحلة: {plan.get('label')}\n"
-            f"وقت الفتح: {format_ts(plan.get('start'), self.display_tz)}\n"
-            f"السعر المعلن: {plan.get('price','غير معروف')}\n\n"
-            "هل تريد شراءه تلقائيًا عند فتحه؟ لن يتم شراء أي شيء حتى تؤكد وتحدد المحافظ والكميات."
-        )
-        token = self.candidate_token(candidate)
-        buttons = [[("✅ نعم، إعداد الشراء", f"ppo:{token}"), ("🚫 لا أريد شراءه", f"ppn:{token}")]]
-        for chat_id in self.telegram.allowed_chat_ids:
-            self.telegram.send(chat_id, text, buttons)
 
     def process_stage_schedule(self, candidate: Candidate) -> None:
         if not candidate.stage_plans:
@@ -2621,22 +2657,15 @@ class Bot:
             )
 
     def notify_paid_selection(self, candidate: Candidate) -> None:
-        # Compatibility path for a paid mint whose stage metadata is incomplete.
-        # Scheduled paid Public stages use maybe_offer_paid_public(), which asks
-        # yes/no first and then opens this same per-wallet quantity selector.
+        """Compatibility registration for paid mints without push messages."""
         plan = self.find_paid_public_plan(candidate)
         if plan:
             self.maybe_offer_paid_public(candidate)
             return
-        if candidate.paid_selection_confirmed or candidate.paid_selection_notified:
-            return
         candidate.paid_detected = True
         candidate.paid_decision = candidate.paid_decision or "pending"
-        candidate.paid_selection_notified = True
         self.ensure_candidate_watch_persisted(candidate)
         self.persist_paid_plan(candidate, candidate.paid_decision)
-        for chat_id in self.telegram.allowed_chat_ids:
-            self.telegram.send(chat_id, self.paid_selector_text(candidate), self.paid_selector_buttons(candidate))
 
     def try_candidate(self, candidate: Candidate) -> None:
         if self.paused or candidate.done:
@@ -2893,9 +2922,9 @@ class Bot:
         return [
             [("➕ إضافة محفظة", "add_wallet"), ("👛 المحافظ", "wallets")],
             [("🎟 التأهيل", "qualification_menu"), ("👀 المراقبة", "monitoring_menu")],
-            [("🧪 فحص الأهلية", "eligibility_all"), ("💳 المنتات المدفوعة", "paid_watches")],
-            [("📜 سجل العمليات", "history"), ("🌐 الشبكات", "chains")],
-            [("⚙️ الإعدادات", "settings")],
+            [("🆓 المجانية المأخوذة", "free_mints"), ("💳 المنتات المدفوعة", "paid_watches")],
+            [("🧪 فحص الأهلية", "eligibility_all"), ("📜 سجل العمليات", "history")],
+            [("🌐 الشبكات", "chains"), ("⚙️ الإعدادات", "settings")],
             [("⏸ إيقاف التنفيذ" if not self.paused else "▶️ استئناف التنفيذ", "toggle_pause")],
         ]
 
@@ -2912,7 +2941,13 @@ class Bot:
             [("📡 المنتات تحت المراقبة", "monitoring_active")],
             [("🗄 المنتات القديمة", "monitoring_old")],
             [("➕ إضافة رابط منت", "monitoring_add")],
-            [("💳 المنتات المدفوعة", "paid_watches")],
+            [("↩️ القائمة الرئيسية", "menu")],
+        ]
+
+    def free_mints_buttons(self) -> list[list[tuple[str, str]]]:
+        return [
+            [("🔄 تحديث القائمة", "free_mints")],
+            [("📜 سجل العمليات", "history")],
             [("↩️ القائمة الرئيسية", "menu")],
         ]
 
@@ -2921,13 +2956,14 @@ class Bot:
         total = len(self.store.list_wallets(enabled_only=False))
         self.telegram.send(
             chat_id,
-            "🤖 OpenSea Mint Guardian V4.4\n\n"
+            "🤖 OpenSea Mint Guardian V4.5\n\n"
             f"🆓/🎟 الاكتشاف التلقائي: مفعّل كل {self.auto_free_scan_seconds:g} ثانية\n"
             f"⚡ الاستعداد للـPublic: آخر {self.public_preopen_window_seconds:g} ثوانٍ\n"
             f"📦 سياسة الكمية: حد المنت ≤100 يؤخذ كما هو، وإذا كان >100/غير محدود فالهدف {self.auto_stage_high_limit_quantity}\n"
             "• كل مرحلة تأهيل تُفحص للمحافظ النشطة وتُحفظ نتيجتها.\n"
             "• المرحلة المجانية تُنفذ تلقائيًا.\n"
-            "• Public المدفوع يحتاج موافقتك + المحافظ + كمية كل محفظة.\n\n"
+            "• Public المدفوع يُحفظ بصمت ولا يظهر إلا عند فتح قسم «💳 المنتات المدفوعة».\n"
+            "• لا يتم شراء المدفوع إلا بعد موافقتك + المحافظ + كمية كل محفظة.\n\n"
             f"المحافظ: {active} نشطة من أصل {total}\n"
             f"المراقبات في الذاكرة: {len(self.candidates)}",
             self.menu_buttons(),
@@ -3070,6 +3106,29 @@ class Bot:
                 f"• {label} | {row['slug']} | {row['wallet_name']}\n"
                 f"  {ts}" + (f"\n  TX: {row['tx_hash']}" if row.get("tx_hash") else "")
             )
+        return "\n".join(lines)[:3900]
+
+    def free_mints_text(self) -> str:
+        rows = self.store.free_mint_summary(30)
+        if not rows:
+            return (
+                "🆓 لا توجد Free Mints مؤكدة أخذها البوت حتى الآن.\n\n"
+                "عندما تنجح معاملة مجانية ستظهر هنا فقط بعد تأكيدها على الشبكة."
+            )
+        lines = ["🆓 المنتات المجانية التي تم أخذها", ""]
+        for row in rows:
+            names = [x.strip() for x in str(row.get("wallet_names") or "").split(",") if x.strip()]
+            if len(names) > 4:
+                wallet_text = "، ".join(names[:4]) + f" +{len(names)-4}"
+            else:
+                wallet_text = "، ".join(names) or "غير معروف"
+            lines.append(
+                f"• {row.get('slug')} | {chain_label(str(row.get('chain') or ''))}\n"
+                f"  الكمية الإجمالية: {int(row.get('total_quantity') or 0)} | المحافظ: {int(row.get('wallet_count') or 0)}\n"
+                f"  الأسماء: {wallet_text}\n"
+                f"  آخر تأكيد: {format_ts(float(row.get('last_confirmed_at') or 0), self.display_tz)}"
+            )
+        lines.append("\nهذه القائمة تعرض الـMint المجاني المؤكد فقط، ولا تعرض المحاولات أو المعاملات الفاشلة.")
         return "\n".join(lines)[:3900]
 
     def _is_timestamp_today(self, ts: float | None) -> bool:
@@ -3215,6 +3274,70 @@ class Bot:
                     return plan
         return self.find_paid_public_plan(candidate)
 
+    def paid_price_native(self, candidate: Candidate) -> Decimal | None:
+        """Best-effort per-token paid Public price in the chain native token."""
+        # For a scheduled paid stage, prefer its own announced price. Reading
+        # SeaDrop first could accidentally show the price of a currently active
+        # different Public stage.
+        plan = self.paid_plan_for_candidate(candidate)
+        if plan:
+            raw = plan.get("price")
+            numeric = _numeric_value(raw)
+            if numeric is not None and numeric >= 0:
+                text = str(raw or "").lower()
+                if "wei" in text or numeric >= Decimal("1000000000"):
+                    return numeric / Decimal(10**18)
+                return numeric
+
+        # Fallback to exact SeaDrop on-chain configuration when metadata does
+        # not expose a parseable price.
+        if candidate.contract_address:
+            pool = self.rpc_pools.get(candidate.chain)
+            if pool:
+                try:
+                    public = read_seadrop_public_drop(pool.primary, candidate.contract_address)
+                    if public and public.get("configured") and public.get("mint_price_wei") is not None:
+                        wei = Decimal(str(public.get("mint_price_wei")))
+                        if wei >= 0:
+                            return wei / Decimal(10**18)
+                except Exception:
+                    pass
+        return None
+
+    @staticmethod
+    def _fmt_decimal(value: Decimal, places: int = 8) -> str:
+        text = f"{value:.{places}f}".rstrip("0").rstrip(".")
+        return text or "0"
+
+    def paid_price_parts(self, candidate: Candidate) -> tuple[str, str]:
+        price = self.paid_price_native(candidate)
+        symbol = native_symbol(candidate.chain)
+        if price is None:
+            return f"غير معروف {symbol}", "غير متاح USDT"
+        native_text = f"{self._fmt_decimal(price, 10)} {symbol}"
+        usd = self.native_usd_price_for_chain(candidate.chain)
+        if usd is None:
+            return native_text, "غير متاح USDT"
+        # USDT display is an approximate USD-equivalent view only. The signed
+        # transaction still uses the native-token amount from the mint contract.
+        usdt_value = price * usd
+        return native_text, f"≈ {self._fmt_decimal(usdt_value, 4)} USDT"
+
+    def paid_list_line(self, candidate: Candidate) -> str:
+        plan = self.paid_plan_for_candidate(candidate)
+        native_text, usdt_text = self.paid_price_parts(candidate)
+        decision = {
+            "confirmed": "✅ شراء مؤكد",
+            "declined": "🚫 لن يتم الشراء",
+            "pending": "⏳ يحتاج إعداد/تأكيد",
+        }.get(candidate.paid_decision or "pending", "⏳ يحتاج إعداد/تأكيد")
+        open_text = format_ts(plan.get("start"), self.display_tz) if plan else format_ts(candidate.paid_stage_start, self.display_tz)
+        return (
+            f"• {candidate.slug} | {chain_label(candidate.chain)}\n"
+            f"  السعر: {native_text} | {usdt_text}\n"
+            f"  الفتح: {open_text} | {decision}"
+        )
+
     def paid_quantity_cap(self, candidate: Candidate) -> int:
         plan = self.paid_plan_for_candidate(candidate)
         limit = plan.get("wallet_limit") if plan else None
@@ -3253,14 +3376,15 @@ class Bot:
                 selected_lines.append(f"• {wallet.name}: {candidate.paid_wallet_quantities.get(address, 1)}")
         selected_text = "\n".join(selected_lines) if selected_lines else "لا توجد محافظ محددة بعد"
         plan = self.paid_plan_for_candidate(candidate)
-        price_text = str(plan.get("price")) if plan else "سيتم التحقق عند الفتح"
+        native_price, usdt_price = self.paid_price_parts(candidate)
         open_text = format_ts(plan.get("start"), self.display_tz) if plan else format_ts(candidate.paid_stage_start, self.display_tz)
         return (
             f"💳 خطة شراء Public Mint المدفوع\n\n"
             f"المشروع: {candidate.slug}\n"
             f"الشبكة: {chain_label(candidate.chain)}\n"
             f"وقت الفتح: {open_text}\n"
-            f"السعر المعلن: {price_text}\n"
+            f"السعر: {native_price}\n"
+            f"القيمة التقريبية: {usdt_price}\n"
             f"أقصى كمية اختيارية/محفظة لهذه المرحلة: {self.paid_quantity_cap(candidate)}\n\n"
             "اختر المحافظ، ثم اضغط زر الكمية بجانب كل محفظة وأدخل الكمية المطلوبة.\n"
             "لن يتم توقيع أي Mint مدفوع قبل الضغط على «🚀 تأكيد خطة الشراء».\n"
@@ -3298,10 +3422,14 @@ class Bot:
 
     def paid_watches_buttons(self) -> list[list[tuple[str, str]]]:
         rows: list[list[tuple[str, str]]] = []
+        shown = 0
         for candidate in self.candidates.values():
             if candidate.paid_detected or candidate.has_paid_stage or candidate.paid_decision:
                 icon = {"confirmed": "✅", "declined": "🚫", "pending": "⏳"}.get(candidate.paid_decision, "💳")
                 rows.append([(f"{icon} {candidate.slug}", f"pwo:{self.candidate_token(candidate)}")])
+                shown += 1
+                if shown >= 40:
+                    break
         rows.append([("↩️ المراقبة", "monitoring_menu"), ("🏠 الرئيسية", "menu")])
         return rows
 
@@ -3494,6 +3622,10 @@ class Bot:
             )
             return
 
+        if data == "free_mints":
+            self.edit_or_send(event, self.free_mints_text(), self.free_mints_buttons())
+            return
+
         if data == "chains":
             self.edit_or_send(event, self.chains_text(), self.menu_buttons())
             return
@@ -3531,11 +3663,16 @@ class Bot:
                 if c.paid_detected or c.has_paid_stage or c.paid_decision
             ]
             if paid:
-                text = (
-                    "💳 المنتات المدفوعة تحت المراقبة\n\n"
-                    "اختر مشروعًا لمراجعة الخطة أو تحديد المحافظ والكميات. "
-                    "لا يتم توقيع أي عملية مدفوعة إلا بعد تأكيد الخطة."
-                )
+                lines = [
+                    "💳 المنتات المدفوعة",
+                    "",
+                    "هذه القائمة لا تُرسل تلقائيًا؛ تظهر فقط عند فتح هذا القسم.",
+                    "اختر مشروعًا لمراجعة السعر، وقت الفتح، المحافظ والكميات.",
+                    "",
+                ]
+                for candidate in paid[:20]:
+                    lines.append(self.paid_list_line(candidate))
+                text = "\n".join(lines)[:3900]
             else:
                 text = "💳 لا توجد Public Mints مدفوعة مكتشفة/مجدولة حاليًا."
             self.edit_or_send(event, text, self.paid_watches_buttons())
@@ -3890,7 +4027,7 @@ class Bot:
             return
 
         parts = text.split()
-        command = parts[0].lower() if parts else ""
+        command = parts[0].lower().split("@", 1)[0] if parts else ""
         if command in {"/start", "/help", "/menu"} or text in {"القائمة", "الرئيسية"}:
             self.send_menu(chat_id)
             return
@@ -3905,6 +4042,18 @@ class Bot:
             return
         if command == "/chains" or text == "الشبكات":
             self.telegram.send(chat_id, self.chains_text(), self.menu_buttons())
+            return
+        if command == "/free":
+            self.telegram.send(chat_id, self.free_mints_text(), self.free_mints_buttons())
+            return
+        if command == "/paid":
+            paid = [c for c in self.candidates.values() if c.paid_detected or c.has_paid_stage or c.paid_decision]
+            if paid:
+                lines = ["💳 المنتات المدفوعة", ""] + [self.paid_list_line(c) for c in paid[:20]]
+                text_paid = "\n".join(lines)[:3900]
+            else:
+                text_paid = "💳 لا توجد Public Mints مدفوعة مكتشفة/مجدولة حاليًا."
+            self.telegram.send(chat_id, text_paid, self.paid_watches_buttons())
             return
         if command == "/history" or text == "السجل":
             self.telegram.send(chat_id, self.history_text(), self.menu_buttons())
@@ -4005,7 +4154,7 @@ class Bot:
     # ---------- main loop ----------
     def run(self) -> None:
         start_health_server()
-        log.info("Mint Guardian V4.4 starting")
+        log.info("Mint Guardian V4.5 starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
@@ -4019,7 +4168,7 @@ class Bot:
             self.public_fast_retry_seconds, self.auto_stage_high_limit_quantity,
         )
         self.notify_all(
-            "🟢 OpenSea Mint Guardian V4.4 يعمل الآن على Railway.\n"
+            "🟢 OpenSea Mint Guardian V4.5 يعمل الآن على Railway.\n"
             f"الاكتشاف التلقائي: {'مفعّل كل ' + format(self.auto_free_scan_seconds, 'g') + ' ثانية' if self.auto_free_enabled else 'متوقف'}.\n"
             f"OpenSea Stream: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} | REST Mint Events: {'مفعّل' if self.auto_event_fallback_enabled else 'متوقف'}.\n"
             f"التأهيل: إعادة فحص كل {self.qualification_recheck_seconds:g} ثانية أثناء المرحلة.\n"
@@ -4027,23 +4176,18 @@ class Bot:
             f"سياسة الكمية: الحد ≤{self.auto_stage_high_limit_threshold} كهدف؛ أعلى/غير محدود = {self.auto_stage_high_limit_quantity}.\n"
             "تمت استعادة المراقبات وخطط المدفوع والمحافظ النشطة بنجاح."
         )
-        for candidate in self.candidates.values():
-            if candidate.paid_detected or candidate.has_paid_stage or candidate.paid_decision:
-                plan = self.find_paid_public_plan(candidate)
-                if plan:
-                    candidate.paid_offer_notified_stage_key = ""
-                    self.maybe_offer_paid_public(candidate)
-                elif candidate.paid_detected and not candidate.paid_selection_confirmed:
-                    self.notify_paid_selection(candidate)
-
         while not STOP:
             self.drain_commands()
             self.drain_auto_discovery()
             self.cleanup_auto_candidates()
             for key, candidate in list(self.candidates.items()):
+                self.drain_commands()
                 self.refresh_candidate(candidate)
+                self.drain_commands()
                 self.process_stage_schedule(candidate)
+                self.drain_commands()
                 self.try_candidate(candidate)
+                self.drain_commands()
                 self.check_receipts(candidate)
                 if candidate.done:
                     pending = any(s.submitted and not s.confirmed for s in candidate.wallets.values())
