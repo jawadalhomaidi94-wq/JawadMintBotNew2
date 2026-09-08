@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import threading
 import time
@@ -24,18 +23,15 @@ class StoredWallet:
 
 
 class SecureStore:
-    """SQLite persistence + Fernet encryption for private keys.
+    """SQLite persistence + Fernet encryption for wallet private keys.
 
-    Put the database on a Railway Volume. Keep WALLET_ENCRYPTION_KEY only in
-    Railway Variables. The database never stores a plaintext private key.
+    The DB is designed to live on a Railway Volume. Schema migrations are
+    intentionally additive so V3 databases continue to work with V4.
     """
 
     def __init__(self, db_path: str, encryption_key: str):
         if not encryption_key:
-            raise ValueError(
-                "WALLET_ENCRYPTION_KEY is required. Generate one with: "
-                "python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
-            )
+            raise ValueError("WALLET_ENCRYPTION_KEY is required")
         try:
             self.fernet = Fernet(encryption_key.encode("utf-8"))
         except Exception as exc:
@@ -47,6 +43,17 @@ class SecureStore:
         self.conn.row_factory = sqlite3.Row
         self.lock = threading.RLock()
         self._init_db()
+
+    def _column_names(self, table: str) -> set[str]:
+        with self.lock:
+            rows = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {str(r["name"]) for r in rows}
+
+    def _ensure_column(self, table: str, name: str, ddl: str) -> None:
+        if name in self._column_names(table):
+            return
+        with self.lock, self.conn:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     def _init_db(self) -> None:
         with self.lock, self.conn:
@@ -96,8 +103,14 @@ class SecureStore:
 
                 CREATE INDEX IF NOT EXISTS idx_mint_history_created ON mint_history(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_mint_history_slug ON mint_history(slug);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_name_nocase ON wallets(name COLLATE NOCASE);
                 """
             )
+
+        # V4 additive watch fields. Existing V3 databases are upgraded in-place.
+        self._ensure_column("watches", "paid_detected", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("watches", "paid_selection_confirmed", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("watches", "paid_wallets_json", "TEXT NOT NULL DEFAULT '[]'")
 
     def encrypt(self, private_key: str) -> bytes:
         return self.fernet.encrypt(private_key.encode("utf-8"))
@@ -106,9 +119,20 @@ class SecureStore:
         try:
             return self.fernet.decrypt(token).decode("utf-8")
         except InvalidToken as exc:
-            raise ValueError(
-                "Cannot decrypt a stored wallet. WALLET_ENCRYPTION_KEY may have changed."
-            ) from exc
+            raise ValueError("Cannot decrypt a stored wallet. WALLET_ENCRYPTION_KEY may have changed.") from exc
+
+    def _row_to_wallet(self, row: sqlite3.Row) -> StoredWallet:
+        chains_raw = json.loads(row["chains_json"] or "[]")
+        chains = tuple(str(x) for x in chains_raw if isinstance(x, str))
+        return StoredWallet(
+            id=int(row["id"]),
+            name=str(row["name"]),
+            address=str(row["address"]),
+            private_key=self.decrypt(row["encrypted_private_key"]),
+            quantity=max(1, int(row["quantity"])),
+            chains=chains,
+            enabled=bool(row["enabled"]),
+        )
 
     def add_wallet(
         self,
@@ -119,10 +143,19 @@ class SecureStore:
         quantity: int = 1,
         chains: tuple[str, ...] = (),
     ) -> int:
+        name = name.strip()
+        if not name:
+            raise ValueError("Wallet name is required")
         now = time.time()
         encrypted = self.encrypt(private_key)
         with self.lock, self.conn:
-            cur = self.conn.execute(
+            existing_name = self.conn.execute(
+                "SELECT id,address FROM wallets WHERE name=? COLLATE NOCASE", (name,)
+            ).fetchone()
+            if existing_name and str(existing_name["address"]).lower() != address.lower():
+                raise ValueError("Wallet name already exists")
+
+            self.conn.execute(
                 """
                 INSERT INTO wallets(name,address,encrypted_private_key,quantity,chains_json,enabled,created_at,updated_at)
                 VALUES(?,?,?,?,?,1,?,?)
@@ -136,8 +169,8 @@ class SecureStore:
                 """,
                 (name, address, encrypted, max(1, int(quantity)), json.dumps(list(chains)), now, now),
             )
-            row = self.conn.execute("SELECT id FROM wallets WHERE address=?", (address,)).fetchone()
-            return int(row["id"] if row else cur.lastrowid)
+            row = self.conn.execute("SELECT id FROM wallets WHERE address=? COLLATE NOCASE", (address,)).fetchone()
+            return int(row["id"])
 
     def list_wallets(self, enabled_only: bool = True) -> list[StoredWallet]:
         sql = "SELECT * FROM wallets"
@@ -146,25 +179,33 @@ class SecureStore:
         sql += " ORDER BY id"
         with self.lock:
             rows = self.conn.execute(sql).fetchall()
-        output: list[StoredWallet] = []
-        for row in rows:
-            try:
-                chains_raw = json.loads(row["chains_json"] or "[]")
-                chains = tuple(str(x) for x in chains_raw if isinstance(x, str))
-                output.append(
-                    StoredWallet(
-                        id=int(row["id"]),
-                        name=str(row["name"]),
-                        address=str(row["address"]),
-                        private_key=self.decrypt(row["encrypted_private_key"]),
-                        quantity=max(1, int(row["quantity"])),
-                        chains=chains,
-                        enabled=bool(row["enabled"]),
-                    )
-                )
-            except Exception:
-                raise
-        return output
+        return [self._row_to_wallet(r) for r in rows]
+
+    def get_wallet_by_id(self, wallet_id: int) -> StoredWallet | None:
+        with self.lock:
+            row = self.conn.execute("SELECT * FROM wallets WHERE id=?", (int(wallet_id),)).fetchone()
+        return self._row_to_wallet(row) if row else None
+
+    def get_wallet_by_address(self, address: str) -> StoredWallet | None:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM wallets WHERE address=? COLLATE NOCASE", (address,)
+            ).fetchone()
+        return self._row_to_wallet(row) if row else None
+
+    def wallet_name_exists(self, name: str, exclude_id: int | None = None) -> bool:
+        name = name.strip()
+        with self.lock:
+            if exclude_id is None:
+                row = self.conn.execute(
+                    "SELECT 1 FROM wallets WHERE name=? COLLATE NOCASE LIMIT 1", (name,)
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    "SELECT 1 FROM wallets WHERE name=? COLLATE NOCASE AND id<>? LIMIT 1",
+                    (name, int(exclude_id)),
+                ).fetchone()
+        return row is not None
 
     def set_wallet_enabled(self, address: str, enabled: bool) -> bool:
         with self.lock, self.conn:
@@ -174,9 +215,44 @@ class SecureStore:
             )
             return cur.rowcount > 0
 
+    def set_wallet_enabled_by_id(self, wallet_id: int, enabled: bool) -> bool:
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE wallets SET enabled=?, updated_at=? WHERE id=?",
+                (1 if enabled else 0, time.time(), int(wallet_id)),
+            )
+            return cur.rowcount > 0
+
+    def set_wallet_name(self, wallet_id: int, name: str) -> bool:
+        name = name.strip()
+        if not name:
+            return False
+        if self.wallet_name_exists(name, exclude_id=wallet_id):
+            raise ValueError("Wallet name already exists")
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE wallets SET name=?, updated_at=? WHERE id=?",
+                (name, time.time(), int(wallet_id)),
+            )
+            return cur.rowcount > 0
+
+    def set_wallet_quantity(self, wallet_id: int, quantity: int) -> bool:
+        quantity = max(1, min(int(quantity), 100))
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE wallets SET quantity=?, updated_at=? WHERE id=?",
+                (quantity, time.time(), int(wallet_id)),
+            )
+            return cur.rowcount > 0
+
     def delete_wallet(self, address: str) -> bool:
         with self.lock, self.conn:
             cur = self.conn.execute("DELETE FROM wallets WHERE address=? COLLATE NOCASE", (address,))
+            return cur.rowcount > 0
+
+    def delete_wallet_by_id(self, wallet_id: int) -> bool:
+        with self.lock, self.conn:
+            cur = self.conn.execute("DELETE FROM wallets WHERE id=?", (int(wallet_id),))
             return cur.rowcount > 0
 
     def upsert_watch(
@@ -207,12 +283,42 @@ class SecureStore:
                 (slug, chain, source, 1 if allow_paid else 0, str(max_mint_price_native), quantity, now, now),
             )
 
+    def set_watch_paid_selection(
+        self,
+        slug: str,
+        addresses: set[str] | list[str] | tuple[str, ...],
+        *,
+        confirmed: bool,
+        paid_detected: bool = True,
+    ) -> bool:
+        normalized = sorted({str(a).lower() for a in addresses if str(a).strip()})
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                """
+                UPDATE watches
+                SET paid_detected=?, paid_selection_confirmed=?, paid_wallets_json=?, updated_at=?
+                WHERE slug=? COLLATE NOCASE
+                """,
+                (1 if paid_detected else 0, 1 if confirmed else 0, json.dumps(normalized), time.time(), slug),
+            )
+            return cur.rowcount > 0
+
+    def clear_watch_paid_selection(self, slug: str) -> bool:
+        return self.set_watch_paid_selection(slug, set(), confirmed=False, paid_detected=False)
+
     def list_watches(self) -> list[dict[str, Any]]:
         with self.lock:
             rows = self.conn.execute(
                 "SELECT * FROM watches WHERE active=1 ORDER BY created_at"
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_watch(self, slug: str) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM watches WHERE slug=? COLLATE NOCASE", (slug,)
+            ).fetchone()
+        return dict(row) if row else None
 
     def remove_watch(self, slug: str) -> bool:
         with self.lock, self.conn:

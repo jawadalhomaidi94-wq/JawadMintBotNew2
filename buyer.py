@@ -114,6 +114,7 @@ class MintResult:
     tx_hash: str | None = None
     mint_value_native: Decimal | None = None
     gas_cost_native: Decimal | None = None
+    gas_cost_usd: Decimal | None = None
     total_max_native: Decimal | None = None
     detail: str | None = None
     rpc: str | None = None
@@ -331,23 +332,49 @@ def _priority_fee(w3: Web3) -> int:
 
 
 def build_fee_fields(w3: Web3, strategy: str) -> dict[str, int]:
+    """Build fee fields with a cost-first strategy.
+
+    `smart` aims for the next few blocks without the large 2x+ maxFee headroom
+    used by the old `fast` mode. The hard USD budget is enforced separately
+    before signing, so this function focuses on bidding efficiently rather
+    than aggressively.
+    """
+    strategy = (strategy or "smart").strip().lower()
     latest = w3.eth.get_block("latest")
     base_fee = latest.get("baseFeePerGas")
     if base_fee is None:
         gp = int(w3.eth.gas_price)
-        multiplier = {"economy": 0.95, "balanced": 1.0, "fast": 1.20, "turbo": 1.45}.get(strategy, 1.0)
+        multiplier = {
+            "economy": 0.90,
+            "smart": 1.00,
+            "balanced": 1.05,
+            "fast": 1.15,
+            "turbo": 1.30,
+        }.get(strategy, 1.0)
         return {"gasPrice": max(1, int(gp * multiplier))}
 
     base_fee = int(base_fee)
-    priority = _priority_fee(w3)
+    network_priority = max(1, _priority_fee(w3))
+    # Small floor so very-low-fee L2 transactions are still accepted.
+    floor_priority = max(1, int(Web3.to_wei(0.005, "gwei")))
+
     if strategy == "economy":
-        max_priority = max(1, int(priority * 0.80)); max_fee = int(base_fee * 1.12) + max_priority
+        max_priority = max(floor_priority, int(network_priority * 0.55))
+        max_fee = int(base_fee * 1.08) + max_priority
+    elif strategy == "smart":
+        # Ethereum base fee can move up by at most 12.5% per full block. 1.15x
+        # gives enough headroom for the next block without the old 2.10x bid.
+        max_priority = max(floor_priority, int(network_priority * 0.75))
+        max_fee = int(base_fee * 1.15) + max_priority
     elif strategy == "fast":
-        max_priority = max(1, int(priority * 1.40)); max_fee = int(base_fee * 2.10) + max_priority
+        max_priority = max(floor_priority, int(network_priority * 1.05))
+        max_fee = int(base_fee * 1.35) + max_priority
     elif strategy == "turbo":
-        max_priority = max(1, int(priority * 1.80)); max_fee = int(base_fee * 2.80) + max_priority
+        max_priority = max(floor_priority, int(network_priority * 1.35))
+        max_fee = int(base_fee * 1.70) + max_priority
     else:
-        max_priority = max(1, priority); max_fee = int(base_fee * 1.45) + max_priority
+        max_priority = max(floor_priority, int(network_priority * 0.75))
+        max_fee = int(base_fee * 1.15) + max_priority
     return {"maxPriorityFeePerGas": max_priority, "maxFeePerGas": max_fee, "type": 2}
 
 
@@ -399,6 +426,9 @@ def mint_drop(
     max_mint_price_native: Decimal,
     max_total_native: Decimal,
     allowed_targets: set[str],
+    paid_wallet_allowed: bool = True,
+    max_gas_usd: Decimal = Decimal("0"),
+    native_usd_price: Decimal | None = None,
 ) -> MintResult:
     account = Account.from_key(wallet.private_key)
     address = Web3.to_checksum_address(account.address)
@@ -420,6 +450,16 @@ def mint_drop(
         return MintResult(False, "bad_mint_payload", detail=str(exc))
 
     mint_value_native = Decimal(value) / Decimal(10**18)
+    # V4: paid mints require an explicit per-watch wallet selection.
+    # Free mints are never blocked by this flag.
+    if value > 0 and not paid_wallet_allowed:
+        return MintResult(
+            False,
+            "paid_wallet_selection_required",
+            mint_value_native=mint_value_native,
+            target=target,
+            detail=f"Paid mint requires wallet selection: {mint_value_native} {native_symbol(rpc_pool.chain)}",
+        )
     if value > 0 and not allow_paid:
         return MintResult(False, "paid_not_allowed", mint_value_native=mint_value_native, target=target,
                           detail=f"Paid mint refused by policy: {mint_value_native} {native_symbol(rpc_pool.chain)}")
@@ -445,7 +485,23 @@ def mint_drop(
         fees = build_fee_fields(w3, gas_strategy)
         gas_cost_wei = max_gas_cost_wei(gas_limit, fees)
         gas_cost_native = Decimal(gas_cost_wei) / Decimal(10**18)
+        gas_cost_usd = (gas_cost_native * native_usd_price) if native_usd_price is not None else None
         total_max_native = mint_value_native + gas_cost_native
+
+        # V4.1: hard USD gas budget. If a USD budget is enabled and we cannot
+        # resolve the native-token USD price, fail closed instead of spending
+        # without knowing the dollar cost.
+        if max_gas_usd > 0:
+            if gas_cost_usd is None:
+                return MintResult(False, "gas_price_unavailable", mint_value_native=mint_value_native,
+                                  gas_cost_native=gas_cost_native, gas_cost_usd=None,
+                                  total_max_native=total_max_native, target=target,
+                                  detail="USD gas budget is enabled but native/USD price is unavailable")
+            if gas_cost_usd > max_gas_usd:
+                return MintResult(False, "gas_usd_too_high", mint_value_native=mint_value_native,
+                                  gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd,
+                                  total_max_native=total_max_native, target=target,
+                                  detail=f"Estimated max gas ${gas_cost_usd:.6f} > USD cap ${max_gas_usd}")
 
         if max_gas_native > 0 and gas_cost_native > max_gas_native:
             return MintResult(False, "gas_too_high", mint_value_native=mint_value_native,
@@ -473,6 +529,7 @@ def mint_drop(
             tx_hash=tx_hash,
             mint_value_native=mint_value_native,
             gas_cost_native=gas_cost_native,
+            gas_cost_usd=gas_cost_usd,
             total_max_native=total_max_native,
             rpc=rpc_url,
             target=target,
