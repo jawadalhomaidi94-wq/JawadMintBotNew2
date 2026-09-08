@@ -781,31 +781,14 @@ class TelegramController(threading.Thread):
         self.allowed_chat_ids = set(csv_values(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS")))
         self.allow_any = env_bool("TELEGRAM_ALLOW_ANY_CHAT", False)
         self.offset = 0
-        # Long-polling and outbound Telegram actions use separate sessions.
-        # requests.Session is not guaranteed to be thread-safe and V4.4 used
-        # the same object from the polling thread and background notification
-        # threads, which could make /start and callbacks appear unresponsive.
-        self.poll_session = requests.Session()
-        self.action_session = requests.Session()
-        self.action_lock = threading.Lock()
+        self.session = requests.Session()
 
     @property
     def enabled(self) -> bool:
         return bool(self.token)
 
     def api(self, method: str, **data: Any) -> dict[str, Any]:
-        with self.action_lock:
-            response = self.action_session.post(
-                f"https://api.telegram.org/bot{self.token}/{method}", data=data, timeout=35
-            )
-        response.raise_for_status()
-        payload = response.json()
-        return payload if isinstance(payload, dict) else {}
-
-    def poll(self, **data: Any) -> dict[str, Any]:
-        response = self.poll_session.post(
-            f"https://api.telegram.org/bot{self.token}/getUpdates", data=data, timeout=35
-        )
+        response = self.session.post(f"https://api.telegram.org/bot{self.token}/{method}", data=data, timeout=35)
         response.raise_for_status()
         payload = response.json()
         return payload if isinstance(payload, dict) else {}
@@ -825,8 +808,7 @@ class TelegramController(threading.Thread):
         try:
             self.api("sendMessage", **data)
         except Exception as exc:
-            detail = getattr(getattr(exc, "response", None), "text", "") or str(exc)
-            log.warning("Telegram send failed: %s", detail[:500])
+            log.debug("Telegram send failed: %s", exc)
 
     def edit(self, chat_id: str | int, message_id: int, text: str, buttons: list[list[tuple[str, str]]] | None = None) -> None:
         data: dict[str, Any] = {
@@ -841,12 +823,9 @@ class TelegramController(threading.Thread):
             })
         try:
             self.api("editMessageText", **data)
-        except Exception as exc:
-            detail = getattr(getattr(exc, "response", None), "text", "") or str(exc)
-            if "message is not modified" in detail.lower():
-                return
-            log.warning("Telegram edit failed; sending a fresh message instead: %s", detail[:500])
-            self.send(chat_id, text, buttons)
+        except Exception:
+            # Editing can fail if Telegram sees no content change; this is harmless.
+            pass
 
     def answer_callback(self, callback_id: str, text: str = "") -> None:
         try:
@@ -864,16 +843,6 @@ class TelegramController(threading.Thread):
         return self.allow_any or chat_id in self.allowed_chat_ids
 
     def setup_commands(self) -> None:
-        # Force long-polling mode and discard stale callbacks from older
-        # deployments. This prevents a leftover webhook/backlog from blocking
-        # /start or the inline menu after a Railway redeploy.
-        try:
-            self.api("deleteWebhook", drop_pending_updates="true")
-            me = self.api("getMe")
-            username = ((me.get("result") or {}).get("username") or "unknown") if isinstance(me, dict) else "unknown"
-            log.info("Telegram polling ready | bot=@%s", username)
-        except Exception as exc:
-            log.warning("Telegram initialization warning: %s", exc)
         commands = [
             {"command": "start", "description": "فتح القائمة الرئيسية"},
             {"command": "wallets", "description": "عرض وإدارة المحافظ"},
@@ -881,9 +850,9 @@ class TelegramController(threading.Thread):
             {"command": "qualification", "description": "قسم التأهيل ومراحل اليوم"},
             {"command": "watch", "description": "إضافة رابط منت للمراقبة"},
             {"command": "eligibility", "description": "فحص أهلية رابط للمحافظ النشطة"},
-            {"command": "chains", "description": "حالة الشبكات والـRPC"},
             {"command": "free", "description": "المنتات المجانية التي تم أخذها"},
             {"command": "paid", "description": "المنتات المدفوعة المحفوظة"},
+            {"command": "chains", "description": "حالة الشبكات والـRPC"},
             {"command": "history", "description": "سجل عمليات الـMint"},
             {"command": "pause", "description": "إيقاف تنفيذ المعاملات مع استمرار المراقبة"},
             {"command": "resume", "description": "استئناف تنفيذ المعاملات"},
@@ -898,7 +867,8 @@ class TelegramController(threading.Thread):
         self.setup_commands()
         while not STOP:
             try:
-                payload = self.poll(
+                payload = self.api(
+                    "getUpdates",
                     offset=self.offset,
                     timeout=25,
                     allowed_updates='["message","callback_query"]',
@@ -934,13 +904,7 @@ class TelegramController(threading.Thread):
                     if not self.authorized(chat_id):
                         self.send(chat_id, f"⛔ هذه المحادثة غير مصرح لها بالتحكم في البوت.\nمعرّف المحادثة: {chat_id}")
                         continue
-                    normalized_command = text.split()[0].lower().split("@", 1)[0] if text.split() else ""
-                    if normalized_command in {"/start", "/menu", "/help"}:
-                        log.info("Telegram %s received | chat_id=%s", normalized_command, chat_id)
-                        # Serve the main menu directly from the polling thread so
-                        # heavy mint/stage work cannot starve /start.
-                        self.bot.send_menu(chat_id)
-                        continue
+                    log.info("Telegram message received | chat_id=%s | text=%s", chat_id, text[:80])
                     self.bot.command_queue.put({
                         "type": "message",
                         "chat_id": chat_id,
@@ -949,7 +913,7 @@ class TelegramController(threading.Thread):
                         "text": text,
                     })
             except Exception as exc:
-                log.warning("Telegram polling error: %s", exc)
+                log.debug("Telegram polling error: %s", exc)
                 time.sleep(2)
 
 
@@ -1042,6 +1006,10 @@ class Bot:
         self.rpc_pools: dict[str, RpcPool] = {}
         self.candidates: dict[str, Candidate] = {}
         self.command_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        # Telegram commands are processed by a dedicated worker. V4.4 coupled
+        # command execution to the mint/stage loop, so long eligibility/network
+        # checks could starve /start and inline-button callbacks.
+        self.command_worker_thread: threading.Thread | None = None
         self.pending_wallet_name: dict[str, float] = {}
         self.pending_wallet_import: dict[str, dict[str, Any]] = {}
         self.pending_wallet_rename: dict[str, dict[str, Any]] = {}
@@ -2473,7 +2441,7 @@ class Bot:
     def maybe_offer_paid_public(self, candidate: Candidate) -> None:
         """Register a paid Public stage silently.
 
-        V4.5 intentionally does not push paid-mint prompts to Telegram. Paid
+        V4.6 intentionally does not push paid-mint prompts to Telegram. Paid
         projects are saved and shown only when the user opens the dedicated
         ``💳 المنتات المدفوعة`` section.
         """
@@ -2956,7 +2924,7 @@ class Bot:
         total = len(self.store.list_wallets(enabled_only=False))
         self.telegram.send(
             chat_id,
-            "🤖 OpenSea Mint Guardian V4.5\n\n"
+            "🤖 OpenSea Mint Guardian V4.6\n\n"
             f"🆓/🎟 الاكتشاف التلقائي: مفعّل كل {self.auto_free_scan_seconds:g} ثانية\n"
             f"⚡ الاستعداد للـPublic: آخر {self.public_preopen_window_seconds:g} ثوانٍ\n"
             f"📦 سياسة الكمية: حد المنت ≤100 يؤخذ كما هو، وإذا كان >100/غير محدود فالهدف {self.auto_stage_high_limit_quantity}\n"
@@ -4130,20 +4098,44 @@ class Bot:
 
         self.telegram.send(chat_id, "أرسل رابط OpenSea أو استخدم أزرار القائمة الرئيسية.", self.menu_buttons())
 
-    def drain_commands(self) -> None:
-        while True:
+    def _process_command_event(self, event: dict[str, Any]) -> None:
+        try:
+            if event.get("type") == "callback":
+                self.handle_callback(event)
+            else:
+                self.handle_message(event)
+        except Exception as exc:
+            log.exception("Telegram command failed")
+            self.telegram.send(event.get("chat_id", ""), f"⚠️ تعذر تنفيذ الأمر: {exc}")
+
+    def command_worker_loop(self) -> None:
+        """Process Telegram updates independently from mint/stage scanning."""
+        log.info("Telegram command worker ready")
+        while not STOP:
             try:
-                event = self.command_queue.get_nowait()
+                event = self.command_queue.get(timeout=0.50)
             except queue.Empty:
-                return
+                continue
             try:
-                if event.get("type") == "callback":
-                    self.handle_callback(event)
-                else:
-                    self.handle_message(event)
-            except Exception as exc:
-                log.exception("Telegram command failed")
-                self.telegram.send(event.get("chat_id", ""), f"⚠️ تعذر تنفيذ الأمر: {exc}")
+                self._process_command_event(event)
+            finally:
+                try:
+                    self.command_queue.task_done()
+                except ValueError:
+                    pass
+
+    def start_command_worker(self) -> None:
+        if self.command_worker_thread and self.command_worker_thread.is_alive():
+            return
+        self.command_worker_thread = threading.Thread(
+            target=self.command_worker_loop, name="telegram-command-worker", daemon=True
+        )
+        self.command_worker_thread.start()
+
+    def drain_commands(self) -> None:
+        # Kept only for compatibility with older code paths. The dedicated
+        # worker is the sole consumer in V4.6 to avoid races/double handling.
+        return
 
     def notify_all(self, text: str) -> None:
         if not self.telegram.enabled:
@@ -4154,11 +4146,12 @@ class Bot:
     # ---------- main loop ----------
     def run(self) -> None:
         start_health_server()
-        log.info("Mint Guardian V4.5 starting")
+        log.info("Mint Guardian V4.6 starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
         if self.telegram.enabled:
+            self.start_command_worker()
             self.telegram.start()
         self.bootstrap_watches()
         self.start_auto_free_discovery()
@@ -4168,7 +4161,7 @@ class Bot:
             self.public_fast_retry_seconds, self.auto_stage_high_limit_quantity,
         )
         self.notify_all(
-            "🟢 OpenSea Mint Guardian V4.5 يعمل الآن على Railway.\n"
+            "🟢 OpenSea Mint Guardian V4.6 يعمل الآن على Railway.\n"
             f"الاكتشاف التلقائي: {'مفعّل كل ' + format(self.auto_free_scan_seconds, 'g') + ' ثانية' if self.auto_free_enabled else 'متوقف'}.\n"
             f"OpenSea Stream: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} | REST Mint Events: {'مفعّل' if self.auto_event_fallback_enabled else 'متوقف'}.\n"
             f"التأهيل: إعادة فحص كل {self.qualification_recheck_seconds:g} ثانية أثناء المرحلة.\n"
@@ -4177,17 +4170,12 @@ class Bot:
             "تمت استعادة المراقبات وخطط المدفوع والمحافظ النشطة بنجاح."
         )
         while not STOP:
-            self.drain_commands()
             self.drain_auto_discovery()
             self.cleanup_auto_candidates()
             for key, candidate in list(self.candidates.items()):
-                self.drain_commands()
                 self.refresh_candidate(candidate)
-                self.drain_commands()
                 self.process_stage_schedule(candidate)
-                self.drain_commands()
                 self.try_candidate(candidate)
-                self.drain_commands()
                 self.check_receipts(candidate)
                 if candidate.done:
                     pending = any(s.submitted and not s.confirmed for s in candidate.wallets.values())
