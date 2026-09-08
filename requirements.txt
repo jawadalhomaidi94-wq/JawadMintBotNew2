@@ -2,3 +2,5 @@ requests>=2.32.0,<3
 web3>=7.0.0,<8
 python-dotenv>=1.0.1,<2
 cryptography>=43.0.0,<47
+
+websockets>=13.0,<16

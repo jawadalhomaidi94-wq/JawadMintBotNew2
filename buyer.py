@@ -105,6 +105,7 @@ class EligibilityResult:
     mint_value_native: Decimal | None = None
     target: str | None = None
     detail: str | None = None
+    quantity_used: int | None = None
 
 
 @dataclass
@@ -140,7 +141,7 @@ class OpenSeaClient:
                 "X-API-KEY": self.api_key,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "OpenSea-Mint-Guardian/4.2",
+                "User-Agent": "OpenSea-Mint-Guardian/4.4",
             })
             self._local.session = session
         return session
@@ -177,6 +178,30 @@ class OpenSeaClient:
 
     def get_collection(self, slug: str) -> dict[str, Any]:
         return self._request("GET", f"/collections/{slug}")
+
+    def get_contract(self, chain: str, address: str) -> dict[str, Any]:
+        return self._request("GET", f"/chain/{chain}/contract/{address}")
+
+    def get_events(
+        self,
+        *,
+        event_type: str = "mint",
+        after: int | None = None,
+        before: int | None = None,
+        limit: int = 200,
+        cursor: str | None = None,
+        chain: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"event_type": event_type, "limit": max(1, min(int(limit), 200))}
+        if chain:
+            params["chain"] = chain
+        if after is not None:
+            params["after"] = int(after)
+        if before is not None:
+            params["before"] = int(before)
+        if cursor:
+            params["next"] = cursor
+        return self._request("GET", "/events", params=params)
 
     def build_mint(self, slug: str, minter: str, quantity: int) -> dict[str, Any]:
         return self._request("POST", f"/drops/{slug}/mint", json={"minter": minter, "quantity": quantity})
@@ -441,9 +466,14 @@ def _build_mint_best_quantity(
 
 
 def check_eligibility(opensea: OpenSeaClient, slug: str, wallet: WalletConfig, quantity: int) -> EligibilityResult:
-    """Preflight through OpenSea. Does not sign or broadcast anything."""
+    """Preflight through OpenSea. Does not sign or broadcast anything.
+
+    V4.4 also probes the highest quantity OpenSea accepts so the eligibility
+    screen reflects the actual usable quantity rather than failing just because
+    the wallet default is above max-per-wallet.
+    """
     try:
-        payload = opensea.build_mint(slug, wallet.address, quantity)
+        payload, quantity_used = _build_mint_best_quantity(opensea, slug, wallet.address, quantity)
         target, _data, value = normalize_mint_tx(payload)
         return EligibilityResult(
             True,
@@ -451,6 +481,7 @@ def check_eligibility(opensea: OpenSeaClient, slug: str, wallet: WalletConfig, q
             mint_value_native=Decimal(value) / Decimal(10**18),
             target=target,
             detail="OpenSea returned ready-to-sign mint transaction data.",
+            quantity_used=quantity_used,
         )
     except requests.HTTPError as exc:
         code = _http_status(exc)
@@ -603,3 +634,362 @@ def mint_drop(
     except Exception as exc:
         return MintResult(False, "rpc_or_tx_error", mint_value_native=mint_value_native, target=target, detail=str(exc),
                           quantity_used=locals().get("quantity_used"))
+
+
+# ---------------------------------------------------------------------------
+# V4.3 — direct SeaDrop public-mint fallback
+# ---------------------------------------------------------------------------
+# The automatic discovery path no longer depends on a collection being present
+# in GET /drops. OpenSea Stream / Events can reveal a freshly minted NFT
+# contract, then these helpers read and simulate the public SeaDrop directly.
+
+SEADROP_ADDRESS = Web3.to_checksum_address("0x00005EA00Ac477B1030CE78506496e8C2dE24bf5")
+ZERO_ADDRESS = Web3.to_checksum_address("0x0000000000000000000000000000000000000000")
+
+SEADROP_ABI = [
+    {
+        "inputs": [
+            {"name": "nftContract", "type": "address"},
+            {"name": "feeRecipient", "type": "address"},
+            {"name": "minterIfNotPayer", "type": "address"},
+            {"name": "quantity", "type": "uint256"},
+        ],
+        "name": "mintPublic",
+        "outputs": [],
+        "stateMutability": "payable",
+        "type": "function",
+    },
+    {
+        "inputs": [{"name": "nftContract", "type": "address"}],
+        "name": "getAllowedFeeRecipients",
+        "outputs": [{"name": "", "type": "address[]"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [{"name": "nftContract", "type": "address"}],
+        "name": "getPublicDrop",
+        "outputs": [{
+            "components": [
+                {"name": "mintPrice", "type": "uint80"},
+                {"name": "startTime", "type": "uint48"},
+                {"name": "endTime", "type": "uint48"},
+                {"name": "maxTotalMintableByWallet", "type": "uint16"},
+                {"name": "feeBps", "type": "uint16"},
+                {"name": "restrictFeeRecipients", "type": "bool"},
+            ],
+            "name": "",
+            "type": "tuple",
+        }],
+        "stateMutability": "view",
+        "type": "function",
+    },
+]
+
+SUPPLY_ABI = [
+    {"inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "maxSupply", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+]
+
+
+def seadrop_is_deployed(w3: Web3) -> bool:
+    try:
+        code = bytes(w3.eth.get_code(SEADROP_ADDRESS))
+        return bool(code and code != b"\\x00")
+    except Exception:
+        return False
+
+
+def _token_supply(w3: Web3, nft_contract: str) -> tuple[int | None, int | None, int | None]:
+    try:
+        token = w3.eth.contract(address=Web3.to_checksum_address(nft_contract), abi=SUPPLY_ABI)
+        total = int(token.functions.totalSupply().call())
+    except Exception:
+        total = None
+    try:
+        token = w3.eth.contract(address=Web3.to_checksum_address(nft_contract), abi=SUPPLY_ABI)
+        maximum = int(token.functions.maxSupply().call())
+    except Exception:
+        maximum = None
+    remaining = None if total is None or maximum is None else max(0, maximum - total)
+    return maximum, total, remaining
+
+
+def read_seadrop_public_drop(w3: Web3, nft_contract: str) -> dict[str, Any] | None:
+    """Read public SeaDrop configuration directly from chain.
+
+    Returns None when SeaDrop is not deployed/reachable on this chain or the NFT
+    address is invalid. A zeroed tuple is marked configured=False instead of
+    being mistaken for an active free mint.
+    """
+    if not Web3.is_address(nft_contract) or not seadrop_is_deployed(w3):
+        return None
+    nft = Web3.to_checksum_address(nft_contract)
+    try:
+        seadrop = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
+        raw = seadrop.functions.getPublicDrop(nft).call()
+        price = int(raw[0])
+        start = int(raw[1])
+        end = int(raw[2])
+        max_wallet = int(raw[3])
+        fee_bps = int(raw[4])
+        restricted = bool(raw[5])
+        recipients = []
+        try:
+            recipients = [Web3.to_checksum_address(x) for x in seadrop.functions.getAllowedFeeRecipients(nft).call()]
+        except Exception:
+            recipients = []
+        maximum, total, remaining = _token_supply(w3, nft)
+        # Allowed fee recipients are configured independently from the public
+        # stage, so they must not make an all-zero PublicDrop look active.
+        configured = bool(start or end or max_wallet or price or fee_bps)
+        return {
+            "contract_address": nft,
+            "mint_price_wei": price,
+            "start_time": start,
+            "end_time": end,
+            "max_per_wallet": max_wallet if max_wallet > 0 else None,
+            "fee_bps": fee_bps,
+            "restrict_fee_recipients": restricted,
+            "fee_recipients": recipients,
+            "configured": configured,
+            "max_supply": maximum,
+            "total_supply": total,
+            "remaining_supply": remaining,
+        }
+    except Exception as exc:
+        log.debug("SeaDrop public-drop read failed %s: %s", nft_contract, exc)
+        return None
+
+
+def _seadrop_fee_recipient(public: dict[str, Any]) -> str | None:
+    recipients = list(public.get("fee_recipients") or [])
+    if recipients:
+        return Web3.to_checksum_address(recipients[0])
+    if bool(public.get("restrict_fee_recipients")):
+        return None
+    # For unrestricted public drops any recipient is accepted. For a free mint
+    # feeBps produces no payment, so zero address avoids inventing attribution.
+    return ZERO_ADDRESS
+
+
+def _seadrop_base_tx(
+    w3: Web3,
+    *,
+    payer: str,
+    nft_contract: str,
+    fee_recipient: str,
+    quantity: int,
+    mint_price_wei: int,
+    chain_id: int,
+    nonce: int | None = None,
+) -> dict[str, Any]:
+    seadrop = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
+    fn = seadrop.functions.mintPublic(
+        Web3.to_checksum_address(nft_contract),
+        Web3.to_checksum_address(fee_recipient),
+        ZERO_ADDRESS,
+        int(quantity),
+    )
+    data = fn._encode_transaction_data()
+    tx: dict[str, Any] = {
+        "chainId": int(chain_id),
+        "from": Web3.to_checksum_address(payer),
+        "to": SEADROP_ADDRESS,
+        "data": data,
+        "value": int(mint_price_wei) * int(quantity),
+    }
+    if nonce is not None:
+        tx["nonce"] = int(nonce)
+    return tx
+
+
+def _best_seadrop_quantity(
+    w3: Web3,
+    *,
+    payer: str,
+    nft_contract: str,
+    fee_recipient: str,
+    desired_quantity: int,
+    mint_price_wei: int,
+    chain_id: int,
+) -> tuple[int, int, dict[str, Any]]:
+    """Return highest quantity whose mintPublic call successfully simulates."""
+    desired = max(1, min(int(desired_quantity), 100))
+
+    def simulate(qty: int) -> tuple[int, dict[str, Any]]:
+        tx = _seadrop_base_tx(
+            w3, payer=payer, nft_contract=nft_contract, fee_recipient=fee_recipient,
+            quantity=qty, mint_price_wei=mint_price_wei, chain_id=chain_id,
+        )
+        estimated = int(w3.eth.estimate_gas(tx))
+        return estimated, tx
+
+    try:
+        estimated, tx = simulate(desired)
+        return desired, estimated, tx
+    except Exception as original:
+        if desired <= 1:
+            raise original
+        try:
+            best_est, best_tx = simulate(1)
+        except Exception:
+            raise original
+        best = 1
+        low, high = 2, desired - 1
+        while low <= high:
+            mid = (low + high) // 2
+            try:
+                est, tx = simulate(mid)
+                best, best_est, best_tx = mid, est, tx
+                low = mid + 1
+            except Exception:
+                high = mid - 1
+        return best, best_est, best_tx
+
+
+def check_seadrop_eligibility(
+    rpc_pool: RpcPool,
+    wallet: WalletConfig,
+    nft_contract: str,
+    quantity: int,
+) -> EligibilityResult:
+    """On-chain public SeaDrop preflight without signing or broadcasting."""
+    w3 = rpc_pool.primary
+    public = read_seadrop_public_drop(w3, nft_contract)
+    if not public or not public.get("configured"):
+        return EligibilityResult(None, "seadrop_not_configured", detail="No configured public SeaDrop was found on-chain.")
+    now = int(__import__("time").time())
+    start = int(public.get("start_time") or 0)
+    end = int(public.get("end_time") or 0)
+    if start and now < start:
+        return EligibilityResult(None, "not_active_yet", mint_value_native=Decimal(int(public["mint_price_wei"])) / Decimal(10**18), detail=f"Public mint opens at {start}")
+    if end and now >= end:
+        return EligibilityResult(False, "stage_ended", mint_value_native=Decimal(int(public["mint_price_wei"])) / Decimal(10**18), detail=f"Public mint ended at {end}")
+    if public.get("remaining_supply") is not None and int(public["remaining_supply"]) <= 0:
+        return EligibilityResult(False, "sold_out", detail="On-chain maxSupply - totalSupply is zero.")
+    fee_recipient = _seadrop_fee_recipient(public)
+    if not fee_recipient:
+        return EligibilityResult(False, "no_fee_recipient", detail="SeaDrop restricts fee recipients but none were returned.")
+    desired = max(1, min(int(quantity), 100))
+    if public.get("max_per_wallet"):
+        desired = min(desired, int(public["max_per_wallet"]))
+    if public.get("remaining_supply") is not None:
+        desired = min(desired, max(1, int(public["remaining_supply"])))
+    try:
+        used, _estimated, _tx = _best_seadrop_quantity(
+            w3, payer=wallet.address, nft_contract=nft_contract, fee_recipient=fee_recipient,
+            desired_quantity=desired, mint_price_wei=int(public["mint_price_wei"]), chain_id=rpc_pool.chain_id,
+        )
+        return EligibilityResult(
+            True, "eligible_now",
+            mint_value_native=(Decimal(int(public["mint_price_wei"])) * Decimal(used)) / Decimal(10**18),
+            target=SEADROP_ADDRESS,
+            detail="Direct SeaDrop mintPublic simulation succeeded.",
+            quantity_used=used,
+        )
+    except Exception as exc:
+        return EligibilityResult(False, "not_eligible_now", mint_value_native=Decimal(int(public["mint_price_wei"])) / Decimal(10**18), target=SEADROP_ADDRESS, detail=str(exc))
+
+
+def mint_seadrop_public(
+    *,
+    rpc_pool: RpcPool,
+    wallet: WalletConfig,
+    nft_contract: str,
+    quantity: int,
+    gas_strategy: str,
+    gas_limit_buffer: float,
+    max_gas_native: Decimal,
+    allow_paid: bool,
+    max_mint_price_native: Decimal,
+    max_total_native: Decimal,
+    allowed_targets: set[str],
+    paid_wallet_allowed: bool = True,
+    max_gas_usd: Decimal = Decimal("0"),
+    native_usd_price: Decimal | None = None,
+) -> MintResult:
+    """Mint a public SeaDrop directly, preserving all V4.x safety guards."""
+    account = Account.from_key(wallet.private_key)
+    address = Web3.to_checksum_address(account.address)
+    w3 = rpc_pool.primary
+    public = read_seadrop_public_drop(w3, nft_contract)
+    if not public or not public.get("configured"):
+        return MintResult(False, "seadrop_not_configured", detail="No configured public SeaDrop was found on-chain.")
+
+    now = int(__import__("time").time())
+    start = int(public.get("start_time") or 0)
+    end = int(public.get("end_time") or 0)
+    if start and now < start:
+        return MintResult(False, "not_mintable_yet", detail=f"Public mint opens at {start}")
+    if end and now >= end:
+        return MintResult(False, "precondition_failed", detail=f"Public mint ended at {end}")
+    remaining = public.get("remaining_supply")
+    if remaining is not None and int(remaining) <= 0:
+        return MintResult(False, "precondition_failed", detail="Sold out according to on-chain supply.")
+
+    price_each = int(public.get("mint_price_wei") or 0)
+    desired = max(1, min(int(quantity), 100))
+    if public.get("max_per_wallet"):
+        desired = min(desired, int(public["max_per_wallet"]))
+    if remaining is not None:
+        desired = min(desired, max(1, int(remaining)))
+
+    # Paid policy is enforced before any simulation/signature work.
+    preliminary_value = price_each * desired
+    preliminary_native = Decimal(preliminary_value) / Decimal(10**18)
+    if preliminary_value > 0 and not allow_paid:
+        return MintResult(False, "paid_not_allowed", mint_value_native=preliminary_native, target=SEADROP_ADDRESS, detail="Paid direct SeaDrop mint refused by policy.", quantity_used=desired)
+    if preliminary_value > 0 and not paid_wallet_allowed:
+        return MintResult(False, "paid_wallet_selection_required", mint_value_native=preliminary_native, target=SEADROP_ADDRESS, detail="Paid direct SeaDrop mint requires explicit wallet selection.", quantity_used=desired)
+
+    fee_recipient = _seadrop_fee_recipient(public)
+    if not fee_recipient:
+        return MintResult(False, "no_fee_recipient", target=SEADROP_ADDRESS, detail="Restricted SeaDrop has no allowed fee recipient.")
+    if allowed_targets and SEADROP_ADDRESS.lower() not in allowed_targets:
+        return MintResult(False, "target_not_allowed", target=SEADROP_ADDRESS, detail=f"Refused target contract {SEADROP_ADDRESS}")
+
+    try:
+        quantity_used, estimated, _sim_tx = _best_seadrop_quantity(
+            w3, payer=address, nft_contract=nft_contract, fee_recipient=fee_recipient,
+            desired_quantity=desired, mint_price_wei=price_each, chain_id=rpc_pool.chain_id,
+        )
+        value = price_each * quantity_used
+        mint_value_native = Decimal(value) / Decimal(10**18)
+        if max_mint_price_native > 0 and mint_value_native > max_mint_price_native:
+            return MintResult(False, "mint_price_too_high", mint_value_native=mint_value_native, target=SEADROP_ADDRESS, quantity_used=quantity_used, detail=f"Mint price {mint_value_native} > cap {max_mint_price_native}")
+
+        nonce = int(w3.eth.get_transaction_count(address, "pending"))
+        base_tx = _seadrop_base_tx(
+            w3, payer=address, nft_contract=nft_contract, fee_recipient=fee_recipient,
+            quantity=quantity_used, mint_price_wei=price_each, chain_id=rpc_pool.chain_id, nonce=nonce,
+        )
+        gas_limit = max(estimated, math.ceil(estimated * gas_limit_buffer))
+        fees = build_fee_fields(w3, gas_strategy)
+        gas_cost_wei = max_gas_cost_wei(gas_limit, fees)
+        gas_cost_native = Decimal(gas_cost_wei) / Decimal(10**18)
+        gas_cost_usd = gas_cost_native * native_usd_price if native_usd_price is not None else None
+        total_max_native = mint_value_native + gas_cost_native
+
+        if max_gas_usd > 0:
+            if gas_cost_usd is None:
+                return MintResult(False, "gas_price_unavailable", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=quantity_used, detail="USD gas budget enabled but native/USD price unavailable")
+            if gas_cost_usd > max_gas_usd:
+                return MintResult(False, "gas_usd_too_high", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=quantity_used, detail=f"Estimated max gas ${gas_cost_usd:.6f} > USD cap ${max_gas_usd}")
+        if max_gas_native > 0 and gas_cost_native > max_gas_native:
+            return MintResult(False, "gas_too_high", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=quantity_used, detail=f"Estimated max gas {gas_cost_native} > cap {max_gas_native}")
+        if max_total_native > 0 and total_max_native > max_total_native:
+            return MintResult(False, "total_spend_too_high", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=quantity_used, detail=f"Estimated total max {total_max_native} > cap {max_total_native}")
+
+        balance = int(w3.eth.get_balance(address))
+        needed = gas_cost_wei + value
+        if balance < needed:
+            return MintResult(False, "insufficient_balance", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=quantity_used, detail=f"Wallet balance {balance} wei < estimated requirement {needed} wei")
+
+        tx = {**base_tx, "gas": gas_limit, **fees}
+        signed = account.sign_transaction(tx)
+        raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
+        tx_hash, rpc_url = rpc_pool.broadcast_raw_transaction(raw)
+        return MintResult(True, "submitted", tx_hash=tx_hash, mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd, total_max_native=total_max_native, rpc=rpc_url, target=SEADROP_ADDRESS, quantity_used=quantity_used, detail=(f"Direct SeaDrop; quantity adjusted from {quantity} to {quantity_used}." if quantity_used != quantity else "Direct SeaDrop mintPublic."))
+    except Exception as exc:
+        return MintResult(False, "rpc_or_tx_error", target=SEADROP_ADDRESS, detail=str(exc))
