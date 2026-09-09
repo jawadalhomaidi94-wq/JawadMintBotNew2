@@ -26,7 +26,7 @@ class SecureStore:
     """SQLite persistence + Fernet encryption for wallet private keys.
 
     The DB is designed to live on a Railway Volume. Schema migrations are
-    intentionally additive so V3/V4 databases continue to work with V4.7.
+    intentionally additive so V3/V4 databases continue to work with V4.8.
     """
 
     def __init__(self, db_path: str, encryption_key: str):
@@ -149,6 +149,12 @@ class SecureStore:
                 CREATE INDEX IF NOT EXISTS idx_qualification_projects_status ON qualification_projects(status,last_checked_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_qualification_projects_discovered ON qualification_projects(discovered_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_qualification_wallets_project ON qualification_wallets(project_key,stage_key);
+
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
                 """
             )
 
@@ -177,6 +183,9 @@ class SecureStore:
         self._ensure_column("watches", "paid_stage_key", "TEXT")
         self._ensure_column("watches", "paid_stage_start", "REAL")
         self._ensure_column("watches", "paid_wallet_quantities_json", "TEXT NOT NULL DEFAULT '{}'")
+        # V4.8: project-specific gas policy. Global/per-chain defaults live in bot_settings.
+        self._ensure_column("watches", "gas_override_usd", "TEXT")
+        self._ensure_column("watches", "ignore_gas_cap", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("mint_history", "stage_key", "TEXT")
         self._ensure_column("mint_history", "stage_label", "TEXT")
         self._ensure_column("mint_history", "watch_kind", "TEXT")
@@ -339,6 +348,8 @@ class SecureStore:
         stages_json: str = "[]",
         next_stage_start: float | None = None,
         public_start: float | None = None,
+        gas_override_usd: str | None = None,
+        ignore_gas_cap: bool = False,
     ) -> None:
         now = time.time()
         with self.lock, self.conn:
@@ -347,8 +358,8 @@ class SecureStore:
                 INSERT INTO watches(
                     slug,chain,source,active,allow_paid,max_mint_price_native,quantity,
                     mint_backend,contract_address,watch_kind,stages_json,next_stage_start,public_start,
-                    archived_at,archive_reason,created_at,updated_at
-                ) VALUES(?,?,?,1,?,?,?,?,?,?,?,?,?,NULL,NULL,?,?)
+                    gas_override_usd,ignore_gas_cap,archived_at,archive_reason,created_at,updated_at
+                ) VALUES(?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,?,?)
                 ON CONFLICT(slug) DO UPDATE SET
                     chain=excluded.chain,
                     source=excluded.source,
@@ -362,6 +373,8 @@ class SecureStore:
                     stages_json=excluded.stages_json,
                     next_stage_start=excluded.next_stage_start,
                     public_start=excluded.public_start,
+                    gas_override_usd=COALESCE(excluded.gas_override_usd,watches.gas_override_usd),
+                    ignore_gas_cap=watches.ignore_gas_cap,
                     archived_at=NULL,
                     archive_reason=NULL,
                     updated_at=excluded.updated_at
@@ -369,7 +382,8 @@ class SecureStore:
                 (
                     slug, chain, source, 1 if allow_paid else 0, str(max_mint_price_native), quantity,
                     str(mint_backend or "opensea"), contract_address, str(watch_kind or "manual"),
-                    stages_json or "[]", next_stage_start, public_start, now, now,
+                    stages_json or "[]", next_stage_start, public_start, gas_override_usd,
+                    1 if ignore_gas_cap else 0, now, now,
                 ),
             )
 
@@ -461,6 +475,40 @@ class SecureStore:
                 """,
                 (1 if paid_detected else 0, 1 if confirmed else 0, json.dumps(addresses),
                  json.dumps(normalized, ensure_ascii=False), decision, stage_key, stage_start, time.time(), slug),
+            )
+            return cur.rowcount > 0
+
+    def get_setting(self, key: str, default: str | None = None) -> str | None:
+        with self.lock:
+            row = self.conn.execute("SELECT value FROM bot_settings WHERE key=?", (str(key),)).fetchone()
+        return str(row["value"]) if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        now = time.time()
+        with self.lock, self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO bot_settings(key,value,updated_at) VALUES(?,?,?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at
+                """,
+                (str(key), str(value), now),
+            )
+
+    def delete_setting(self, key: str) -> bool:
+        with self.lock, self.conn:
+            cur = self.conn.execute("DELETE FROM bot_settings WHERE key=?", (str(key),))
+            return cur.rowcount > 0
+
+    def set_watch_gas_policy(
+        self, slug: str, *, gas_override_usd: str | None = None, ignore_gas_cap: bool = False
+    ) -> bool:
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                """
+                UPDATE watches SET gas_override_usd=?,ignore_gas_cap=?,updated_at=?
+                WHERE slug=? COLLATE NOCASE
+                """,
+                (gas_override_usd, 1 if ignore_gas_cap else 0, time.time(), slug),
             )
             return cur.rowcount > 0
 

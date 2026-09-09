@@ -136,7 +136,7 @@ class OpenSeaClient:
         self.api_key = api_key
         self._local = threading.local()
 
-        # V4.7: all REST calls share one rate-limit state even though each
+        # V4.8: all REST calls share one rate-limit state even though each
         # worker thread has its own requests.Session. OpenSea uses one bucket
         # per account/key, so a per-thread limiter would still create bursts.
         self._rate_lock = threading.Lock()
