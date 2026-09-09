@@ -26,7 +26,7 @@ class SecureStore:
     """SQLite persistence + Fernet encryption for wallet private keys.
 
     The DB is designed to live on a Railway Volume. Schema migrations are
-    intentionally additive so V3/V4 databases continue to work with V4.8.
+    intentionally additive so V3/V4 databases continue to work with V4.9.
     """
 
     def __init__(self, db_path: str, encryption_key: str):
@@ -183,7 +183,7 @@ class SecureStore:
         self._ensure_column("watches", "paid_stage_key", "TEXT")
         self._ensure_column("watches", "paid_stage_start", "REAL")
         self._ensure_column("watches", "paid_wallet_quantities_json", "TEXT NOT NULL DEFAULT '{}'")
-        # V4.8: project-specific gas policy. Global/per-chain defaults live in bot_settings.
+        # V4.9: project-specific gas policy. Global/per-chain defaults live in bot_settings.
         self._ensure_column("watches", "gas_override_usd", "TEXT")
         self._ensure_column("watches", "ignore_gas_cap", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("mint_history", "stage_key", "TEXT")

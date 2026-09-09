@@ -136,7 +136,7 @@ class OpenSeaClient:
         self.api_key = api_key
         self._local = threading.local()
 
-        # V4.8: all REST calls share one rate-limit state even though each
+        # V4.9: all REST calls share one rate-limit state even though each
         # worker thread has its own requests.Session. OpenSea uses one bucket
         # per account/key, so a per-thread limiter would still create bursts.
         self._rate_lock = threading.Lock()
@@ -168,7 +168,7 @@ class OpenSeaClient:
                 "X-API-KEY": self.api_key,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "OpenSea-Mint-Guardian/4.7",
+                "User-Agent": "OpenSea-Mint-Guardian/4.9",
             })
             self._local.session = session
         return session
@@ -380,6 +380,18 @@ class RpcPool:
         self.chain_id = int(CHAIN_CONFIGS[chain]["chain_id"])
         self.timeout = timeout
         self.broadcast_workers = max(1, broadcast_workers)
+        # V4.9: keep a persistent broadcast pool. Creating a new executor for
+        # every wallet/transaction adds avoidable latency exactly when a public
+        # mint opens. The pool is intentionally larger than broadcast_workers
+        # because several wallets may race at the same instant.
+        self._broadcast_pool_workers = max(
+            self.broadcast_workers,
+            min(64, max(8, int(os.getenv("RPC_BROADCAST_POOL_WORKERS", str(self.broadcast_workers * 8)))))
+        )
+        self._broadcast_executor = ThreadPoolExecutor(
+            max_workers=self._broadcast_pool_workers,
+            thread_name_prefix=f"rpc-broadcast-{chain}",
+        )
         self.clients: list[tuple[float, str, Web3]] = []
 
         import time
@@ -418,31 +430,28 @@ class RpcPool:
         return [url for _, url, _ in self.clients]
 
     def broadcast_raw_transaction(self, raw_tx: bytes) -> tuple[str, str]:
+        """Broadcast the same signed transaction to verified RPCs in parallel.
+
+        V4.9 uses one persistent executor for the lifetime of the process, so a
+        multi-wallet public race does not repeatedly create/destroy thread pools.
+        """
         def send(item: tuple[float, str, Web3]) -> tuple[str, str]:
             _, url, w3 = item
             tx_hash = w3.eth.send_raw_transaction(raw_tx)
             return tx_hash.hex(), url
 
-        workers = min(self.broadcast_workers, len(self.clients))
+        targets = self.clients[: max(1, min(self.broadcast_workers, len(self.clients)))]
+        futures = [self._broadcast_executor.submit(send, item) for item in targets]
         errors: list[str] = []
-        executor = ThreadPoolExecutor(max_workers=workers)
-        closed = False
-        try:
-            futures = [executor.submit(send, item) for item in self.clients]
-            for future in as_completed(futures):
-                try:
-                    tx_hash, url = future.result()
-                    for f in futures:
-                        if f is not future:
-                            f.cancel()
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    closed = True
-                    return tx_hash, url
-                except Exception as exc:
-                    errors.append(str(exc))
-        finally:
-            if not closed:
-                executor.shutdown(wait=False, cancel_futures=True)
+        for future in as_completed(futures):
+            try:
+                tx_hash, url = future.result()
+                for f in futures:
+                    if f is not future:
+                        f.cancel()
+                return tx_hash, url
+            except Exception as exc:
+                errors.append(str(exc))
         raise RuntimeError("All RPC broadcasts failed: " + " | ".join(errors[:4]))
 
     def receipt_status(self, tx_hash: str) -> int | None:
@@ -1155,3 +1164,426 @@ def mint_seadrop_public(
         return MintResult(True, "submitted", tx_hash=tx_hash, mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd, total_max_native=total_max_native, rpc=rpc_url, target=SEADROP_ADDRESS, quantity_used=quantity_used, detail=(f"Direct SeaDrop; quantity adjusted from {quantity} to {quantity_used}." if quantity_used != quantity else "Direct SeaDrop mintPublic."))
     except Exception as exc:
         return MintResult(False, "rpc_or_tx_error", target=SEADROP_ADDRESS, detail=str(exc))
+
+# ---------------------------------------------------------------------------
+# V4.9 — Ultra-fast public SeaDrop race lane
+# ---------------------------------------------------------------------------
+
+def read_seadrop_public_fast(w3: Web3, nft_contract: str) -> dict[str, Any] | None:
+    """Read only the data needed to race a SeaDrop public mint.
+
+    The normal reader also probes contract bytecode and token supply. Those are
+    useful for dashboards, but they add several RPC round trips. The race lane
+    deliberately performs only getPublicDrop and, when required, one allowed
+    fee-recipient read.
+    """
+    if not Web3.is_address(nft_contract):
+        return None
+    nft = Web3.to_checksum_address(nft_contract)
+    try:
+        seadrop = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
+        raw = seadrop.functions.getPublicDrop(nft).call()
+        price = int(raw[0])
+        start = int(raw[1])
+        end = int(raw[2])
+        max_wallet = int(raw[3])
+        fee_bps = int(raw[4])
+        restricted = bool(raw[5])
+        configured = bool(start or end or max_wallet or price or fee_bps)
+        recipients: list[str] = []
+        if configured and restricted:
+            try:
+                recipients = [
+                    Web3.to_checksum_address(x)
+                    for x in seadrop.functions.getAllowedFeeRecipients(nft).call()
+                ]
+            except Exception:
+                recipients = []
+        return {
+            "contract_address": nft,
+            "mint_price_wei": price,
+            "start_time": start,
+            "end_time": end,
+            "max_per_wallet": max_wallet if max_wallet > 0 else None,
+            "fee_bps": fee_bps,
+            "restrict_fee_recipients": restricted,
+            "fee_recipients": recipients,
+            "configured": configured,
+            # Intentionally omitted on the hot path. Supply is enforced by the
+            # contract and can be refreshed by the background metadata lane.
+            "max_supply": None,
+            "total_supply": None,
+            "remaining_supply": None,
+        }
+    except Exception as exc:
+        log.debug("SeaDrop fast public read failed %s: %s", nft_contract, exc)
+        return None
+
+
+def _race_result_for_all(
+    wallet_quantities: list[tuple[WalletConfig, int]],
+    status: str,
+    *,
+    detail: str,
+    mint_value_native: Decimal | None = None,
+    target: str | None = None,
+) -> dict[str, MintResult]:
+    return {
+        wallet.address.lower(): MintResult(
+            False,
+            status,
+            mint_value_native=mint_value_native,
+            target=target,
+            detail=detail,
+            quantity_used=max(1, min(int(quantity), 100)),
+        )
+        for wallet, quantity in wallet_quantities
+    }
+
+
+def _clamp_fee_fields_to_budget(
+    fees: dict[str, int],
+    *,
+    gas_limit: int,
+    max_gas_native: Decimal,
+    max_gas_usd: Decimal,
+    native_usd_price: Decimal | None,
+) -> dict[str, int]:
+    """Cap fee-per-gas fields to the user's configured gas budget.
+
+    The race lane can start from a faster fee strategy and then trim the bid so
+    the signed transaction's worst-case gas spend still respects the same USD
+    / native caps. This is faster than simply rejecting a high-headroom `fast`
+    quote and waiting for a later retry.
+    """
+    budget_wei: int | None = None
+    if max_gas_native > 0:
+        budget_wei = int(max_gas_native * Decimal(10**18))
+    if max_gas_usd > 0 and native_usd_price is not None and native_usd_price > 0:
+        usd_budget_wei = int((max_gas_usd / native_usd_price) * Decimal(10**18))
+        budget_wei = usd_budget_wei if budget_wei is None else min(budget_wei, usd_budget_wei)
+    if budget_wei is None or gas_limit <= 0:
+        return dict(fees)
+
+    per_gas_cap = max(1, budget_wei // int(gas_limit))
+    out = dict(fees)
+    if "gasPrice" in out:
+        out["gasPrice"] = max(1, min(int(out["gasPrice"]), per_gas_cap))
+        return out
+
+    if "maxFeePerGas" in out:
+        max_fee = max(1, min(int(out["maxFeePerGas"]), per_gas_cap))
+        out["maxFeePerGas"] = max_fee
+        if "maxPriorityFeePerGas" in out:
+            out["maxPriorityFeePerGas"] = max(1, min(int(out["maxPriorityFeePerGas"]), max_fee))
+    return out
+
+
+def prepare_seadrop_race_transactions(
+    *,
+    rpc_pool: RpcPool,
+    wallet_quantities: list[tuple[WalletConfig, int]],
+    nft_contract: str,
+    gas_strategy: str,
+    gas_limit_buffer: float,
+    max_gas_native: Decimal,
+    max_total_native: Decimal,
+    max_gas_usd: Decimal,
+    native_usd_price: Decimal | None,
+    allowed_targets: set[str],
+    allow_paid: bool = False,
+    paid_wallet_addresses: set[str] | None = None,
+    max_mint_price_native: Decimal = Decimal("0"),
+    fee_fields_override: dict[str, int] | None = None,
+    public_override: dict[str, Any] | None = None,
+    allow_before_start: bool = False,
+    static_gas_limit: int | None = None,
+    skip_balance_check: bool = False,
+    clamp_fees_to_gas_budget: bool = False,
+) -> dict[str, Any]:
+    """Pre-build and sign a batch of SeaDrop public transactions.
+
+    For a *scheduled* public opening, pass ``allow_before_start=True`` and a
+    conservative ``static_gas_limit``. This allows the expensive work (public
+    config, fee fields, nonces, balance checks and signatures) to finish before
+    the opening timestamp; the launch step then performs only raw broadcasts.
+
+    For a live mint discovered from Stream after it has already started, leave
+    ``static_gas_limit=None``. One gas estimate is shared by every wallet that
+    uses the same quantity instead of re-running the full SeaDrop read and gas
+    simulation per wallet.
+    """
+    cleaned: list[tuple[WalletConfig, int]] = []
+    for wallet, quantity in wallet_quantities:
+        q = max(1, min(int(quantity), 100))
+        cleaned.append((wallet, q))
+    if not cleaned:
+        return {"entries": [], "results": {}, "prepared_at": time.time()}
+
+    w3 = rpc_pool.primary
+    public = public_override or read_seadrop_public_fast(w3, nft_contract)
+    if not public or not public.get("configured"):
+        return {
+            "entries": [],
+            "results": _race_result_for_all(cleaned, "seadrop_not_configured", detail="No configured public SeaDrop was found."),
+            "prepared_at": time.time(),
+        }
+
+    now = int(time.time())
+    start = int(public.get("start_time") or 0)
+    end = int(public.get("end_time") or 0)
+    if start and now < start and not allow_before_start:
+        return {
+            "entries": [],
+            "results": _race_result_for_all(cleaned, "not_mintable_yet", detail=f"Public mint opens at {start}"),
+            "prepared_at": time.time(),
+            "public": public,
+        }
+    if end and now >= end:
+        return {
+            "entries": [],
+            "results": _race_result_for_all(cleaned, "precondition_failed", detail=f"Public mint ended at {end}"),
+            "prepared_at": time.time(),
+            "public": public,
+        }
+
+    price_each = int(public.get("mint_price_wei") or 0)
+    max_per_wallet = int(public.get("max_per_wallet") or 0) or None
+    paid_set = {x.lower() for x in (paid_wallet_addresses or set())}
+    adjusted: list[tuple[WalletConfig, int]] = []
+    results: dict[str, MintResult] = {}
+    for wallet, quantity in cleaned:
+        q = min(quantity, max_per_wallet) if max_per_wallet else quantity
+        q = max(1, min(q, 100))
+        value = price_each * q
+        value_native = Decimal(value) / Decimal(10**18)
+        if value > 0 and not allow_paid:
+            results[wallet.address.lower()] = MintResult(
+                False, "paid_not_allowed", mint_value_native=value_native,
+                target=SEADROP_ADDRESS, quantity_used=q,
+                detail="Paid direct SeaDrop race refused by policy.",
+            )
+            continue
+        if value > 0 and wallet.address.lower() not in paid_set:
+            results[wallet.address.lower()] = MintResult(
+                False, "paid_wallet_selection_required", mint_value_native=value_native,
+                target=SEADROP_ADDRESS, quantity_used=q,
+                detail="Paid direct SeaDrop race requires explicit wallet selection.",
+            )
+            continue
+        if max_mint_price_native > 0 and value_native > max_mint_price_native:
+            results[wallet.address.lower()] = MintResult(
+                False, "mint_price_too_high", mint_value_native=value_native,
+                target=SEADROP_ADDRESS, quantity_used=q,
+                detail=f"Mint price {value_native} > cap {max_mint_price_native}",
+            )
+            continue
+        adjusted.append((wallet, q))
+
+    if not adjusted:
+        return {"entries": [], "results": results, "prepared_at": time.time(), "public": public}
+
+    fee_recipient = _seadrop_fee_recipient(public)
+    if not fee_recipient:
+        results.update(_race_result_for_all(adjusted, "no_fee_recipient", detail="Restricted SeaDrop has no allowed fee recipient.", target=SEADROP_ADDRESS))
+        return {"entries": [], "results": results, "prepared_at": time.time(), "public": public}
+    if allowed_targets and SEADROP_ADDRESS.lower() not in allowed_targets:
+        results.update(_race_result_for_all(adjusted, "target_not_allowed", detail=f"Refused target contract {SEADROP_ADDRESS}", target=SEADROP_ADDRESS))
+        return {"entries": [], "results": results, "prepared_at": time.time(), "public": public}
+
+    # One fee snapshot for the whole project, not once per wallet. The race
+    # lane can inject a background-refreshed snapshot so the launch path does
+    # not spend an RPC round-trip fetching base/priority fees.
+    try:
+        fees = dict(fee_fields_override) if fee_fields_override else build_fee_fields(w3, gas_strategy)
+    except Exception as exc:
+        results.update(_race_result_for_all(adjusted, "rpc_or_tx_error", detail=f"Fee read failed: {exc}", target=SEADROP_ADDRESS))
+        return {"entries": [], "results": results, "prepared_at": time.time(), "public": public}
+
+    gas_by_qty: dict[int, int] = {}
+    if static_gas_limit is not None and int(static_gas_limit) > 21_000:
+        for _wallet, q in adjusted:
+            gas_by_qty[q] = int(static_gas_limit)
+    else:
+        # The mint is already live, so estimate once per distinct quantity.
+        groups: dict[int, WalletConfig] = {}
+        for wallet, q in adjusted:
+            groups.setdefault(q, wallet)
+        for q, sample_wallet in groups.items():
+            try:
+                sample_tx = _seadrop_base_tx(
+                    w3,
+                    payer=sample_wallet.address,
+                    nft_contract=nft_contract,
+                    fee_recipient=fee_recipient,
+                    quantity=q,
+                    mint_price_wei=price_each,
+                    chain_id=rpc_pool.chain_id,
+                )
+                estimated = int(w3.eth.estimate_gas(sample_tx))
+                gas_by_qty[q] = max(estimated, math.ceil(estimated * gas_limit_buffer))
+            except Exception as exc:
+                # Keep only this quantity group out of the batch; the caller can
+                # retry on the next fast tick or fall back to the normal path.
+                for wallet, wallet_q in adjusted:
+                    if wallet_q == q:
+                        results[wallet.address.lower()] = MintResult(
+                            False, "simulation_failed", target=SEADROP_ADDRESS,
+                            quantity_used=q, detail=str(exc),
+                        )
+
+    eligible = [(w, q) for w, q in adjusted if q in gas_by_qty and w.address.lower() not in results]
+    if not eligible:
+        return {"entries": [], "results": results, "prepared_at": time.time(), "public": public}
+
+    # Fetch pending nonces (and, during prewarm, balances) concurrently. These
+    # calls finish before opening for scheduled races.
+    wallet_runtime: dict[str, tuple[int, int | None]] = {}
+
+    def read_wallet_runtime(item: tuple[WalletConfig, int]) -> tuple[str, int, int | None]:
+        wallet, _q = item
+        address = Web3.to_checksum_address(wallet.address)
+        nonce = int(w3.eth.get_transaction_count(address, "pending"))
+        balance = None if skip_balance_check else int(w3.eth.get_balance(address))
+        return wallet.address.lower(), nonce, balance
+
+    with ThreadPoolExecutor(max_workers=min(32, len(eligible))) as executor:
+        futures = [executor.submit(read_wallet_runtime, item) for item in eligible]
+        for future in as_completed(futures):
+            try:
+                addr, nonce, balance = future.result()
+                wallet_runtime[addr] = (nonce, balance)
+            except Exception as exc:
+                log.debug("Race wallet prewarm failed: %s", exc)
+
+    entries: list[dict[str, Any]] = []
+    for wallet, q in eligible:
+        addr_l = wallet.address.lower()
+        runtime = wallet_runtime.get(addr_l)
+        if runtime is None:
+            results[addr_l] = MintResult(False, "rpc_or_tx_error", target=SEADROP_ADDRESS, quantity_used=q, detail="Could not prefetch pending nonce.")
+            continue
+        nonce, balance = runtime
+        gas_limit = int(gas_by_qty[q])
+        tx_fees = (
+            _clamp_fee_fields_to_budget(
+                fees, gas_limit=gas_limit, max_gas_native=max_gas_native,
+                max_gas_usd=max_gas_usd, native_usd_price=native_usd_price,
+            )
+            if clamp_fees_to_gas_budget else dict(fees)
+        )
+        gas_cost_wei = max_gas_cost_wei(gas_limit, tx_fees)
+        gas_cost_native = Decimal(gas_cost_wei) / Decimal(10**18)
+        gas_cost_usd = gas_cost_native * native_usd_price if native_usd_price is not None else None
+        value = price_each * q
+        mint_value_native = Decimal(value) / Decimal(10**18)
+        total_max_native = mint_value_native + gas_cost_native
+
+        if max_gas_usd > 0:
+            if gas_cost_usd is None:
+                results[addr_l] = MintResult(False, "gas_price_unavailable", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=q, detail="USD gas budget enabled but native/USD price unavailable")
+                continue
+            if gas_cost_usd > max_gas_usd:
+                results[addr_l] = MintResult(False, "gas_usd_too_high", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=q, detail=f"Estimated max gas ${gas_cost_usd:.6f} > USD cap ${max_gas_usd}")
+                continue
+        if max_gas_native > 0 and gas_cost_native > max_gas_native:
+            results[addr_l] = MintResult(False, "gas_too_high", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=q, detail=f"Estimated max gas {gas_cost_native} > cap {max_gas_native}")
+            continue
+        if max_total_native > 0 and total_max_native > max_total_native:
+            results[addr_l] = MintResult(False, "total_spend_too_high", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=q, detail=f"Estimated total max {total_max_native} > cap {max_total_native}")
+            continue
+        if balance is not None and balance < gas_cost_wei + value:
+            results[addr_l] = MintResult(False, "insufficient_balance", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=q, detail=f"Wallet balance {balance} wei < estimated requirement {gas_cost_wei + value} wei")
+            continue
+
+        account = Account.from_key(wallet.private_key)
+        base_tx = _seadrop_base_tx(
+            w3,
+            payer=wallet.address,
+            nft_contract=nft_contract,
+            fee_recipient=fee_recipient,
+            quantity=q,
+            mint_price_wei=price_each,
+            chain_id=rpc_pool.chain_id,
+            nonce=nonce,
+        )
+        tx = {**base_tx, "gas": gas_limit, **tx_fees}
+        try:
+            signed = account.sign_transaction(tx)
+            raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
+        except Exception as exc:
+            results[addr_l] = MintResult(False, "signing_failed", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=q, detail=str(exc))
+            continue
+        entries.append({
+            "wallet": wallet,
+            "quantity": q,
+            "raw": raw,
+            "nonce": nonce,
+            "gas_limit": gas_limit,
+            "gas_cost_native": gas_cost_native,
+            "gas_cost_usd": gas_cost_usd,
+            "mint_value_native": mint_value_native,
+            "total_max_native": total_max_native,
+            "fee_fields": tx_fees,
+        })
+
+    return {
+        "entries": entries,
+        "results": results,
+        "public": public,
+        "fee_recipient": fee_recipient,
+        "fees": fees,
+        "prepared_at": time.time(),
+        "static_gas": static_gas_limit is not None,
+    }
+
+
+def broadcast_seadrop_race_transactions(
+    *,
+    rpc_pool: RpcPool,
+    bundle: dict[str, Any],
+    max_parallel_wallets: int = 10,
+) -> dict[str, MintResult]:
+    """Broadcast a pre-signed SeaDrop race bundle concurrently."""
+    results: dict[str, MintResult] = dict(bundle.get("results") or {})
+    entries = list(bundle.get("entries") or [])
+    if not entries:
+        return results
+
+    def send(entry: dict[str, Any]) -> tuple[str, MintResult]:
+        wallet: WalletConfig = entry["wallet"]
+        addr_l = wallet.address.lower()
+        try:
+            tx_hash, rpc_url = rpc_pool.broadcast_raw_transaction(entry["raw"])
+            return addr_l, MintResult(
+                True,
+                "submitted",
+                tx_hash=tx_hash,
+                mint_value_native=entry["mint_value_native"],
+                gas_cost_native=entry["gas_cost_native"],
+                gas_cost_usd=entry["gas_cost_usd"],
+                total_max_native=entry["total_max_native"],
+                detail="V4.9 race-lane pre-signed SeaDrop transaction.",
+                rpc=rpc_url,
+                target=SEADROP_ADDRESS,
+                quantity_used=int(entry["quantity"]),
+            )
+        except Exception as exc:
+            return addr_l, MintResult(
+                False,
+                "rpc_or_tx_error",
+                mint_value_native=entry["mint_value_native"],
+                gas_cost_native=entry["gas_cost_native"],
+                gas_cost_usd=entry["gas_cost_usd"],
+                total_max_native=entry["total_max_native"],
+                detail=str(exc),
+                target=SEADROP_ADDRESS,
+                quantity_used=int(entry["quantity"]),
+            )
+
+    with ThreadPoolExecutor(max_workers=max(1, min(int(max_parallel_wallets), len(entries)))) as executor:
+        futures = [executor.submit(send, entry) for entry in entries]
+        for future in as_completed(futures):
+            addr, result = future.result()
+            results[addr] = result
+    return results

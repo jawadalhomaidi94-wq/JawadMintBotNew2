@@ -35,10 +35,14 @@ from buyer import (
     alchemy_rpc,
     check_eligibility,
     check_seadrop_eligibility,
+    build_fee_fields,
     default_rpcs,
     explorer_tx_url,
     mint_drop,
     mint_seadrop_public,
+    prepare_seadrop_race_transactions,
+    broadcast_seadrop_race_transactions,
+    read_seadrop_public_fast,
     native_symbol,
     normalize_chain,
     opensea_chain_name,
@@ -663,33 +667,54 @@ class AlchemyPriceOracle:
         if not self.api_key or not symbol:
             return None
         now = time.time()
+        # Never hold the cache lock while doing HTTP. The V4.9 race lane calls
+        # peek_usd(), and a background price refresh must not make that hot
+        # read wait behind a multi-second network request.
         with self._lock:
             cached = self._cache.get(symbol)
             if cached and now - cached[0] <= self.ttl_seconds:
                 return cached[1]
-            try:
-                url = f"https://api.g.alchemy.com/prices/v1/{self.api_key}/tokens/by-symbol"
-                response = requests.get(url, params={"symbols": symbol}, timeout=self.timeout)
-                response.raise_for_status()
-                payload = response.json()
-                rows = payload.get("data", []) if isinstance(payload, dict) else []
-                for row in rows if isinstance(rows, list) else []:
-                    if str(row.get("symbol", "")).upper() != symbol:
-                        continue
-                    prices = row.get("prices", [])
-                    for price in prices if isinstance(prices, list) else []:
-                        if str(price.get("currency", "")).upper() == "USD":
-                            value = Decimal(str(price.get("value")))
-                            if value > 0:
-                                self._cache[symbol] = (now, value)
-                                return value
-            except Exception as exc:
-                log.debug("Alchemy price lookup failed for %s: %s", symbol, exc)
-                # A recent stale value is safer than disabling execution entirely
-                # because of one transient HTTP error. Limit stale use to 10 min.
-                cached = self._cache.get(symbol)
-                if cached and now - cached[0] <= 600:
-                    return cached[1]
+        try:
+            url = f"https://api.g.alchemy.com/prices/v1/{self.api_key}/tokens/by-symbol"
+            response = requests.get(url, params={"symbols": symbol}, timeout=self.timeout)
+            response.raise_for_status()
+            payload = response.json()
+            rows = payload.get("data", []) if isinstance(payload, dict) else []
+            for row in rows if isinstance(rows, list) else []:
+                if str(row.get("symbol", "")).upper() != symbol:
+                    continue
+                prices = row.get("prices", [])
+                for price in prices if isinstance(prices, list) else []:
+                    if str(price.get("currency", "")).upper() == "USD":
+                        value = Decimal(str(price.get("value")))
+                        if value > 0:
+                            with self._lock:
+                                self._cache[symbol] = (time.time(), value)
+                            return value
+        except Exception as exc:
+            log.debug("Alchemy price lookup failed for %s: %s", symbol, exc)
+        # A recent stale value is safer than disabling execution entirely
+        # because of one transient HTTP error. Limit stale use to 10 minutes.
+        with self._lock:
+            cached = self._cache.get(symbol)
+            if cached and now - cached[0] <= 600:
+                return cached[1]
+        return None
+
+    def peek_usd(self, symbol: str, *, max_age_seconds: float = 600.0) -> Decimal | None:
+        """Return an already-cached price without performing network I/O.
+
+        The hot mint path must never pause on an HTTP price request. A separate
+        background warmer keeps this cache fresh.
+        """
+        symbol = symbol.upper().strip()
+        if not symbol:
+            return None
+        now = time.time()
+        with self._lock:
+            cached = self._cache.get(symbol)
+            if cached and now - cached[0] <= max(10.0, float(max_age_seconds)):
+                return cached[1]
         return None
 
 
@@ -767,9 +792,15 @@ class Candidate:
     processed_stage_key: str = ""
     schedule_summary_notified: bool = False
     stage_open_notified_keys: set[str] = field(default_factory=set)
-    # V4.8 project-specific gas policy. None means inherit the saved chain/global setting.
+    # V4.9 project-specific gas policy. None means inherit the saved chain/global setting.
     gas_override_usd: Decimal | None = None
     ignore_gas_cap: bool = False
+    # V4.9 race-lane state. These fields prevent the background candidate loop
+    # from racing the dedicated public-mint engine for the same stage.
+    race_stage_key: str = ""
+    race_inflight: bool = False
+    race_last_attempt: float = 0.0
+    race_prepared: bool = False
 
     def submitted_count(self) -> int:
         return sum(1 for s in self.wallets.values() if s.submitted)
@@ -945,7 +976,7 @@ class Bot:
         self.max_mint_price_default = env_decimal("MAX_MINT_PRICE_NATIVE", "0")
         self.max_total_native = env_decimal("MAX_TOTAL_NATIVE", "0")
         self.max_gas_native = env_decimal("MAX_GAS_NATIVE", "0")
-        # V4.8: gas budgets are persisted in SQLite and editable from Telegram.
+        # V4.9: gas budgets are persisted in SQLite and editable from Telegram.
         # Environment values are only first-run fallbacks; after that the saved
         # settings are authoritative across Railway restarts/redeploys.
         def _stored_decimal(key: str, fallback: Decimal) -> Decimal:
@@ -1043,13 +1074,35 @@ class Bot:
         self.auto_stage_high_limit_quantity = max(1, min(env_int("AUTO_STAGE_HIGH_LIMIT_QTY", 30), 100))
         self.stage_discovery_horizon_seconds = max(3600, env_int("STAGE_DISCOVERY_HORIZON_SECONDS", 604800))
         self.public_preopen_window_seconds = max(1.0, env_float("PUBLIC_PREOPEN_WINDOW_SECONDS", 5.0))
-        self.public_fast_retry_seconds = max(0.05, env_float("PUBLIC_FAST_RETRY_SECONDS", 0.10))
+        self.public_fast_retry_seconds = max(0.02, env_float("PUBLIC_FAST_RETRY_SECONDS", 0.05))
+
+        # V4.9 RACE LANE. Scheduled Public mints are pre-built/signed shortly
+        # before opening and broadcast by a dedicated scheduler at the opening
+        # timestamp. Live Stream/SeaDrop signals bypass discovery queues and
+        # enter a separate executor immediately.
+        self.race_enabled = env_bool("RACE_LANE_ENABLED", True)
+        self.race_prewarm_seconds = max(0.30, env_float("RACE_PREWARM_SECONDS", 2.0))
+        self.race_scheduler_tick = max(0.005, env_float("RACE_SCHEDULER_TICK", 0.01))
+        self.race_retry_seconds = max(0.02, env_float("RACE_RETRY_SECONDS", 0.05))
+        self.race_launch_window_seconds = max(1.0, env_float("RACE_LAUNCH_WINDOW_SECONDS", 8.0))
+        self.race_static_gas_limit = max(80_000, env_int("RACE_PUBLIC_GAS_LIMIT", 300_000))
+        self.race_open_offset_seconds = max(0.0, env_float("RACE_OPEN_OFFSET_MS", 0.0) / 1000.0)
+        self.race_stream_workers = max(2, min(env_int("RACE_STREAM_WORKERS", 16), 64))
+        self.race_gas_strategy = os.getenv("RACE_GAS_STRATEGY", "fast").strip().lower()
+        if self.race_gas_strategy not in {"economy", "balanced", "smart", "fast", "turbo"}:
+            self.race_gas_strategy = "fast"
+        # Hot market snapshots are refreshed outside the launch path. This
+        # avoids spending precious milliseconds on fee/price HTTP/RPC reads
+        # when a small public mint opens.
+        self.race_fee_refresh_seconds = max(0.15, env_float("RACE_FEE_REFRESH_SECONDS", 0.50))
+        self.race_price_refresh_seconds = max(10.0, env_float("RACE_PRICE_REFRESH_SECONDS", 30.0))
+        self.seadrop_wss_enabled = env_bool("SEADROP_WSS_DISCOVERY", True)
         self.qualification_recheck_seconds = max(5.0, env_float("QUALIFICATION_RECHECK_SECONDS", 15.0))
         # OpenSea's wallet-specific mint builder is quota-sensitive. Direct
         # SeaDrop checks stay fully parallel, while OpenSea qualification calls
         # use a small worker cap to avoid a many-wallet 429 burst.
         self.opensea_eligibility_workers = max(1, min(env_int("OPENSEA_ELIGIBILITY_WORKERS", 2), 6))
-        # V4.8: qualification/monitoring are quiet dashboards by default.
+        # V4.9: qualification/monitoring are quiet dashboards by default.
         # Routine stage messages are shown only when the user opens the section;
         # transaction submitted/confirmed/reverted notifications remain active.
         self.routine_stage_notifications = (self.store.get_setting("routine_stage_notifications", "0") == "1")
@@ -1066,6 +1119,27 @@ class Bot:
         # command execution to the mint/stage loop, so long eligibility/network
         # checks could starve /start and inline-button callbacks.
         self.command_worker_thread: threading.Thread | None = None
+
+        # V4.9 independent hot-path state. None of these workers consumes the
+        # catalog/discovery queue used by the slower metadata lane.
+        self.candidates_lock = threading.RLock()
+        self.race_state_lock = threading.RLock()
+        self.race_executor = ThreadPoolExecutor(
+            max_workers=self.race_stream_workers,
+            thread_name_prefix="mint-race",
+        )
+        self.race_prepared: dict[str, dict[str, Any]] = {}
+        self.race_preparing: set[str] = set()
+        self.race_active: set[str] = set()
+        self.race_queued: set[str] = set()
+        self.race_signal_seen: dict[str, float] = {}
+        self.race_scheduler_thread: threading.Thread | None = None
+        self.seadrop_log_threads: list[threading.Thread] = []
+        self.race_market_thread: threading.Thread | None = None
+        self.race_market_lock = threading.RLock()
+        self.race_fee_cache: dict[str, tuple[float, dict[str, int]]] = {}
+        self.race_last_price_refresh = 0.0
+
         self.pending_wallet_name: dict[str, float] = {}
         self.pending_wallet_import: dict[str, dict[str, Any]] = {}
         self.pending_wallet_rename: dict[str, dict[str, Any]] = {}
@@ -1332,7 +1406,7 @@ class Bot:
                 log.warning("RPC pool disabled for %s: %s", chain, exc)
 
     def max_gas_for_chain(self, chain: str) -> Decimal:
-        # Native cap stays as a compatibility safety valve; V4.8's primary
+        # Native cap stays as a compatibility safety valve; V4.9's primary
         # budget is the Telegram-managed USD cap below.
         raw = os.getenv(f"{chain.upper()}_MAX_GAS_NATIVE", "").strip()
         if raw:
@@ -1384,6 +1458,90 @@ class Bot:
 
     def native_usd_price_for_chain(self, chain: str) -> Decimal | None:
         return self.price_oracle.get_usd(native_symbol(chain))
+
+    def race_native_usd_price(self, chain: str, *, allow_network: bool = False) -> Decimal | None:
+        """Return a cached USD price for the race lane.
+
+        Live/scheduled launch threads should not block on an HTTP price lookup.
+        The market warmer continuously refreshes this cache. During prewarm we
+        may allow a synchronous lookup as a fallback because it happens before
+        the opening timestamp.
+        """
+        symbol = native_symbol(chain)
+        cached = self.price_oracle.peek_usd(symbol, max_age_seconds=max(120.0, self.race_price_refresh_seconds * 4))
+        if cached is not None:
+            return cached
+        return self.price_oracle.get_usd(symbol) if allow_network else None
+
+    def race_fee_fields(self, chain: str, *, allow_network: bool = False) -> dict[str, int] | None:
+        now = time.time()
+        with self.race_market_lock:
+            cached = self.race_fee_cache.get(chain)
+            if cached and now - cached[0] <= max(2.0, self.race_fee_refresh_seconds * 6):
+                return dict(cached[1])
+        if not allow_network or chain not in self.rpc_pools:
+            return None
+        try:
+            fields = build_fee_fields(self.rpc_pools[chain].primary, self.race_gas_strategy)
+            with self.race_market_lock:
+                self.race_fee_cache[chain] = (time.time(), dict(fields))
+            return fields
+        except Exception:
+            return None
+
+    def _race_market_warmer_loop(self) -> None:
+        """Keep fee and native/USD snapshots hot outside the mint path."""
+        log.info(
+            "Race market warmer ready | fee=%.2fs | price=%.0fs",
+            self.race_fee_refresh_seconds, self.race_price_refresh_seconds,
+        )
+        next_price = 0.0
+        while not STOP:
+            cycle = time.time()
+            # Fee snapshots are chain-specific and cheap RPC reads. Refresh in
+            # parallel so one slow endpoint cannot make every network stale.
+            def fee_job(item: tuple[str, RpcPool]):
+                chain, pool = item
+                try:
+                    return chain, build_fee_fields(pool.primary, self.race_gas_strategy)
+                except Exception:
+                    return chain, None
+
+            items = list(self.rpc_pools.items())
+            if items:
+                with ThreadPoolExecutor(max_workers=min(len(items), 8)) as executor:
+                    futures = [executor.submit(fee_job, item) for item in items]
+                    for future in as_completed(futures):
+                        try:
+                            chain, fields = future.result()
+                            if fields:
+                                with self.race_market_lock:
+                                    self.race_fee_cache[chain] = (time.time(), dict(fields))
+                        except Exception:
+                            pass
+
+            if cycle >= next_price:
+                # Current supported EVM networks use ETH as their native gas
+                # asset, but dedupe by symbol so future chains are safe too.
+                symbols = sorted({native_symbol(chain) for chain in self.rpc_pools})
+                for symbol in symbols:
+                    try:
+                        self.price_oracle.get_usd(symbol)
+                    except Exception:
+                        pass
+                self.race_last_price_refresh = time.time()
+                next_price = cycle + self.race_price_refresh_seconds
+
+            elapsed = time.time() - cycle
+            time.sleep(max(0.05, self.race_fee_refresh_seconds - elapsed))
+
+    def start_race_market_warmer(self) -> None:
+        if not self.race_enabled or (self.race_market_thread and self.race_market_thread.is_alive()):
+            return
+        self.race_market_thread = threading.Thread(
+            target=self._race_market_warmer_loop, name="race-market-warmer", daemon=True
+        )
+        self.race_market_thread.start()
 
     # ---------- drop parsing / watch ----------
     def load_env_watches_to_store(self) -> None:
@@ -1562,6 +1720,25 @@ class Bot:
         now = time.time()
         discovered_contract = extract_contract_address(drop)
 
+        # V4.9: the race lane can create a contract-first candidate milliseconds
+        # before the slower OpenSea metadata lane resolves the slug. Merge by
+        # (chain, contract) so metadata enrichment can never create a second
+        # candidate that races the same wallet/nonce for the same mint.
+        if candidate is None and discovered_contract:
+            contract_l = str(discovered_contract).lower()
+            with self.candidates_lock:
+                contract_match = next((
+                    (existing_key, existing) for existing_key, existing in self.candidates.items()
+                    if existing.chain == chain and existing.contract_address
+                    and existing.contract_address.lower() == contract_l
+                ), None)
+                if contract_match is not None:
+                    old_key, candidate = contract_match
+                    if old_key != key:
+                        self.candidates.pop(old_key, None)
+                        candidate.slug = slug
+                        self.candidates[key] = candidate
+
         if candidate is None:
             candidate = Candidate(
                 slug=slug, chain=chain, source=source, allow_paid=allow_paid,
@@ -1572,7 +1749,8 @@ class Bot:
                 watch_kind="auto_stage" if auto_discovered and has_qualification_stages(plans) else ("auto_free" if auto_discovered else "manual"),
                 discovery_source="drops" if auto_discovered else "manual-link",
             )
-            self.candidates[key] = candidate
+            with self.candidates_lock:
+                self.candidates[key] = candidate
         elif auto_discovered and not candidate.auto_discovered:
             # A manually watched project keeps its manual execution policy but
             # still receives fresh stage metadata from automatic discovery.
@@ -2036,6 +2214,504 @@ class Bot:
         lines.extend(["", f"🔗 رابط المنت (للنسخ):\n{self.mint_url(slug=slug, chain=chain, source=raw, contract_address=contract)}"])
         return "\n".join(lines)[:3900]
 
+    # ---------- V4.9 ultra-fast race lane ----------
+    def _race_key(self, candidate: Candidate, stage_key: str | None = None) -> str:
+        return f"{self.project_key_for_candidate(candidate)}:{stage_key or candidate.current_stage_key or 'public'}"
+
+    def _fast_plan_from_public(self, public: dict[str, Any], contract: str) -> dict[str, Any]:
+        start = float(public.get("start_time") or 0) or None
+        end = float(public.get("end_time") or 0) or None
+        price_wei = int(public.get("mint_price_wei") or 0)
+        limit = int(public.get("max_per_wallet") or 0) or None
+        return {
+            "key": hashlib.sha1(f"race|{contract.lower()}|{start}|{end}|{price_wei}|{limit}".encode()).hexdigest()[:16],
+            "index": 0,
+            "label": "Public SeaDrop",
+            "start": start,
+            "end": end,
+            "is_public": True,
+            "is_free": price_wei == 0,
+            "is_paid": price_wei > 0,
+            "wallet_limit": limit,
+            "price": str(Decimal(price_wei) / Decimal(10**18)),
+        }
+
+    def _ensure_fast_candidate(
+        self, chain: str, contract: str, slug: str | None,
+        public: dict[str, Any], source: str,
+    ) -> Candidate:
+        contract = Web3.to_checksum_address(contract)
+        with self.candidates_lock:
+            existing = next((
+                c for c in self.candidates.values()
+                if c.chain == chain and c.contract_address and c.contract_address.lower() == contract.lower()
+            ), None)
+            if existing is not None:
+                candidate = existing
+                if slug and candidate.slug.startswith("contract-"):
+                    candidate.slug = slug
+            else:
+                safe_slug = slug or f"contract-{contract[-10:].lower()}"
+                candidate = Candidate(
+                    slug=safe_slug, chain=chain, source=source, allow_paid=True,
+                    max_mint_price_native=self.max_mint_price_default,
+                    auto_discovered=True, mint_backend="seadrop",
+                    contract_address=contract, discovery_source=source,
+                    watch_kind="auto_free",
+                )
+                for wallet in self.wallets:
+                    if wallet.supports_chain(chain):
+                        candidate.wallets[wallet.address.lower()] = WalletState(wallet=wallet, quantity=wallet.quantity)
+                self.candidates[f"{chain}:{safe_slug}"] = candidate
+            plan = self._fast_plan_from_public(public, contract)
+            # Preserve richer OpenSea allowlist/signed-stage metadata if this
+            # candidate already exists. The on-chain public plan is merged in
+            # rather than replacing the qualification timeline.
+            if candidate.stage_plans:
+                same_public = next((
+                    p for p in candidate.stage_plans
+                    if p.get("is_public") and (
+                        str(p.get("key") or "") == str(plan.get("key") or "")
+                        or (p.get("start") is not None and plan.get("start") is not None and abs(float(p["start"]) - float(plan["start"])) < 2.0)
+                    )
+                ), None)
+                if same_public is not None:
+                    same_public.update(plan)
+                else:
+                    candidate.stage_plans.append(plan)
+                    candidate.stage_plans.sort(key=lambda p: float(p.get("start") or 0))
+            else:
+                candidate.stage_plans = [plan]
+            candidate.public_start = plan.get("start") or candidate.public_start
+            candidate.stage_end = plan.get("end") or candidate.stage_end
+            candidate.wallet_limit = plan.get("wallet_limit") or candidate.wallet_limit
+            now = time.time()
+            if plan.get("start") and float(plan["start"]) > now:
+                candidate.next_stage_start = min(
+                    [x for x in [candidate.next_stage_start, float(plan["start"])] if x is not None],
+                    default=float(plan["start"]),
+                )
+            active_public = (not plan.get("start") or now >= float(plan["start"])) and (not plan.get("end") or now < float(plan["end"]))
+            if active_public:
+                candidate.current_stage_key = str(plan.get("key") or "")
+                candidate.current_stage_label = str(plan.get("label") or "Public SeaDrop")
+                candidate.current_stage_start = plan.get("start")
+                candidate.current_stage_end = plan.get("end")
+                candidate.current_stage_public = True
+                candidate.current_stage_free = bool(plan.get("is_free"))
+                candidate.current_stage_paid = bool(plan.get("is_paid"))
+                candidate.current_stage_limit = plan.get("wallet_limit")
+            candidate.last_seen_auto = now
+            return candidate
+
+    def _race_wallet_work(self, candidate: Candidate, plan: dict[str, Any]) -> list[tuple[WalletState, int]]:
+        work: list[tuple[WalletState, int]] = []
+        is_paid = bool(plan.get("is_paid"))
+        target_total = self.stage_target_total(candidate, plan)
+        for state in candidate.wallets.values():
+            if state.submitted:
+                continue
+            address = state.wallet.address.lower()
+            if is_paid:
+                if candidate.paid_decision != "confirmed" or address not in candidate.paid_wallet_addresses:
+                    continue
+                qty = int(candidate.paid_wallet_quantities.get(address) or 0)
+                if qty <= 0:
+                    continue
+                if plan.get("wallet_limit"):
+                    qty = min(qty, int(plan["wallet_limit"]))
+            else:
+                confirmed = self.confirmed_total_for_wallet(candidate, state.wallet.address)
+                state.confirmed_total = confirmed
+                state.target_total = target_total
+                qty = max(0, target_total - confirmed)
+                if candidate.quantity_override:
+                    qty = min(qty, max(1, int(candidate.quantity_override)))
+            if qty <= 0:
+                continue
+            qty = max(1, min(int(qty), 100))
+            state.quantity = qty
+            state.stage_key = str(plan.get("key") or "")
+            state.stage_label = str(plan.get("label") or "Public SeaDrop")
+            work.append((state, qty))
+        return work
+
+    def _apply_race_results(self, candidate: Candidate, plan: dict[str, Any], results: dict[str, Any]) -> int:
+        submitted = 0
+        now = time.time()
+        for addr_l, result in results.items():
+            state = candidate.wallets.get(addr_l.lower())
+            if state is None:
+                continue
+            state.status = result.status
+            state.last_detail = result.detail
+            if result.ok:
+                submitted += 1
+                state.submitted = True
+                state.final = False
+                state.pending_quantity = int(result.quantity_used or state.quantity or 1)
+                state.quantity = state.pending_quantity
+                state.tx_hash = result.tx_hash
+                state.mint_value_native = result.mint_value_native
+                state.receipt_next_check = now + self.receipt_check_seconds
+                self.store.record_mint(
+                    slug=candidate.slug, chain=candidate.chain,
+                    wallet_name=state.wallet.name, wallet_address=state.wallet.address,
+                    status="submitted", tx_hash=result.tx_hash,
+                    mint_value_native=str(result.mint_value_native),
+                    gas_max_native=str(result.gas_cost_native), quantity=state.pending_quantity,
+                    detail=result.detail, contract_address=candidate.contract_address,
+                    stage_key=state.stage_key or None, stage_label=state.stage_label or None,
+                    watch_kind=candidate.watch_kind,
+                )
+                self.notify_all(
+                    "⚡🚀 تم إرسال Mint عبر Race Lane\n\n"
+                    f"📦 المشروع: {candidate.slug}\n"
+                    f"🎟 المرحلة: {state.stage_label}\n"
+                    f"🌐 الشبكة: {chain_label(candidate.chain)}\n"
+                    f"👛 المحفظة: {state.wallet.name} {short_address(state.wallet.address)}\n"
+                    f"🔢 الكمية: {state.pending_quantity}\n"
+                    f"💰 القيمة: {result.mint_value_native} {native_symbol(candidate.chain)}\n"
+                    + (f"⛽ أقصى تقدير: ${result.gas_cost_usd:.4f}\n" if result.gas_cost_usd is not None else "")
+                    + "\n" + self.mint_link_block(candidate)
+                    + "\n\n🔎 المعاملة:\n" + explorer_tx_url(candidate.chain, result.tx_hash or "")
+                )
+            else:
+                # Keep hot failures retryable while the short launch window is
+                # still open. Gas policy and paid-policy failures keep their
+                # normal slower retry semantics.
+                if result.status in {"gas_usd_too_high", "gas_price_unavailable", "gas_too_high"}:
+                    state.next_attempt = now + self.gas_over_budget_retry_seconds
+                elif result.status in {"paid_not_allowed", "paid_wallet_selection_required", "mint_price_too_high"}:
+                    state.next_attempt = now + 15.0
+                else:
+                    state.next_attempt = now + self.race_retry_seconds
+        return submitted
+
+    def _prepare_race_bundle(self, candidate: Candidate, plan: dict[str, Any], public: dict[str, Any]) -> dict[str, Any] | None:
+        if not candidate.contract_address:
+            return None
+        work = self._race_wallet_work(candidate, plan)
+        if not work:
+            return None
+        paid = bool(plan.get("is_paid"))
+        return prepare_seadrop_race_transactions(
+            rpc_pool=self.rpc_pools[candidate.chain],
+            wallet_quantities=[(state.wallet, qty) for state, qty in work],
+            nft_contract=candidate.contract_address,
+            gas_strategy=self.race_gas_strategy,
+            gas_limit_buffer=self.gas_limit_buffer,
+            max_gas_native=self.max_gas_for_chain(candidate.chain),
+            max_total_native=self.max_total_native,
+            max_gas_usd=self.max_gas_usd_for_chain(candidate.chain, candidate),
+            native_usd_price=self.race_native_usd_price(candidate.chain, allow_network=True),
+            allowed_targets=self.allowed_targets,
+            allow_paid=paid and candidate.paid_decision == "confirmed",
+            paid_wallet_addresses=candidate.paid_wallet_addresses,
+            max_mint_price_native=candidate.max_mint_price_native,
+            fee_fields_override=self.race_fee_fields(candidate.chain, allow_network=True),
+            public_override=public,
+            allow_before_start=True,
+            static_gas_limit=self.race_static_gas_limit,
+            skip_balance_check=False,
+            clamp_fees_to_gas_budget=True,
+        )
+
+    def _prewarm_candidate_race(self, candidate: Candidate, plan: dict[str, Any]) -> None:
+        prep_perf = time.perf_counter()
+        if not self.race_enabled or not candidate.contract_address:
+            return
+        key = self._race_key(candidate, str(plan.get("key") or ""))
+        with self.race_state_lock:
+            if key in self.race_preparing or key in self.race_prepared:
+                return
+            self.race_preparing.add(key)
+        try:
+            public = read_seadrop_public_fast(self.rpc_pools[candidate.chain].primary, candidate.contract_address)
+            if not public or not public.get("configured"):
+                return
+            price_wei = int(public.get("mint_price_wei") or 0)
+            if price_wei > 0 and candidate.paid_decision != "confirmed":
+                return
+            bundle = self._prepare_race_bundle(candidate, plan, public)
+            if bundle and bundle.get("entries"):
+                with self.race_state_lock:
+                    self.race_prepared[key] = bundle
+                candidate.race_prepared = True
+                log.info(
+                    "Race prewarm ready | %s | %s | wallets=%s | opens=%.3f | prep=%.3fs",
+                    candidate.slug, candidate.chain, len(bundle.get("entries") or []), float(plan.get("start") or 0),
+                    time.perf_counter() - prep_perf,
+                )
+            elif bundle:
+                statuses = sorted({getattr(r, "status", "unknown") for r in (bundle.get("results") or {}).values()})
+                log.info(
+                    "Race prewarm blocked | %s | %s | statuses=%s | prep=%.3fs",
+                    candidate.slug, candidate.chain, ",".join(statuses) or "no-wallet-work", time.perf_counter() - prep_perf,
+                )
+        except Exception as exc:
+            log.debug("Race prewarm failed %s: %s", candidate.slug, exc)
+        finally:
+            with self.race_state_lock:
+                self.race_preparing.discard(key)
+
+    def _launch_candidate_race(self, candidate: Candidate, plan: dict[str, Any], *, live: bool = False) -> None:
+        launch_perf = time.perf_counter()
+        if not self.race_enabled or not candidate.contract_address:
+            return
+        stage_key = str(plan.get("key") or candidate.current_stage_key or "public")
+        key = self._race_key(candidate, stage_key)
+        with self.race_state_lock:
+            if key in self.race_active:
+                return
+            self.race_active.add(key)
+        candidate.race_inflight = True
+        candidate.race_stage_key = stage_key
+        candidate.race_last_attempt = time.time()
+        try:
+            bundle = None
+            if not live:
+                with self.race_state_lock:
+                    bundle = self.race_prepared.pop(key, None)
+            if bundle is None:
+                public = read_seadrop_public_fast(self.rpc_pools[candidate.chain].primary, candidate.contract_address)
+                if not public or not public.get("configured"):
+                    return
+                # A Stream event means the stage is already live; use one shared
+                # estimate per quantity. A scheduled launch uses the static race
+                # gas limit so it does not wait for a new block timestamp before
+                # estimateGas starts succeeding.
+                work = self._race_wallet_work(candidate, plan)
+                if not work:
+                    return
+                paid = int(public.get("mint_price_wei") or 0) > 0
+                bundle = prepare_seadrop_race_transactions(
+                    rpc_pool=self.rpc_pools[candidate.chain],
+                    wallet_quantities=[(state.wallet, qty) for state, qty in work],
+                    nft_contract=candidate.contract_address,
+                    gas_strategy=self.race_gas_strategy,
+                    gas_limit_buffer=self.gas_limit_buffer,
+                    max_gas_native=self.max_gas_for_chain(candidate.chain),
+                    max_total_native=self.max_total_native,
+                    max_gas_usd=self.max_gas_usd_for_chain(candidate.chain, candidate),
+                    # Hot path: cached only. The market warmer prevents an HTTP
+                    # price lookup from sitting in front of broadcast.
+                    native_usd_price=self.race_native_usd_price(candidate.chain, allow_network=False),
+                    allowed_targets=self.allowed_targets,
+                    allow_paid=paid and candidate.paid_decision == "confirmed",
+                    paid_wallet_addresses=candidate.paid_wallet_addresses,
+                    max_mint_price_native=candidate.max_mint_price_native,
+                    fee_fields_override=self.race_fee_fields(candidate.chain, allow_network=False),
+                    public_override=public,
+                    allow_before_start=not live,
+                    static_gas_limit=None if live else self.race_static_gas_limit,
+                    skip_balance_check=live,
+                    clamp_fees_to_gas_budget=True,
+                )
+            if not bundle:
+                log.info("RACE skipped | %s | %s | no bundle", candidate.slug, candidate.chain)
+                return
+            results = broadcast_seadrop_race_transactions(
+                rpc_pool=self.rpc_pools[candidate.chain],
+                bundle=bundle,
+                max_parallel_wallets=self.max_parallel_wallets,
+            )
+            submitted = self._apply_race_results(candidate, plan, results)
+            if submitted:
+                log.info(
+                    "RACE submitted | %s | %s | wallets=%s | launch-path=%.3fs",
+                    candidate.slug, candidate.chain, submitted, time.perf_counter() - launch_perf,
+                )
+            else:
+                statuses = sorted({getattr(r, "status", "unknown") for r in results.values()})
+                log.info(
+                    "RACE no-submit | %s | %s | statuses=%s | launch-path=%.3fs",
+                    candidate.slug, candidate.chain, ",".join(statuses) or "no-wallet-work", time.perf_counter() - launch_perf,
+                )
+        finally:
+            candidate.race_inflight = False
+            with self.race_state_lock:
+                self.race_active.discard(key)
+
+    def _fast_live_contract_signal(self, chain: str, contract: str, slug: str | None, source: str) -> None:
+        signal_perf = time.perf_counter()
+        if not self.race_enabled or chain not in self.rpc_pools or not Web3.is_address(contract):
+            return
+        contract = Web3.to_checksum_address(contract)
+        dedupe = f"{chain}:{contract.lower()}"
+        now = time.time()
+        with self.race_state_lock:
+            if now - self.race_signal_seen.get(dedupe, 0.0) < 0.20:
+                return
+            self.race_signal_seen[dedupe] = now
+        try:
+            public = read_seadrop_public_fast(self.rpc_pools[chain].primary, contract)
+            if not public or not public.get("configured"):
+                return
+            plan = self._fast_plan_from_public(public, contract)
+            candidate = self._ensure_fast_candidate(chain, contract, slug, public, source)
+            start = float(plan.get("start") or 0)
+            end = float(plan.get("end") or 0)
+            active = (not start or now >= start) and (not end or now < end)
+            if active:
+                if plan.get("is_paid") and candidate.paid_decision != "confirmed":
+                    candidate.paid_detected = True
+                    self.maybe_offer_paid_public(candidate)
+                    return
+                self._launch_candidate_race(candidate, plan, live=True)
+                log.info(
+                    "Fast signal handled | source=%s | %s | %s | %.3fs",
+                    source, candidate.slug, chain, time.perf_counter() - signal_perf,
+                )
+            elif start and start > now:
+                candidate.watch_kind = "auto_stage"
+                # Persist future on-chain public stages so a Railway restart does
+                # not throw away the schedule discovered without OpenSea Drops.
+                try:
+                    self.ensure_candidate_watch_persisted(candidate)
+                    self.persist_candidate_planning(candidate)
+                except Exception:
+                    pass
+        except Exception as exc:
+            log.debug("Fast live contract signal failed %s %s: %s", chain, contract, exc)
+
+    def submit_fast_contract_signal(self, chain: str | None, contract: str | None, slug: str | None, source: str) -> None:
+        chain_n = normalize_chain(chain or "")
+        if not self.race_enabled or chain_n not in self.rpc_pools or not contract or not Web3.is_address(contract):
+            return
+        self.race_executor.submit(self._fast_live_contract_signal, chain_n, contract, slug, source)
+
+    def _submit_scheduled_race(self, candidate: Candidate, plan: dict[str, Any]) -> None:
+        """Queue at most one scheduled launch for a stage at a time.
+
+        This prevents a 10ms scheduler tick from filling the executor with
+        duplicate work while the first launch thread is still being scheduled.
+        """
+        stage_key = str(plan.get("key") or candidate.current_stage_key or "public")
+        key = self._race_key(candidate, stage_key)
+        with self.race_state_lock:
+            if key in self.race_active or key in self.race_queued:
+                return
+            self.race_queued.add(key)
+        candidate.race_last_attempt = time.time()
+
+        def runner():
+            with self.race_state_lock:
+                self.race_queued.discard(key)
+            self._launch_candidate_race(candidate, plan, live=False)
+
+        self.race_executor.submit(runner)
+
+    def _race_scheduler_loop(self) -> None:
+        log.info(
+            "Race scheduler ready | tick=%.3fs | prewarm=%.2fs | staticGas=%s",
+            self.race_scheduler_tick, self.race_prewarm_seconds, self.race_static_gas_limit,
+        )
+        while not STOP:
+            now = time.time()
+            with self.candidates_lock:
+                snapshot = list(self.candidates.values())
+            for candidate in snapshot:
+                if candidate.done or not candidate.contract_address or not candidate.stage_plans:
+                    continue
+                public_plans = [p for p in candidate.stage_plans if p.get("is_public") and p.get("start") is not None]
+                if not public_plans:
+                    continue
+                for plan in public_plans:
+                    start = float(plan.get("start") or 0)
+                    launch_at = start + self.race_open_offset_seconds
+                    end = float(plan.get("end") or 0) if plan.get("end") is not None else start + 3600
+                    if now > end or now < start - self.race_prewarm_seconds:
+                        continue
+                    if plan.get("is_paid") and candidate.paid_decision != "confirmed":
+                        continue
+                    key = self._race_key(candidate, str(plan.get("key") or ""))
+                    if now < launch_at:
+                        with self.race_state_lock:
+                            prepared = key in self.race_prepared or key in self.race_preparing
+                        if not prepared:
+                            self.race_executor.submit(self._prewarm_candidate_race, candidate, plan)
+                        continue
+                    if now <= min(end, launch_at + self.race_launch_window_seconds):
+                        # Keep re-launching only while no transaction is pending;
+                        # _race_wallet_work removes wallets already submitted.
+                        if now - candidate.race_last_attempt >= self.race_retry_seconds:
+                            self._submit_scheduled_race(candidate, plan)
+            time.sleep(self.race_scheduler_tick)
+
+    def start_race_scheduler(self) -> None:
+        if not self.race_enabled or (self.race_scheduler_thread and self.race_scheduler_thread.is_alive()):
+            return
+        self.race_scheduler_thread = threading.Thread(target=self._race_scheduler_loop, name="public-race-scheduler", daemon=True)
+        self.race_scheduler_thread.start()
+
+    def _alchemy_wss_url(self, chain: str) -> str | None:
+        api_key = os.getenv("ALCHEMY_API_KEY", "").strip()
+        cfg = CHAIN_CONFIGS.get(chain) or {}
+        slug = str(cfg.get("alchemy_slug") or "").strip()
+        if not api_key or not slug:
+            return None
+        return f"wss://{slug}.g.alchemy.com/v2/{api_key}"
+
+    async def _seadrop_log_loop(self, chain: str) -> None:
+        url = self._alchemy_wss_url(chain)
+        if not url:
+            return
+        while not STOP:
+            try:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=20, open_timeout=10, close_timeout=3, max_size=2 * 1024 * 1024) as ws:
+                    req = {
+                        "jsonrpc": "2.0", "id": 1, "method": "eth_subscribe",
+                        "params": ["logs", {"address": SEADROP_ADDRESS}],
+                    }
+                    await ws.send(json.dumps(req))
+                    log.info("SeaDrop chain log stream connected | %s", chain)
+                    while not STOP:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=45)
+                        except asyncio.TimeoutError:
+                            # websockets ping_interval already keeps the socket
+                            # alive; an idle chain is not a reason to reconnect.
+                            continue
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+                        params = msg.get("params") if isinstance(msg, dict) else None
+                        result = params.get("result") if isinstance(params, dict) else None
+                        topics = result.get("topics") if isinstance(result, dict) else None
+                        if not isinstance(topics, list) or len(topics) < 2:
+                            continue
+                        topic1 = str(topics[1])
+                        if not topic1.startswith("0x") or len(topic1) != 66:
+                            continue
+                        contract = "0x" + topic1[-40:]
+                        if Web3.is_address(contract):
+                            self.submit_fast_contract_signal(chain, contract, None, "seadrop-wss")
+            except Exception as exc:
+                if not STOP:
+                    log.debug("SeaDrop chain log stream %s reconnect: %s", chain, exc)
+                    await asyncio.sleep(1.0)
+
+    def _seadrop_log_worker(self, chain: str) -> None:
+        try:
+            asyncio.run(self._seadrop_log_loop(chain))
+        except Exception as exc:
+            if not STOP:
+                log.debug("SeaDrop log worker stopped %s: %s", chain, exc)
+
+    def start_seadrop_log_discovery(self) -> None:
+        if not self.seadrop_wss_enabled:
+            return
+        if self.seadrop_log_threads:
+            return
+        for chain in self.enabled_chains:
+            if not self._alchemy_wss_url(chain):
+                continue
+            t = threading.Thread(target=self._seadrop_log_worker, args=(chain,), name=f"seadrop-wss-{chain}", daemon=True)
+            self.seadrop_log_threads.append(t)
+            t.start()
+
     def _queue_mint_event(self, payload: dict[str, Any], source: str) -> None:
         chain = extract_event_chain(payload)
         if chain and chain not in self.enabled_chains:
@@ -2044,6 +2720,11 @@ class Bot:
         slug = extract_event_slug(payload)
         if not contract and not slug:
             return
+        # Stream is the speed signal. Submit it to the race lane *before* the
+        # slower metadata de-duplication map; an Events-API backfill must never
+        # suppress a newer live Stream signal for the same contract.
+        if source == "stream" and chain and contract:
+            self.submit_fast_contract_signal(chain, contract, slug, source)
         key = f"{chain or 'unknown'}:{(contract or slug or '').lower()}"
         now = time.time()
         if now - self.auto_event_seen.get(key, 0.0) < 5.0:
@@ -2054,6 +2735,9 @@ class Bot:
         if len(self.auto_event_seen) > 5000:
             cutoff = now - 900.0
             self.auto_event_seen = {k: ts for k, ts in self.auto_event_seen.items() if ts >= cutoff}
+        # V4.9: a live Stream signal no longer waits for the discovery queue or
+        # the main candidate loop. Fire the independent race lane immediately.
+        # The queue copy remains only for metadata enrichment/persistence.
         target_queue = self.auto_priority_queue if source == "stream" else self.auto_discovery_queue
         target_queue.put({
             "kind": "mint_event", "source": source, "slug": slug,
@@ -2097,7 +2781,7 @@ class Bot:
         if contract and not Web3.is_address(contract):
             contract = None
 
-        # V4.8 FAST LANE: a live Stream mint event already gives us the most
+        # V4.9 FAST LANE: a live Stream mint event already gives us the most
         # useful real-time signal. When chain + contract are known, probe
         # SeaDrop directly before touching OpenSea REST. This bypasses REST
         # rate limits and can register an active free Public mint immediately.
@@ -2432,7 +3116,7 @@ class Bot:
         """Drain live mint signals first, then a bounded amount of catalog work.
 
         V4.6 drained the entire queue in one pass; a busy backfill could delay a
-        brand-new Stream event. V4.8 gives Stream signals strict priority and
+        brand-new Stream event. V4.9 gives Stream signals strict priority and
         limits slow catalog work per main-loop tick.
         """
         def process_item(item: dict[str, Any]) -> None:
@@ -2883,7 +3567,7 @@ class Bot:
                         state.stage_label = candidate.current_stage_label
                         state.next_attempt = now
                 if current.get("is_public") and not current.get("is_paid"):
-                    # Critical V4.8 behavior: a free Public must never wait for
+                    # Critical V4.9 behavior: a free Public must never wait for
                     # an OpenSea eligibility preflight. Activate every enabled
                     # wallet immediately; the mint transaction/simulation is the
                     # final oracle. This avoids losing small-supply drops to 429s.
@@ -3096,6 +3780,18 @@ class Bot:
             if candidate.paid_decision != "confirmed":
                 self.maybe_offer_paid_public(candidate)
                 return
+
+        # V4.9: do not let the normal REST/simulation path compete with the
+        # dedicated race lane during the first seconds of a known SeaDrop Public
+        # opening. The scheduler pre-signs and broadcasts independently. After
+        # the race window, this method becomes the safety fallback again.
+        if candidate.race_inflight:
+            return
+        if self.race_enabled and candidate.contract_address and plan and plan.get("is_public"):
+            start_ts = float(plan.get("start") or now)
+            if now >= start_ts - self.race_prewarm_seconds and now <= start_ts + self.race_launch_window_seconds:
+                if not plan.get("is_paid") or candidate.paid_decision == "confirmed":
+                    return
 
         due = [state for state in candidate.wallets.values() if not state.submitted and not state.final and state.next_attempt <= now]
         if not due:
@@ -3414,7 +4110,7 @@ class Bot:
         total = len(self.store.list_wallets(enabled_only=False))
         self.telegram.send(
             chat_id,
-            "🤖 OpenSea Mint Guardian V4.8\n\n"
+            "🤖 OpenSea Mint Guardian V4.9\n\n"
             "🆓 الاكتشاف المجاني: Stream لحظي + SeaDrop مباشر + REST احتياطي\n"
             f"⚡ الاستعداد للـPublic: آخر {self.public_preopen_window_seconds:g} ثوانٍ\n"
             f"📦 سياسة الكمية: حد المنت ≤100 يؤخذ كما هو، وإذا كان >100/غير محدود فالهدف {self.auto_stage_high_limit_quantity}\n"
@@ -4241,7 +4937,7 @@ class Bot:
             )
             return
 
-        # ----- V4.8 paid-public planner -----
+        # ----- V4.9 paid-public planner -----
         if data == "paid_add":
             self._clear_pending(chat_id)
             self.pending_link_action[chat_id] = {"expiry": time.time() + 300, "action": "paid"}
@@ -4900,7 +5596,7 @@ class Bot:
     # ---------- main loop ----------
     def run(self) -> None:
         start_health_server()
-        log.info("Mint Guardian V4.8 starting")
+        log.info("Mint Guardian V4.9 starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
@@ -4908,6 +5604,11 @@ class Bot:
             self.start_command_worker()
             self.telegram.start()
         self.bootstrap_watches()
+        # Start market snapshots before discovery. It runs independently and
+        # keeps price/fee data hot for the race lane.
+        self.start_race_market_warmer()
+        self.start_race_scheduler()
+        self.start_seadrop_log_discovery()
         self.start_auto_free_discovery()
         log.info(
             "Discovery priority ready | stream-fast=%s | upcoming=%.1fs | mint-events=%.1fs | catalog-backfill=%.1fs | REST concurrency=%s",
@@ -4919,8 +5620,13 @@ class Bot:
             self.qualification_recheck_seconds, self.public_preopen_window_seconds,
             self.public_fast_retry_seconds, self.auto_stage_high_limit_quantity,
         )
+        log.info(
+            "RACE LANE ready | enabled=%s | prewarm=%.2fs | scheduler=%.3fs | retry=%.3fs | staticGas=%s | SeaDrop-WSS=%s | fee-cache=%.2fs | race-gas=%s",
+            self.race_enabled, self.race_prewarm_seconds, self.race_scheduler_tick,
+            self.race_retry_seconds, self.race_static_gas_limit, self.seadrop_wss_enabled, self.race_fee_refresh_seconds, self.race_gas_strategy,
+        )
         self.notify_all(
-            "🟢 OpenSea Mint Guardian V4.8 يعمل الآن على Railway.\n"
+            "🟢 OpenSea Mint Guardian V4.9 يعمل الآن على Railway.\n"
             f"الاكتشاف التلقائي: {'مفعّل كل ' + format(self.auto_free_scan_seconds, 'g') + ' ثانية' if self.auto_free_enabled else 'متوقف'}.\n"
             f"OpenSea Stream: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} | REST Mint Events: {'مفعّل' if self.auto_event_fallback_enabled else 'متوقف'}.\n"
             f"التأهيل/المراقبة: تعمل بصمت وتظهر تفاصيلها عند فتح الأقسام.\n"
@@ -4931,7 +5637,8 @@ class Bot:
         while not STOP:
             self.drain_auto_discovery()
             self.cleanup_auto_candidates()
-            ordered = sorted(list(self.candidates.items()), key=lambda kv: self.candidate_loop_priority(kv[1]))
+            with self.candidates_lock:
+                ordered = sorted(list(self.candidates.items()), key=lambda kv: self.candidate_loop_priority(kv[1]))
             for key, candidate in ordered:
                 self.refresh_candidate(candidate)
                 self.process_stage_schedule(candidate)
@@ -4940,7 +5647,8 @@ class Bot:
                 if candidate.done:
                     pending = any(s.submitted and not s.confirmed for s in candidate.wallets.values())
                     if not pending:
-                        self.candidates.pop(key, None)
+                        with self.candidates_lock:
+                            self.candidates.pop(key, None)
                 # Pull in any live Stream mint that arrived while this candidate
                 # was being processed; it will be first on the next sorted pass.
                 self.drain_auto_discovery()

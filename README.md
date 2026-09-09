@@ -1,6 +1,83 @@
-# OpenSea Mint Guardian V4.8
+# OpenSea Mint Guardian V4.9 — Ultra Race Lane
 
-نسخة V4.8 مبنية فوق V4.7/V4.6 بدون تغيير هيكل Telegram الذي أصلح الأزرار. التركيز في هذه النسخة هو: تنفيذ الـPublic المجاني فور فتحه، إلغاء إزعاج رسائل المراقبة/التأهيل التلقائية، إضافة رابط منت مدفوع من داخل قسم المدفوع، وإدارة حدود الغاز بالكامل من Telegram مع إمكانية استثناء مشروع واحد من الحد.
+V4.9 مبنية مباشرة فوق V4.8 وتحافظ على واجهة Telegram والمحافظ والمراقبة والتأهيل والمدفوع وإعدادات الغاز. التغيير الأساسي هو إزالة المسار البطيء من أمام المنت الحرج: الـPublic المجاني المجدول يُجهز ويُوقع قبل الفتح ثم يُبث مباشرة عند وقت الفتح، وأحداث Stream/SeaDrop تدخل Race Lane مستقل ولا تنتظر طابور الـmetadata أو الحلقة الرئيسية.
+
+## ⚡ V4.9 Ultra Race Lane
+
+### لماذا V4.8 كان يمكن أن يتأخر؟
+في V4.8 كان حدث Stream يدخل إلى مرشح/طابور ثم تمر العملية عبر تحديث المرشح والمراحل ومحاولة المنت. كذلك بعض معلومات الرسوم والسعر كانت قد تُقرأ وقت التنفيذ. هذا مقبول للمراقبة العادية، لكنه غير مناسب لمنت ينفد خلال 20 ثانية.
+
+### المسار الجديد للـPublic المعروف مسبقًا
+1. يحتفظ مدير المراحل بوقت فتح Public.
+2. قبل الفتح بـ `RACE_PREWARM_SECONDS` (افتراضي 2 ثانية) يقرأ إعداد Public SeaDrop مرة واحدة.
+3. يحسب الكمية المطلوبة لكل محفظة مع خصم ما أخذته في المراحل السابقة.
+4. يجلب nonces والأرصدة للمحافظ بالتوازي.
+5. يجهز ويوقع معاملات كل المحافظ **قبل** وقت الفتح.
+6. عند timestamp الفتح، Race Scheduler (tick افتراضي 10ms) يرسل الـraw transactions مباشرة بالتوازي.
+7. لا يوجد OpenSea REST eligibility ولا Drops refresh ولا HTTP price lookup أمام البث.
+
+### المسار الجديد للمنتات التي تبدأ بدون جدول معروف
+- OpenSea Stream يرسل إشارة مباشرة إلى Race Executor قبل طابور الـmetadata.
+- يوجد اشتراك WebSocket مباشر في Logs عقد SeaDrop عبر Alchemy لكل شبكة مفعلة؛ تحديثات Public وMint activity يمكن أن تكشف العقد قبل/أسرع من REST catalog.
+- عند وجود Public SeaDrop نشط، يُبنى batch للمحافظ مباشرة.
+- Gas estimate يتم **مرة لكل كمية مختلفة** بدل مرة لكل محفظة.
+- البث يستخدم ThreadPool دائم بدل إنشاء Executor جديد لكل عملية.
+
+### Hot Cache للرسوم والسعر
+- Fee fields تُحدّث في الخلفية افتراضيًا كل `0.50s`.
+- سعر native/USD يُحدّث في الخلفية افتراضيًا كل `30s`.
+- الـRace Lane يقرأ النسخة المخزنة في الذاكرة ولا ينتظر HTTP وقت الفتح.
+- قفل Price Oracle لا يُمسك أثناء HTTP، لذلك تحديث السعر بالخلفية لا يوقف مسار المنت.
+
+### استراتيجية الغاز في Race Lane
+`RACE_GAS_STRATEGY=fast` منفصلة عن استراتيجية الغاز العادية. قبل التوقيع تُقصّ fee fields إلى الحد الفعلي الذي ضبطته من Telegram (Global / network / project). بهذا لا يرفض الـRace transaction فقط لأن استراتيجية fast وضعت headroom أكبر من ميزانية الغاز؛ يحاول استخدام أسرع bid ممكن داخل الحد.
+
+> إذا كان **base fee الحقيقي نفسه** أعلى من الحد الذي حددته، فلا توجد خوارزمية تستطيع ضمان الإدراج مع الالتزام بذلك الحد. لمشروع مهم استخدم استثناء الغاز الموجود أصلًا في `⚙️ الإعدادات`.
+
+### حماية التكرار والتزامن
+- Stage واحد لا يمكن أن يملأ Executor بطلبات launch مكررة؛ يوجد `race_queued/race_active`.
+- المحافظ التي لديها transaction pending لا تُعاد.
+- سجل SQLite والحماية حسب chain + contract ما زالا فعالين.
+- Telegram command worker يبقى مستقلًا عن Race Lane.
+
+### Logs تشخيصية مهمة
+```text
+Race market warmer ready ...
+Race scheduler ready ...
+SeaDrop chain log stream connected | ethereum
+Race prewarm ready | ... | wallets=... | prep=...s
+RACE submitted | ... | wallets=... | launch-path=...s
+```
+وإذا لم تُرسل أي معاملة سيظهر مثل:
+```text
+Race prewarm blocked | ... | statuses=gas_usd_too_high
+RACE no-submit | ... | statuses=...
+```
+وهكذا يصبح سبب عدم المنت واضحًا بدل أن يبدو كأنه تأخير مجهول.
+
+### إعدادات V4.9 الاختيارية
+```env
+RACE_LANE_ENABLED=true
+RACE_PREWARM_SECONDS=2.0
+RACE_SCHEDULER_TICK=0.01
+RACE_RETRY_SECONDS=0.05
+RACE_LAUNCH_WINDOW_SECONDS=8
+RACE_PUBLIC_GAS_LIMIT=300000
+RACE_OPEN_OFFSET_MS=0
+RACE_STREAM_WORKERS=16
+RACE_GAS_STRATEGY=fast
+RACE_FEE_REFRESH_SECONDS=0.50
+RACE_PRICE_REFRESH_SECONDS=30
+SEADROP_WSS_DISCOVERY=true
+RPC_BROADCAST_POOL_WORKERS=32
+```
+لا تحتاج إضافتها إلى Railway لكي تعمل؛ هذه هي القيم الافتراضية في الكود.
+
+> `RACE_PUBLIC_GAS_LIMIT` هو gas limit للمعاملة المجدولة التي تُوقَّع قبل الفتح، وليس مبلغًا يتم دفعه تلقائيًا. الغاز غير المستخدم لا يُدفع، لكن فحص سقف الغاز يبقى محافظًا ويحسب worst-case من هذا الحد.
+
+> لا يمكن لأي بوت ضمان الفوز بكل Drop: توقيت البلوك، ازدحام الشبكة، RPC، سياسة الغاز والمنافسة عوامل خارج التطبيق. V4.9 يزيل الانتظار الداخلي القابل للإزالة من أمام البث.
+
+---
 
 ## أهم السلوكيات
 
@@ -119,11 +196,11 @@ QUALIFICATION_RECHECK_SECONDS=15
 
 ## ملاحظات السرعة
 
-V4.8 لا يحاول جعل كل REST requests أسرع لأن ذلك يؤدي إلى `429`. بدلاً من ذلك:
+V4.9 لا يحاول جعل كل REST requests أسرع لأن ذلك يؤدي إلى `429`. بدلاً من ذلك:
 - Stream/on-chain هما مسار السرعة.
 - REST محمي بـrate limiter وRetry-After.
 - Public المجاني يتجاوز eligibility preflight ويذهب مباشرة لمحاولة التنفيذ.
 - SeaDrop المباشر يُفضّل عندما يمكن استخدامه.
 - حلقة التنفيذ تعمل بتردد أعلى، بينما Telegram يبقى في worker مستقل.
 
-لا يمكن ضمان أن أي بوت سيلحق كل Drop محدود؛ زمن البلوك، RPC، ازدحام الشبكة، وسرعة نفاد الـsupply عوامل خارجية. V4.8 يقلل التأخيرات التي كانت داخل البوت نفسه دون تجاوز حماية الغاز أو توقيع Paid Mint بدون موافقة.
+لا يمكن ضمان أن أي بوت سيلحق كل Drop محدود؛ زمن البلوك، RPC، ازدحام الشبكة، وسرعة نفاد الـsupply عوامل خارجية. V4.9 يقلل التأخيرات التي كانت داخل البوت نفسه دون تجاوز حماية الغاز أو توقيع Paid Mint بدون موافقة.
