@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import random
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from decimal import Decimal
@@ -133,6 +136,30 @@ class OpenSeaClient:
         self.api_key = api_key
         self._local = threading.local()
 
+        # V4.7: all REST calls share one rate-limit state even though each
+        # worker thread has its own requests.Session. OpenSea uses one bucket
+        # per account/key, so a per-thread limiter would still create bursts.
+        self._rate_lock = threading.Lock()
+        self._blocked_until = 0.0
+        self._rate_limit: int | None = None
+        self._rate_remaining: int | None = None
+        self._rate_reset_at = 0.0
+        self._last_429_log = 0.0
+        # Keep REST traffic fast but non-bursty. Stream/on-chain discovery is
+        # intentionally outside this limiter, so real-time free-mint detection
+        # is not slowed by OpenSea REST quotas.
+        self._next_request_at = 0.0
+        self.rest_concurrency = max(1, min(int(os.getenv("OPENSEA_REST_CONCURRENCY", "2")), 8))
+        self.min_request_interval = max(0.0, float(os.getenv("OPENSEA_MIN_REQUEST_INTERVAL", "0.08")))
+        self.rate_reserve = max(0, int(os.getenv("OPENSEA_RATE_RESERVE", "6")))
+        self._rest_slots = threading.BoundedSemaphore(self.rest_concurrency)
+        self._cache_lock = threading.Lock()
+        self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self.drop_cache_seconds = max(0.0, float(os.getenv("OPENSEA_DROP_CACHE_SECONDS", "3")))
+        self.collection_cache_seconds = max(0.0, float(os.getenv("OPENSEA_COLLECTION_CACHE_SECONDS", "60")))
+        self.contract_cache_seconds = max(0.0, float(os.getenv("OPENSEA_CONTRACT_CACHE_SECONDS", "120")))
+        self.list_cache_seconds = max(0.0, float(os.getenv("OPENSEA_LIST_CACHE_SECONDS", "4")))
+
     def _session(self) -> requests.Session:
         session = getattr(self._local, "session", None)
         if session is None:
@@ -141,19 +168,154 @@ class OpenSeaClient:
                 "X-API-KEY": self.api_key,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "OpenSea-Mint-Guardian/4.5",
+                "User-Agent": "OpenSea-Mint-Guardian/4.7",
             })
             self._local.session = session
         return session
 
-    def _request(self, method: str, path: str, **kwargs) -> dict[str, Any]:
-        r = self._session().request(method, f"{self.BASE_URL}{path}", timeout=self.timeout, **kwargs)
+    @staticmethod
+    def _header_int(headers: Any, name: str) -> int | None:
+        try:
+            value = headers.get(name)
+            return int(float(value)) if value not in (None, "") else None
+        except Exception:
+            return None
+
+    def cooldown_remaining(self) -> float:
+        with self._rate_lock:
+            return max(0.0, self._blocked_until - time.time())
+
+    def rate_status(self) -> dict[str, Any]:
+        with self._rate_lock:
+            return {
+                "limit": self._rate_limit,
+                "remaining": self._rate_remaining,
+                "reset_at": self._rate_reset_at or None,
+                "cooldown": max(0.0, self._blocked_until - time.time()),
+            }
+
+    def _rate_limited_error(self, wait_seconds: float, detail: str = "local cooldown") -> requests.HTTPError:
+        wait_seconds = max(0.1, float(wait_seconds))
+        response = requests.Response()
+        response.status_code = 429
+        response.headers["Retry-After"] = str(max(1, int(math.ceil(wait_seconds))))
+        response._content = (
+            '{"errors":["Rate limit cooldown active"],"detail":"' + detail.replace('"', "'") + '"}'
+        ).encode("utf-8")
+        return requests.HTTPError(
+            f"OpenSea 429: rate-limit cooldown active; retry after {wait_seconds:.2f}s",
+            response=response,
+        )
+
+    def _update_rate_state(self, response: requests.Response) -> None:
+        now = time.time()
+        limit = self._header_int(response.headers, "X-RateLimit-Limit")
+        remaining = self._header_int(response.headers, "X-RateLimit-Remaining")
+        reset = self._header_int(response.headers, "X-RateLimit-Reset")
+        retry_after = self._header_int(response.headers, "Retry-After")
+        with self._rate_lock:
+            if limit is not None:
+                self._rate_limit = limit
+            if remaining is not None:
+                self._rate_remaining = remaining
+            if reset is not None:
+                self._rate_reset_at = float(reset)
+
+            if response.status_code == 429:
+                if retry_after is not None:
+                    wait = max(1.0, float(retry_after))
+                elif reset is not None and reset > now:
+                    wait = max(1.0, float(reset) - now)
+                else:
+                    wait = 5.0
+                # Small jitter prevents all wallet workers from waking at once.
+                self._blocked_until = max(self._blocked_until, now + wait + random.uniform(0.05, 0.30))
+                if now - self._last_429_log >= 20.0:
+                    log.warning(
+                        "OpenSea REST rate limit reached | retry_after=%.1fs | remaining=%s | limit=%s",
+                        wait, self._rate_remaining, self._rate_limit,
+                    )
+                    self._last_429_log = now
+            elif remaining is not None and remaining <= 0 and reset is not None and reset > now:
+                self._blocked_until = max(self._blocked_until, float(reset) + 0.05)
+
+    def _reserve_rest_slot(self, request_class: str) -> None:
+        """Reserve a REST start slot without sleeping through long cooldowns.
+
+        ``critical`` is used for ready-to-sign mint builders, ``normal`` for
+        user/stage metadata, and ``background`` for catalog/event backfill.
+        Background work preserves a token reserve for mint-time calls.
+        """
+        now = time.time()
+        with self._rate_lock:
+            cooldown = max(0.0, self._blocked_until - now)
+            if cooldown > 0:
+                raise self._rate_limited_error(cooldown, "server Retry-After cooldown")
+
+            remaining = self._rate_remaining
+            reset_at = float(self._rate_reset_at or 0.0)
+            if remaining is not None and reset_at > now:
+                reserve = 0 if request_class == "critical" else (2 if request_class == "normal" else self.rate_reserve)
+                if remaining <= reserve:
+                    wait = max(0.2, reset_at - now + 0.05)
+                    raise self._rate_limited_error(wait, f"REST quota reserved for {request_class} calls")
+
+            # Serialize request *starts* just enough to avoid a many-wallet
+            # thundering herd. Actual HTTP work may still overlap up to
+            # OPENSEA_REST_CONCURRENCY.
+            scheduled = max(now, self._next_request_at)
+            wait = max(0.0, scheduled - now)
+            self._next_request_at = scheduled + self.min_request_interval
+            # Pessimistically reserve one known token so another worker cannot
+            # see the same last token before this response updates the headers.
+            if remaining is not None:
+                self._rate_remaining = max(0, remaining - 1)
+
+        if wait > 0:
+            time.sleep(wait)
+
+    @staticmethod
+    def _cache_key(method: str, path: str, kwargs: dict[str, Any]) -> str:
+        params = kwargs.get("params") or {}
+        if isinstance(params, dict):
+            param_bits = "&".join(f"{k}={params[k]}" for k in sorted(params))
+        else:
+            param_bits = str(params)
+        return f"{method.upper()}:{path}?{param_bits}"
+
+    def _request(
+        self, method: str, path: str, *, cache_ttl: float = 0.0,
+        request_class: str = "normal", **kwargs
+    ) -> dict[str, Any]:
+        method = method.upper()
+        cache_key = self._cache_key(method, path, kwargs) if method == "GET" and cache_ttl > 0 else ""
+        now = time.time()
+        if cache_key:
+            with self._cache_lock:
+                cached = self._cache.get(cache_key)
+                if cached and cached[0] > now:
+                    return cached[1]
+
+        # Do not queue dozens of wallet calls behind a sleeping lock. A caller
+        # that encounters a real/synthetic 429 gets a retry time and returns to
+        # the bot loop, while Stream/on-chain detection keeps running.
+        with self._rest_slots:
+            self._reserve_rest_slot(request_class)
+            r = self._session().request(method, f"{self.BASE_URL}{path}", timeout=self.timeout, **kwargs)
+            self._update_rate_state(r)
+
         if r.status_code >= 400:
             text = r.text[:1500]
             raise requests.HTTPError(f"OpenSea {r.status_code}: {text}", response=r)
         data = r.json()
         if not isinstance(data, dict):
             raise ValueError("Unexpected OpenSea API response")
+        if cache_key:
+            with self._cache_lock:
+                self._cache[cache_key] = (time.time() + cache_ttl, data)
+                if len(self._cache) > 2000:
+                    cutoff = time.time()
+                    self._cache = {k: v for k, v in self._cache.items() if v[0] > cutoff}
         return data
 
     def get_chains(self) -> dict[str, Any]:
@@ -171,16 +333,16 @@ class OpenSeaClient:
             params["chains"] = chain
         if cursor:
             params["cursor"] = cursor
-        return self._request("GET", "/drops", params=params)
+        return self._request("GET", "/drops", params=params, cache_ttl=self.list_cache_seconds, request_class="background")
 
     def get_drop(self, slug: str) -> dict[str, Any]:
-        return self._request("GET", f"/drops/{slug}")
+        return self._request("GET", f"/drops/{slug}", cache_ttl=self.drop_cache_seconds)
 
     def get_collection(self, slug: str) -> dict[str, Any]:
-        return self._request("GET", f"/collections/{slug}")
+        return self._request("GET", f"/collections/{slug}", cache_ttl=self.collection_cache_seconds)
 
     def get_contract(self, chain: str, address: str) -> dict[str, Any]:
-        return self._request("GET", f"/chain/{chain}/contract/{address}")
+        return self._request("GET", f"/chain/{chain}/contract/{address}", cache_ttl=self.contract_cache_seconds)
 
     def get_events(
         self,
@@ -201,10 +363,10 @@ class OpenSeaClient:
             params["before"] = int(before)
         if cursor:
             params["next"] = cursor
-        return self._request("GET", "/events", params=params)
+        return self._request("GET", "/events", params=params, request_class="background")
 
     def build_mint(self, slug: str, minter: str, quantity: int) -> dict[str, Any]:
-        return self._request("POST", f"/drops/{slug}/mint", json={"minter": minter, "quantity": quantity})
+        return self._request("POST", f"/drops/{slug}/mint", json={"minter": minter, "quantity": quantity}, request_class="critical")
 
 
 class RpcPool:

@@ -26,7 +26,7 @@ class SecureStore:
     """SQLite persistence + Fernet encryption for wallet private keys.
 
     The DB is designed to live on a Railway Volume. Schema migrations are
-    intentionally additive so V3/V4 databases continue to work with V4.6.
+    intentionally additive so V3/V4 databases continue to work with V4.7.
     """
 
     def __init__(self, db_path: str, encryption_key: str):

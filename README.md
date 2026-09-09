@@ -1,75 +1,112 @@
-# OpenSea Mint Guardian V4.6
+# OpenSea Mint Guardian V4.7
 
-نسخة إصلاح واجهة Telegram مع الحفاظ على منطق V4.5/V4.4 للمراحل والاكتشاف والـMint.
+نسخة محسّنة فوق **V4.6** التي أصلحت أزرار Telegram. لم يتم تغيير البنية التي أصبحت تعمل لدى المستخدم؛ V4.7 تضيف تنظيم الرسائل، روابط المنت، معالجة Rate Limit، وتسريع الاكتشاف.
 
-## أهم إصلاح في V4.6
+## ما بقي كما هو
 
-المشكلة التي ظهرت ابتداءً من V4.4 لم تكن من `callback_data` نفسها. V4.4 أضاف فحوص المراحل/التأهيل إلى الحلقة الرئيسية، وبعض هذه الفحوص ينتظر RPC/OpenSea لكل المحافظ. نتيجة ذلك كانت رسائل `/start` وضغطات Inline Keyboard تصل إلى `command_queue` لكن قد تتأخر معالجتها أثناء انشغال حلقة الـMint.
+- Telegram command worker مستقل؛ `/start` والأزرار لا تنتظر فحوص الـMint.
+- محافظ مشفرة بالأسماء مع تشغيل/إيقاف وكمية مستقلة.
+- Railway Volume + SQLite migration بدون حذف البيانات.
+- Free Mint تلقائي لكل المحافظ النشطة.
+- Paid Mint لا يُشترى إلا بعد موافقة المستخدم، اختيار المحافظ، وكمية كل محفظة.
+- Stage/qualification planner والكمية التراكمية بين المراحل.
+- إذا كان حد المرحلة `1..100` فهو الهدف؛ إذا كان `>100` أو غير محدود/غير معروف فالهدف `30`.
+- سقف الغاز بالدولار، واستراتيجية `smart`.
 
-V4.6 يفصل العمل إلى مسارين مستقلين:
+## V4.7 — معالجة OpenSea 429
 
-- `TelegramController`: مبني على آلية polling المستخدمة في V4.3/V4.2 (`getUpdates` + message/callback_query).
-- `telegram-command-worker`: يستهلك أوامر Telegram في Thread مستقل عن حلقة Mint/Stage.
-- حلقة الـMint/Stage تظل مستقلة ولا يمكنها تجويع واجهة Telegram.
+OpenSea REST أصبح له مدير مركزي واحد داخل `OpenSeaClient`:
 
-عند التشغيل يجب أن ترى:
+- يقرأ `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`.
+- عند `429` يحترم `Retry-After` ولا يعيد الضرب على OpenSea أثناء فترة التهدئة.
+- يترك Reserve لطلبات الـMint المهمة ويؤجل backfill إذا كانت الحصة منخفضة.
+- يمنع انفجار طلبات عدة محافظ في اللحظة نفسها عبر REST concurrency + start pacing.
+- Cache قصير لبيانات Drop، وأطول لبيانات collection/contract.
+- رسائل `429` لا تملأ Telegram افتراضيًا؛ تظهر في Logs ويُعاد المحاولة آليًا.
+- فحص أهلية OpenSea يستخدم `quantity=1` فقط لمعرفة نعم/لا؛ البحث عن أعلى كمية لا يحدث إلا عند التنفيذ عند الحاجة، وهذا يوفر عدة POSTs لكل محفظة.
 
-```text
-Telegram command worker ready
-Telegram listener enabled
-Mint Guardian V4.6 starting
-```
+> لا يتم تخفيض سرعة Stream أو القراءة المباشرة من SeaDrop بسبب هذا الـlimiter.
 
-وعند إرسال `/start`:
+## V4.7 — سرعة الاكتشاف
 
-```text
-Telegram message received | chat_id=... | text=/start
-```
+ترتيب الاكتشاف:
 
-وعند الضغط على زر:
+1. **OpenSea Stream** لحظي — أعلى أولوية.
+2. إذا أعطى Stream الشبكة + العقد، يتم فحص **SeaDrop on-chain مباشرةً قبل REST**.
+3. `upcoming` يُفحص افتراضيًا كل 15 ثانية لاكتشاف المراحل/الـPublic المجدول مبكرًا.
+4. Global Mint Events كل 30 ثانية كتعويض عن أي Stream event مفقود.
+5. `featured/recently_minted` backfill أبطأ افتراضيًا كل 60 ثانية حتى لا تستهلك REST quota.
 
-```text
-Telegram callback received | chat_id=... | data=...
-```
+الـStream candidate يدخل Priority Queue ويُعالج قبل catalog work، كما أن المرشحين النشطين المجانيين وPublic الوشيك لهم أولوية داخل حلقة التنفيذ.
 
-## تنظيم Telegram
+## الرسائل والتنظيم
 
-القائمة الرئيسية:
+كل رسالة/قسم متعلق بمنت يعرض رابطًا قابلًا للنسخ متى أمكن:
 
-- إضافة محفظة / المحافظ
-- التأهيل / المراقبة
-- المجانية المأخوذة / المنتات المدفوعة
-- فحص الأهلية / سجل العمليات
-- الشبكات / الإعدادات
-- إيقاف/استئناف التنفيذ
+`🔗 رابط المنت (للنسخ): https://opensea.io/collection/...`
 
-### المنتات المدفوعة
+القائمة الرئيسية تحتوي أقسامًا مستقلة:
 
-يتم اكتشافها وحفظها بصمت. لا يتم إرسال Prompt تلقائي عند الاكتشاف. تظهر فقط عند فتح قسم `💳 المنتات المدفوعة`. تظهر قيمة Native والسعر التقريبي USDT، ولا يتم أي Paid Mint إلا بعد اختيار المحافظ والكميات وتأكيد الخطة.
+- `🎟 التأهيل`
+- `👀 المراقبة`
+- `🆓 المجانية المأخوذة`
+- `💳 المنتات المدفوعة`
+- `🧪 فحص الأهلية`
+- `📜 سجل العمليات`
 
-### المنتات المجانية
+### التأهيل بدون Spam
 
-تستمر بالعمل تلقائيًا كما في الإصدارات السابقة. قسم `🆓 المجانية المأخوذة` يعرض النتائج المؤكدة عند الطلب فقط.
+للمشروع متعدد مراحل التأهيل:
 
-## إعدادات الغاز الحالية
+- رسالة منظمة واحدة عند اكتشاف جدول مراحل اليوم.
+- الفحوص التفصيلية للمحافظ تعمل بصمت وتُحفظ في قسم التأهيل.
+- رسالة واحدة فقط عند بدء كل **مرحلة جديدة غير مدفوعة**.
+- المرحلة المدفوعة لا تُدفع تلقائيًا إلى Telegram ولا تظهر في رسالة جدول التأهيل؛ تبقى داخل `💳 المنتات المدفوعة`.
 
-```env
-MAX_GAS_NATIVE=0
-MAX_GAS_USD=0.08
-GAS_STRATEGY=smart
-GAS_LIMIT_BUFFER=1.08
-GAS_OVER_BUDGET_RETRY_SECONDS=2
-```
+### المدفوع
+
+المدفوع يُحفظ بصمت. عند فتح زر `💳 المنتات المدفوعة` يظهر:
+
+- اسم المشروع والشبكة.
+- وقت الفتح.
+- السعر الحقيقي بالعملة الأصلية (`ETH` للشبكات الحالية).
+- القيمة التقريبية بـ `USDT`.
+- حالة خطة الشراء.
+- رابط المنت.
 
 ## Railway
 
-لا تغيّر `WALLET_ENCRYPTION_KEY` ولا تحذف Railway Volume. استبدل ملفات المشروع ثم Push إلى GitHub ليعمل Railway redeploy.
+لا تحذف الـVolume ولا تغيّر `WALLET_ENCRYPTION_KEY` بعد حفظ المحافظ.
 
-## ملفات يجب تحديثها
+الملفات الأساسية:
 
 - `main.py`
 - `buyer.py`
 - `storage.py`
+- `health.py`
 - `requirements.txt`
-- `.env.example` اختياري
+- `railway.json`
 
+القيم الجديدة كلها لها Defaults؛ لا يلزم تعديل Variables الحالية لتشغيل V4.7. راجع `.env.example` إذا أردت التحكم في pacing/cache/scan intervals.
+
+## أهم القيم الافتراضية الجديدة
+
+```env
+OPENSEA_REST_CONCURRENCY=2
+OPENSEA_MIN_REQUEST_INTERVAL=0.08
+OPENSEA_RATE_RESERVE=6
+OPENSEA_ELIGIBILITY_WORKERS=2
+SILENT_RATE_LIMIT_TELEGRAM=true
+
+AUTO_STREAM_FAST_PATH=true
+AUTO_UPCOMING_SCAN_SECONDS=15
+AUTO_EVENT_SCAN_SECONDS=30
+AUTO_DROP_SCAN_SECONDS=60
+
+STAGE_SUMMARY_NOTIFICATIONS=true
+STAGE_OPEN_NOTIFICATIONS=true
+```
+
+## ملاحظة السرعة
+
+لا يمكن لأي بوت ضمان أن يكون دائمًا أول معاملة في البلوك؛ وقت وصول Stream/RPC، ازدحام الشبكة، ترتيب المعاملات، وسقف الغاز كلها عوامل خارج البرنامج. V4.7 صُممت لتجعل **المسار الحي لا يعتمد على REST polling** قدر الإمكان، مع منع 429 من استهلاك وقت الفرصة.

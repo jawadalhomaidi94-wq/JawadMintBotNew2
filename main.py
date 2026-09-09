@@ -765,6 +765,8 @@ class Candidate:
     last_qualification_check: float = 0.0
     last_schedule_tick: float = 0.0
     processed_stage_key: str = ""
+    schedule_summary_notified: bool = False
+    stage_open_notified_keys: set[str] = field(default_factory=set)
 
     def submitted_count(self) -> int:
         return sum(1 for s in self.wallets.values() if s.submitted)
@@ -972,13 +974,19 @@ class Bot:
         self.auto_free_enabled = env_bool("AUTO_FREE_MINTS", True)
         self.auto_free_scan_seconds = max(5.0, env_float("AUTO_FREE_SCAN_SECONDS", 15.0))
         self.auto_free_drop_limit = max(1, min(env_int("AUTO_FREE_DROP_LIMIT", 100), 100))
-        self.auto_free_initial_pages = max(1, min(env_int("AUTO_FREE_INITIAL_PAGES", 3), 10))
-        self.auto_free_detail_workers = max(1, min(env_int("AUTO_FREE_DETAIL_WORKERS", 8), 20))
+        self.auto_free_initial_pages = max(1, min(env_int("AUTO_FREE_INITIAL_PAGES", 1), 10))
+        self.auto_free_detail_workers = max(1, min(env_int("AUTO_FREE_DETAIL_WORKERS", 4), 20))
         self.auto_free_notify_discovery = env_bool("AUTO_FREE_NOTIFY_DISCOVERY", False)
         self.auto_free_candidate_ttl = max(30.0, env_float("AUTO_FREE_CANDIDATE_TTL", 90.0))
         configured_types = csv_values(os.getenv("AUTO_FREE_DROP_TYPES", "recently_minted,featured,upcoming"))
         self.auto_free_drop_types = [x for x in configured_types if x in {"recently_minted", "featured", "upcoming"}] or ["recently_minted", "featured", "upcoming"]
         self.auto_discovery_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        # Live Stream mint events use a separate priority queue so a catalog
+        # backfill cannot delay a fresh mint signal.
+        self.auto_priority_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.auto_catalog_seen: dict[str, float] = {}
+        self.auto_catalog_detail_ttl = max(10.0, env_float("AUTO_CATALOG_DETAIL_TTL", 60.0))
+        self.auto_stream_fast_path = env_bool("AUTO_STREAM_FAST_PATH", True)
         self.auto_discovery_thread: threading.Thread | None = None
         # V4.3: real-time mint discovery from OpenSea Stream plus REST mint-event
         # polling fallback. Drops scanning stays enabled as a third discovery path.
@@ -987,9 +995,21 @@ class Bot:
         self.auto_event_limit = max(1, min(env_int("AUTO_FREE_EVENT_LIMIT", 200), 200))
         self.auto_event_overlap_seconds = max(5, env_int("AUTO_FREE_EVENT_OVERLAP_SECONDS", 45))
         self.auto_event_initial_lookback_seconds = max(300, env_int("AUTO_FREE_EVENT_INITIAL_LOOKBACK_SECONDS", 86400))
-        self.auto_event_initial_pages = max(1, min(env_int("AUTO_FREE_EVENT_INITIAL_PAGES", 3), 10))
+        self.auto_event_initial_pages = max(1, min(env_int("AUTO_FREE_EVENT_INITIAL_PAGES", 1), 10))
         self.auto_event_last_after = int(time.time()) - max(60, self.auto_event_overlap_seconds)
         self.auto_event_seen: dict[str, float] = {}
+        # REST is a safety/backfill lane, not the speed lane. Stream is instant
+        # and does not consume OpenSea REST quota, so background REST is paced.
+        self.auto_event_scan_seconds = max(15.0, env_float("AUTO_EVENT_SCAN_SECONDS", 30.0))
+        # Upcoming is the useful pre-open lane for paid/public stage schedules,
+        # so scan it more often than the general catalog. Live free mints still
+        # come from Stream first.
+        self.auto_upcoming_scan_seconds = max(10.0, env_float("AUTO_UPCOMING_SCAN_SECONDS", 15.0))
+        self.auto_drop_scan_seconds = max(30.0, env_float("AUTO_DROP_SCAN_SECONDS", 60.0))
+        self.auto_catalog_detail_budget = max(1, min(env_int("AUTO_CATALOG_DETAIL_BUDGET", 12), 100))
+        self._last_auto_event_scan = 0.0
+        self._last_auto_upcoming_scan = 0.0
+        self._last_auto_drop_scan = 0.0
         self.auto_stream_thread: threading.Thread | None = None
 
         # V4.4 stage planner / qualification engine.
@@ -1000,6 +1020,13 @@ class Bot:
         self.public_preopen_window_seconds = max(1.0, env_float("PUBLIC_PREOPEN_WINDOW_SECONDS", 5.0))
         self.public_fast_retry_seconds = max(0.10, env_float("PUBLIC_FAST_RETRY_SECONDS", 0.20))
         self.qualification_recheck_seconds = max(5.0, env_float("QUALIFICATION_RECHECK_SECONDS", 15.0))
+        # OpenSea's wallet-specific mint builder is quota-sensitive. Direct
+        # SeaDrop checks stay fully parallel, while OpenSea qualification calls
+        # use a small worker cap to avoid a many-wallet 429 burst.
+        self.opensea_eligibility_workers = max(1, min(env_int("OPENSEA_ELIGIBILITY_WORKERS", 2), 6))
+        self.stage_summary_notifications = env_bool("STAGE_SUMMARY_NOTIFICATIONS", True)
+        self.stage_open_notifications = env_bool("STAGE_OPEN_NOTIFICATIONS", True)
+        self.silent_rate_limit_telegram = env_bool("SILENT_RATE_LIMIT_TELEGRAM", True)
         self.paused = env_bool("START_PAUSED", False)
 
         self.wallets: list[WalletConfig] = []
@@ -1052,6 +1079,43 @@ class Bot:
     def project_key_for_candidate(self, candidate: Candidate) -> str:
         identity = candidate.contract_address.lower() if candidate.contract_address else candidate.slug.lower()
         return f"{candidate.chain}:{identity}"
+
+    def mint_url(
+        self,
+        *,
+        slug: str | None = None,
+        chain: str | None = None,
+        source: str | None = None,
+        contract_address: str | None = None,
+    ) -> str:
+        """Return a copyable OpenSea URL for every project-facing message."""
+        raw = str(source or "").strip()
+        if raw.startswith(("https://", "http://")) and "opensea.io" in raw.lower():
+            return raw
+        clean_slug = str(slug or "").strip()
+        if clean_slug and not clean_slug.startswith("contract-"):
+            return f"https://opensea.io/collection/{quote(clean_slug, safe='-._~')}"
+        address = str(contract_address or "").strip()
+        if address and Web3.is_address(address):
+            chain_name = opensea_chain_name(normalize_chain(chain or "ethereum"))
+            return f"https://opensea.io/assets/{quote(chain_name, safe='-._~')}/{address}"
+        return "https://opensea.io/"
+
+    def candidate_mint_url(self, candidate: Candidate) -> str:
+        return self.mint_url(
+            slug=candidate.slug, chain=candidate.chain, source=candidate.source,
+            contract_address=candidate.contract_address,
+        )
+
+    def row_mint_url(self, row: dict[str, Any]) -> str:
+        return self.mint_url(
+            slug=str(row.get("slug") or ""), chain=str(row.get("chain") or ""),
+            source=str(row.get("source") or ""),
+            contract_address=str(row.get("contract_address") or ""),
+        )
+
+    def mint_link_block(self, candidate: Candidate) -> str:
+        return f"🔗 رابط المنت (للنسخ):\n{self.candidate_mint_url(candidate)}"
 
     def auto_target_for_limit(self, limit: int | None, remaining: int | None = None) -> int:
         """V4.4 automatic quantity policy.
@@ -1161,10 +1225,12 @@ class Bot:
 
                 if not candidate.auto_discovered and candidate.watch_kind == "manual":
                     self.notify_all(
-                        f"➕ تمت إضافة المحفظة «{wallet.name}» إلى مراقبة منت نشط\n"
-                        f"العنوان: {short_address(wallet.address)}\n"
-                        f"المشروع: {candidate.slug}\nالشبكة: {chain_label(candidate.chain)}\n"
-                        "سيتم فحص أهليتها عند كل مرحلة جديدة، والـMint المجاني سيُنفذ تلقائيًا إذا كانت مؤهلة."
+                        "👛 تم ربط محفظة بمراقبة منت نشط\n\n"
+                        f"📦 المشروع: {candidate.slug}\n"
+                        f"🌐 الشبكة: {chain_label(candidate.chain)}\n"
+                        f"👛 المحفظة: {wallet.name} {short_address(wallet.address)}\n"
+                        "⚙️ سيتم فحصها عند كل مرحلة جديدة، والـMint المجاني يُنفذ تلقائيًا إذا كانت مؤهلة.\n\n"
+                        f"{self.mint_link_block(candidate)}"
                     )
 
     def validate_wallet_name(self, name: str, *, exclude_id: int | None = None) -> tuple[bool, str]:
@@ -1496,13 +1562,15 @@ class Bot:
         paid_text = "مسموح فقط بعد تأكيدك واختيار المحافظ والكميات" if allow_paid else "مجاني فقط"
         kind_text = f"{len(plans)} مرحلة" + (" — يحتوي مراحل تأهيل" if has_qualification_stages(plans) else "")
         message = (
-            f"🎯 بدأت مراقبة: {slug}\n"
-            f"الشبكة: {chain_label(chain)}\n"
-            f"المراحل: {kind_text}\n"
-            f"موعد أقرب Public: {format_ts(candidate.public_start, self.display_tz)}\n"
-            f"المحافظ النشطة المناسبة للشبكة: {len(candidate.wallets)}\n"
-            f"المنت المدفوع: {paid_text}\n\n"
+            "🎯 تم تفعيل مراقبة المنت\n\n"
+            f"📦 المشروع: {slug}\n"
+            f"🌐 الشبكة: {chain_label(chain)}\n"
+            f"🎟 المراحل: {kind_text}\n"
+            f"⏰ أقرب Public: {format_ts(candidate.public_start, self.display_tz)}\n"
+            f"👛 المحافظ النشطة: {len(candidate.wallets)}\n"
+            f"💳 المدفوع: {paid_text}\n\n"
             + "\n".join(candidate.stage_lines[:10])
+            + "\n\n" + self.mint_link_block(candidate)
         )
         return True, message, candidate
 
@@ -1607,6 +1675,11 @@ class Bot:
                     candidate.paid_decision = str(row.get("paid_decision") or ("confirmed" if candidate.paid_selection_confirmed else ""))
                     candidate.paid_stage_key = str(row.get("paid_stage_key") or "")
                     candidate.paid_stage_start = float(row["paid_stage_start"]) if row.get("paid_stage_start") is not None else None
+                    restored_stage_key = str(row.get("last_stage_key") or "")
+                    if restored_stage_key:
+                        candidate.processed_stage_key = restored_stage_key
+                        candidate.stage_open_notified_keys.add(restored_stage_key)
+                    candidate.schedule_summary_notified = True
                     try:
                         saved = json.loads(str(row.get("paid_wallets_json") or "[]"))
                         candidate.paid_wallet_addresses = {str(a).lower() for a in saved if isinstance(a, str)}
@@ -1793,13 +1866,15 @@ class Bot:
 
         policy = "المدفوع لا يُنفذ إلا بعد تأكيدك" if allow_paid else "مجاني فقط"
         message = (
-            f"🎯 بدأت مراقبة: {slug}\n"
-            f"الشبكة: {chain_label(chain)}\n"
-            f"المصدر: SeaDrop مباشر على السلسلة\n"
-            f"العقد: {contract_address}\n"
-            f"موعد الـPublic: {format_ts(candidate.public_start, self.display_tz)}\n"
-            f"السياسة: {policy}\n"
-            + candidate.stage_lines[0]
+            "🎯 تم تفعيل مراقبة المنت\n\n"
+            f"📦 المشروع: {slug}\n"
+            f"🌐 الشبكة: {chain_label(chain)}\n"
+            f"⚙️ المصدر: SeaDrop مباشر على السلسلة\n"
+            f"📜 العقد: {contract_address}\n"
+            f"⏰ موعد الـPublic: {format_ts(candidate.public_start, self.display_tz)}\n"
+            f"🛡 السياسة: {policy}\n"
+            f"🎟 الحالة: {candidate.stage_lines[0]}\n\n"
+            f"{self.mint_link_block(candidate)}"
         )
         return True, message, candidate
 
@@ -1862,6 +1937,7 @@ class Bot:
                     qty = f" | الكمية المتاحة={result.quantity_used}" if result.quantity_used else ""
                     price = f" | السعر={result.mint_value_native} {native_symbol(chain)}" if result.mint_value_native is not None else ""
                     lines.append(f"{icon} {wallet.name}: {eligibility_label(result.status)}{qty}{price}")
+                lines.extend(["", f"🔗 رابط المنت (للنسخ):\n{self.mint_url(slug=slug, chain=chain, source=raw)}"])
                 return "\n".join(lines)[:3900]
         except Exception:
             pass
@@ -1881,6 +1957,7 @@ class Bot:
             qty = f" | الكمية المتاحة={result.quantity_used}" if result.quantity_used else ""
             price = f" | القيمة={result.mint_value_native} {native_symbol(chain)}" if result.mint_value_native is not None else ""
             lines.append(f"{icon} {wallet.name}: {eligibility_label(result.status)}{qty}{price}")
+        lines.extend(["", f"🔗 رابط المنت (للنسخ):\n{self.mint_url(slug=slug, chain=chain, source=raw, contract_address=contract)}"])
         return "\n".join(lines)[:3900]
 
     def _queue_mint_event(self, payload: dict[str, Any], source: str) -> None:
@@ -1901,7 +1978,8 @@ class Bot:
         if len(self.auto_event_seen) > 5000:
             cutoff = now - 900.0
             self.auto_event_seen = {k: ts for k, ts in self.auto_event_seen.items() if ts >= cutoff}
-        self.auto_discovery_queue.put({
+        target_queue = self.auto_priority_queue if source == "stream" else self.auto_discovery_queue
+        target_queue.put({
             "kind": "mint_event", "source": source, "slug": slug,
             "chain_hint": chain, "contract_address": contract,
         })
@@ -1943,8 +2021,46 @@ class Bot:
         if contract and not Web3.is_address(contract):
             contract = None
 
-        # Prefer Drop metadata first because it contains private/allowlist stage
-        # schedules that getPublicDrop cannot expose.
+        # V4.7 FAST LANE: a live Stream mint event already gives us the most
+        # useful real-time signal. When chain + contract are known, probe
+        # SeaDrop directly before touching OpenSea REST. This bypasses REST
+        # rate limits and can register an active free Public mint immediately.
+        if self.auto_stream_fast_path and chain in self.rpc_pools and contract:
+            try:
+                public_fast = read_seadrop_public_drop(self.rpc_pools[chain].primary, contract)
+            except Exception:
+                public_fast = None
+            if public_fast and public_fast.get("configured"):
+                now_i = int(time.time())
+                start_i = int(public_fast.get("start_time") or 0)
+                end_i = int(public_fast.get("end_time") or 0)
+                price_i = int(public_fast.get("mint_price_wei") or 0)
+                remain_i = public_fast.get("remaining_supply")
+                active_i = (not start_i or now_i >= start_i) and (not end_i or now_i < end_i)
+                future_i = bool(start_i and now_i < start_i)
+                if remain_i is None or int(remain_i) > 0:
+                    fast_slug = slug or self.resolve_slug_from_contract(chain, contract) or f"contract-{contract[-10:].lower()}"
+                    ok_fast, _msg_fast, fast_candidate = self.register_onchain_candidate(
+                        fast_slug, chain, contract, str(item.get("source") or "stream"),
+                        allow_paid=(price_i > 0),
+                        max_mint_price_native=self.max_mint_price_default if price_i > 0 else Decimal("0"),
+                        auto_discovered=True, discovery_source=str(item.get("source") or "stream"),
+                    )
+                    if ok_fast and fast_candidate:
+                        fast_candidate.last_seen_auto = time.time()
+                        if active_i and price_i == 0:
+                            fast_candidate.watch_kind = "auto_free"
+                            # Free Public discovered live: return immediately so
+                            # try_candidate() can run in the same main-loop tick.
+                            return
+                        if future_i or price_i > 0:
+                            fast_candidate.watch_kind = "auto_stage"
+                            self.ensure_candidate_watch_persisted(fast_candidate)
+                            self.maybe_offer_paid_public(fast_candidate)
+
+        # Prefer Drop metadata next because it contains private/allowlist stage
+        # schedules that getPublicDrop cannot expose. The fast lane above has
+        # already protected live free mints from REST latency/429s.
         if slug:
             try:
                 drop = self.opensea.get_drop(slug)
@@ -1963,6 +2079,7 @@ class Bot:
                             candidate.watch_kind = "auto_stage" if (has_qualification_stages(plans) or candidate.has_paid_stage or len(plans) > 1) else "auto_free"
                             if candidate.watch_kind == "auto_stage":
                                 self.ensure_candidate_watch_persisted(candidate)
+                                self.notify_stage_schedule_once(candidate)
                             return
             except Exception:
                 pass
@@ -2078,24 +2195,68 @@ class Bot:
                 log.exception("OpenSea Stream worker stopped unexpectedly")
 
     # ---------- automatic free-mint discovery ----------
+    def _background_detail_budget(self) -> int:
+        status = self.opensea.rate_status()
+        if float(status.get("cooldown") or 0) > 0:
+            return 0
+        remaining = status.get("remaining")
+        reset_at = status.get("reset_at")
+        if remaining is None or reset_at is None:
+            # Before rate headers are known, start conservatively. The live
+            # Stream fast lane does not need this REST budget.
+            return min(4, self.auto_catalog_detail_budget)
+        remaining = int(remaining)
+        if remaining <= 10:
+            return 0
+        window = max(1.0, float(reset_at) - time.time())
+        # Spend at most about half of the fair-share refill on detail backfill,
+        # leaving quota for mint builders, manual checks, and stage refreshes.
+        fair = int(max(0, remaining - 10) * (min(self.auto_upcoming_scan_seconds, self.auto_drop_scan_seconds) / window) * 0.5)
+        return max(0, min(self.auto_catalog_detail_budget, fair))
+
     def _auto_free_scan_once(self, deep: bool = False) -> None:
         if not self.auto_free_enabled:
             return
-        # V4.3 fallback catches mints that never appear in Drops lists.
-        self._auto_mint_events_scan_once(deep=deep)
+        now_scan = time.time()
+
+        # REST Mint Events is a fallback only. Live Stream remains continuous
+        # and is processed immediately without consuming REST rate limit.
+        if deep or now_scan - self._last_auto_event_scan >= self.auto_event_scan_seconds:
+            if self.opensea.cooldown_remaining() <= 0:
+                self._auto_mint_events_scan_once(deep=deep)
+            self._last_auto_event_scan = now_scan
+
+        # Catalog Drops is for backfill/schedules, not live free-mint speed.
+        # Scan only `upcoming` every ~15s so scheduled Public/paid stages are
+        # learned early; `featured`/`recently_minted` are slower backfill lanes.
+        if self.opensea.cooldown_remaining() > 0:
+            return
+        if deep:
+            types_to_scan = list(self.auto_free_drop_types)
+            self._last_auto_upcoming_scan = now_scan
+            self._last_auto_drop_scan = now_scan
+        else:
+            types_to_scan: list[str] = []
+            if "upcoming" in self.auto_free_drop_types and now_scan - self._last_auto_upcoming_scan >= self.auto_upcoming_scan_seconds:
+                types_to_scan.append("upcoming")
+                self._last_auto_upcoming_scan = now_scan
+            if now_scan - self._last_auto_drop_scan >= self.auto_drop_scan_seconds:
+                types_to_scan.extend(t for t in self.auto_free_drop_types if t != "upcoming")
+                self._last_auto_drop_scan = now_scan
+            if not types_to_scan:
+                return
+
         chain_query = ",".join(opensea_chain_name(c) for c in self.enabled_chains)
         slugs: dict[str, str | None] = {}
         pages = self.auto_free_initial_pages if deep else 1
 
-        for drop_type in self.auto_free_drop_types:
+        for drop_type in types_to_scan:
             cursor: str | None = None
             for _page in range(pages):
-                if STOP:
+                if STOP or self.opensea.cooldown_remaining() > 0:
                     return
                 try:
-                    payload = self.opensea.get_drops(
-                        drop_type, chain_query, self.auto_free_drop_limit, cursor=cursor
-                    )
+                    payload = self.opensea.get_drops(drop_type, chain_query, self.auto_free_drop_limit, cursor=cursor)
                 except Exception as exc:
                     log.debug("Auto-free list scan failed type=%s: %s", drop_type, exc)
                     break
@@ -2111,6 +2272,24 @@ class Bot:
 
         if not slugs:
             return
+
+        now_seen = time.time()
+        filtered_items: list[tuple[str, str | None]] = []
+        for slug, hint in slugs.items():
+            last_seen = self.auto_catalog_seen.get(slug.lower(), 0.0)
+            if deep or now_seen - last_seen >= self.auto_catalog_detail_ttl:
+                filtered_items.append((slug, hint))
+
+        budget = self._background_detail_budget()
+        if budget <= 0:
+            return
+        filtered_items = filtered_items[:budget]
+        for slug, _hint in filtered_items:
+            self.auto_catalog_seen[slug.lower()] = now_seen
+
+        if len(self.auto_catalog_seen) > 10000:
+            cutoff = now_seen - max(600.0, self.auto_catalog_detail_ttl * 5)
+            self.auto_catalog_seen = {k: ts for k, ts in self.auto_catalog_seen.items() if ts >= cutoff}
 
         def fetch(item: tuple[str, str | None]):
             slug, hint = item
@@ -2131,9 +2310,9 @@ class Bot:
                 log.debug("Auto-free detail scan failed %s: %s", slug, exc)
                 return None
 
-        workers = min(self.auto_free_detail_workers, len(slugs))
+        workers = min(self.auto_free_detail_workers, len(filtered_items))
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(fetch, item) for item in slugs.items()]
+            futures = [executor.submit(fetch, item) for item in filtered_items]
             for future in as_completed(futures):
                 found = future.result()
                 if found is not None:
@@ -2174,14 +2353,16 @@ class Bot:
         )
 
     def drain_auto_discovery(self) -> None:
-        while True:
-            try:
-                item = self.auto_discovery_queue.get_nowait()
-            except queue.Empty:
-                break
+        """Drain live mint signals first, then a bounded amount of catalog work.
+
+        V4.6 drained the entire queue in one pass; a busy backfill could delay a
+        brand-new Stream event. V4.7 gives Stream signals strict priority and
+        limits slow catalog work per main-loop tick.
+        """
+        def process_item(item: dict[str, Any]) -> None:
             if item.get("kind") == "mint_event":
                 self._process_auto_mint_event(item)
-                continue
+                return
             slug = str(item["slug"])
             drop = item["drop"]
             hint = item.get("chain_hint")
@@ -2191,7 +2372,6 @@ class Bot:
 
             existing = next((c for c in self.candidates.values() if c.slug.lower() == slug.lower()), None)
             if existing and not existing.auto_discovered:
-                # Refresh its stage metadata without downgrading manual policy.
                 self.register_drop(
                     slug, drop, existing.chain, existing.source,
                     allow_paid=existing.allow_paid,
@@ -2199,19 +2379,16 @@ class Bot:
                     quantity_override=existing.quantity_override,
                     auto_discovered=False,
                 )
-                continue
+                return
 
             if not active_free and not relevant_stage:
                 if existing and existing.auto_discovered and existing.watch_kind == "auto_free":
                     pending = any(st.submitted and not st.confirmed and not st.final for st in existing.wallets.values())
                     if not pending:
                         self.candidates.pop(f"{existing.chain}:{existing.slug}", None)
-                continue
+                return
 
             before = existing is not None
-            # Multi-stage candidates need allow_paid=True only so a user-approved
-            # future Public paid plan can execute. No paid transaction is signed
-            # without candidate.paid_decision == confirmed.
             allow_paid = relevant_stage or has_qualification
             ok, _message, candidate = self.register_drop(
                 slug, drop, hint, "auto-stage" if relevant_stage else "auto-free",
@@ -2220,25 +2397,41 @@ class Bot:
                 auto_discovered=True,
             )
             if not ok or not candidate:
-                continue
+                return
             candidate.last_seen_auto = time.time()
             if relevant_stage or has_qualification or candidate.has_paid_stage:
                 candidate.watch_kind = "auto_stage"
                 self.ensure_candidate_watch_persisted(candidate)
                 self.persist_candidate_planning(candidate)
+                if not before:
+                    self.notify_stage_schedule_once(candidate)
             else:
                 candidate.watch_kind = "auto_free"
 
-            if not before and self.auto_free_notify_discovery:
+            if not before and self.auto_free_notify_discovery and not candidate.qualification_tracked:
                 self.notify_all(
-                    f"{'🎟' if candidate.qualification_tracked else '🆓'} تم اكتشاف Mint تلقائيًا\n"
-                    f"المشروع: {candidate.slug}\n"
-                    f"الشبكة: {chain_label(candidate.chain)}\n"
-                    f"عدد المراحل: {len(candidate.stage_plans)}\n"
-                    f"المحافظ النشطة: {len(candidate.wallets)}\n"
-                    f"المرحلة الحالية: {candidate.current_stage_label or 'بانتظار المرحلة القادمة'}\n"
-                    "سيتم فحص الأهلية والتنفيذ المجاني تلقائيًا، والمدفوع يحتاج موافقتك."
+                    "🆓 <b>تم اكتشاف Mint مجاني تلقائيًا</b>\n\n"
+                    f"📦 المشروع: {candidate.slug}\n"
+                    f"🌐 الشبكة: {chain_label(candidate.chain)}\n"
+                    f"👛 المحافظ النشطة: {len(candidate.wallets)}\n\n"
+                    f"{self.mint_link_block(candidate)}"
                 )
+
+        # Live Stream has strict priority.
+        for _ in range(200):
+            try:
+                item = self.auto_priority_queue.get_nowait()
+            except queue.Empty:
+                break
+            process_item(item)
+
+        # Keep catalog/events fallback from monopolizing the mint loop.
+        for _ in range(40):
+            try:
+                item = self.auto_discovery_queue.get_nowait()
+            except queue.Empty:
+                break
+            process_item(item)
 
     def cleanup_auto_candidates(self) -> None:
         now = time.time()
@@ -2330,6 +2523,12 @@ class Bot:
         target_total = self.stage_target_total(candidate, plan)
         active_addresses = {w.address.lower() for w in self.store.list_wallets(enabled_only=True)}
         states = [s for s in candidate.wallets.values() if s.wallet.address.lower() in active_addresses]
+        is_recheck = stage_key in candidate.checked_stage_keys and not force
+        if is_recheck:
+            transient = {"unknown", "rate_limited", "preflight_error", "opensea_error", "seadrop_not_configured"}
+            states = [s for s in states if s.eligibility in transient]
+            if not states:
+                return ""
         lines = [
             f"🎟 فحص مرحلة — {candidate.slug}",
             f"المرحلة: {plan.get('label')} | {'عام' if plan.get('is_public') else 'تأهيل'}",
@@ -2345,11 +2544,21 @@ class Bot:
             if candidate.mint_backend == "seadrop" and candidate.contract_address:
                 result = check_seadrop_eligibility(pool, state.wallet, candidate.contract_address, additional)
             else:
-                result = check_eligibility(self.opensea, candidate.slug, state.wallet, additional)
+                # Eligibility only needs to answer "can this wallet mint in the
+                # active stage?". Probing the full target here could trigger a
+                # binary quantity search (several POSTs per wallet) and exhaust
+                # the OpenSea bucket before the actual mint. Probe one token;
+                # the execution path still adapts to the highest valid quantity.
+                result = check_eligibility(self.opensea, candidate.slug, state.wallet, 1)
+                if result.eligible is True:
+                    result.quantity_used = None
             return state, confirmed_total, additional, result
 
         if states:
-            workers = min(self.max_parallel_wallets, len(states))
+            workers = min(
+                self.max_parallel_wallets if candidate.mint_backend == "seadrop" else self.opensea_eligibility_workers,
+                len(states),
+            )
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = [executor.submit(one, state) for state in states]
                 for future in as_completed(futures):
@@ -2363,6 +2572,7 @@ class Bot:
                         status = "target_satisfied"
                         eligible = True
                         available = 0
+                        state.eligibility = status
                         lines.append(f"✅ {state.wallet.name}: الهدف محقق مسبقًا ({confirmed_total}/{target_total})")
                     else:
                         status = result.status
@@ -2390,6 +2600,15 @@ class Bot:
                                 state.final = False
                             elif plan.get("is_public"):
                                 candidate.paid_detected = True
+
+                        # Do not immediately call OpenSea's mint builder again
+                        # for wallets that were already found ineligible. That
+                        # duplicate call pattern was a major source of 429s.
+                        if result.eligible is False:
+                            state.next_attempt = float(plan.get("end") or (now + max(60.0, self.qualification_recheck_seconds)))
+                        elif result.eligible is None:
+                            cooldown = self.opensea.cooldown_remaining()
+                            state.next_attempt = now + max(self.qualification_recheck_seconds, cooldown)
 
                     self.store.record_qualification_wallet(
                         project_key=project_key,
@@ -2423,10 +2642,101 @@ class Bot:
             last_stage_end=float(plan["end"]) if plan.get("end") is not None else None,
         )
         self.persist_candidate_planning(candidate)
+        lines.extend(["", self.mint_link_block(candidate)])
         text = "\n".join(lines)[:3900]
         if notify:
             self.notify_all(text)
         return text
+
+    def stage_schedule_summary_text(self, candidate: Candidate) -> str:
+        # Paid stages are deliberately omitted from automatic Telegram pushes;
+        # they remain visible only inside «💳 المنتات المدفوعة».
+        plans = sorted(
+            [p for p in candidate.stage_plans if not p.get("is_paid")],
+            key=lambda p: float(p.get("start") or 0),
+        )
+        lines = [
+            "🎟 تم اكتشاف منت متعدد المراحل",
+            "",
+            f"📦 المشروع: {candidate.slug}",
+            f"🌐 الشبكة: {chain_label(candidate.chain)}",
+            f"📋 عدد المراحل: {len(plans)}",
+            "",
+            "🗓 جدول المراحل:",
+        ]
+        for idx, plan in enumerate(plans[:10], 1):
+            kind = "🌍 Public" if plan.get("is_public") else "🎫 تأهيل"
+            price = "🆓 مجاني" if plan.get("is_free") else ("💳 مدفوع" if plan.get("is_paid") else "❔ السعر غير معروف")
+            lines.append(
+                f"{idx}. {kind} — {plan.get('label') or 'Mint'}\n"
+                f"   ⏰ {format_ts(plan.get('start'), self.display_tz)}\n"
+                f"   {price} | الحد/المحفظة: {plan.get('wallet_limit') or 'غير محدد'}"
+            )
+        lines.extend([
+            "",
+            "🔕 فحص المحافظ أثناء التأهيل يتم بصمت لتجنب كثرة الرسائل.",
+            "🔔 سأرسل تنبيهًا واحدًا فقط عند بدء مرحلة جديدة.",
+            "",
+            self.mint_link_block(candidate),
+        ])
+        return "\n".join(lines)[:3900]
+
+    def notify_stage_schedule_once(self, candidate: Candidate) -> None:
+        if not self.stage_summary_notifications or candidate.schedule_summary_notified:
+            return
+        visible_plans = [p for p in candidate.stage_plans if not p.get("is_paid")]
+        if not visible_plans:
+            return
+        if not candidate.qualification_tracked:
+            return
+        now = time.time()
+        if not any(self._is_timestamp_today(p.get("start")) or plan_is_active(p, now) for p in visible_plans):
+            return
+        if candidate.discovery_source == "restored":
+            candidate.schedule_summary_notified = True
+            return
+        candidate.schedule_summary_notified = True
+        self.notify_all(self.stage_schedule_summary_text(candidate))
+
+    def notify_stage_opened(self, candidate: Candidate, plan: dict[str, Any]) -> None:
+        if not self.stage_open_notifications:
+            return
+        if plan.get("is_paid"):
+            # Paid mints remain silent and are shown only in the dedicated paid section.
+            return
+        stage_key = str(plan.get("key") or "")
+        if not stage_key or stage_key in candidate.stage_open_notified_keys:
+            return
+        candidate.stage_open_notified_keys.add(stage_key)
+        target = self.stage_target_total(candidate, plan)
+        kind = "🌍 Public" if plan.get("is_public") else "🎫 مرحلة تأهيل"
+        price = "🆓 مجاني" if plan.get("is_free") else ("💳 مدفوع" if plan.get("is_paid") else "❔ السعر غير معروف")
+        action = (
+            "سيتم التنفيذ تلقائيًا للمحافظ المؤهلة." if plan.get("is_free")
+            else "سيتم فحص الأهلية بصمت وحفظ النتائج في قسم التأهيل."
+        )
+        active_addresses = {w.address.lower() for w in self.store.list_wallets(enabled_only=True)}
+        stage_states = [s for s in candidate.wallets.values() if s.wallet.address.lower() in active_addresses]
+        eligible_count = sum(1 for s in stage_states if s.eligibility in {"eligible_now", "target_satisfied"})
+        ineligible_count = sum(1 for s in stage_states if s.eligibility in {"not_eligible_now", "precondition_failed"})
+        pending_count = max(0, len(stage_states) - eligible_count - ineligible_count)
+        qualification_summary = (
+            f"👛 المحافظ: ✅ {eligible_count} مؤهلة | ❌ {ineligible_count} غير مؤهلة"
+            + (f" | ⏳ {pending_count} مؤقت" if pending_count else "")
+        )
+        self.notify_all(
+            "🔔 بدأت مرحلة جديدة\n\n"
+            f"📦 المشروع: {candidate.slug}\n"
+            f"🌐 الشبكة: {chain_label(candidate.chain)}\n"
+            f"🎟 المرحلة: {plan.get('label') or 'Mint'}\n"
+            f"🏷 النوع: {kind} — {price}\n"
+            f"⏰ البداية: {format_ts(plan.get('start'), self.display_tz)}\n"
+            f"⏳ النهاية: {format_ts(plan.get('end'), self.display_tz)}\n"
+            f"📦 الهدف/المحفظة: {target}\n"
+            f"{qualification_summary}\n\n"
+            f"⚙️ {action} التفاصيل الكاملة محفوظة داخل قسم «🎟 التأهيل».\n\n"
+            f"{self.mint_link_block(candidate)}"
+        )
 
     def find_paid_public_plan(self, candidate: Candidate, now: float | None = None) -> dict[str, Any] | None:
         now = time.time() if now is None else now
@@ -2495,10 +2805,12 @@ class Bot:
                         state.stage_label = candidate.current_stage_label
                         state.next_attempt = now
                 self.stage_qualification_check(candidate, current, notify=False, force=True)
+                self.notify_stage_opened(candidate, current)
             elif not current.get("is_public") and now - candidate.last_qualification_check >= self.qualification_recheck_seconds:
-                # Re-check qualification during an active private stage because
-                # allowlists/signed eligibility can change while the stage is live.
-                self.stage_qualification_check(candidate, current, notify=False, force=True)
+                # Only retry transient/unknown wallets inside the same stage.
+                # Definitive eligible/ineligible results are checked again when
+                # the next stage opens, exactly matching the stage schedule.
+                self.stage_qualification_check(candidate, current, notify=False, force=False)
         else:
             self.set_current_stage(candidate, None)
             future = self.next_plan_for_candidate(candidate, now)
@@ -2558,7 +2870,12 @@ class Bot:
             if candidate.mint_backend == "seadrop" and candidate.contract_address:
                 result = check_seadrop_eligibility(pool, state.wallet, candidate.contract_address, state.quantity)
             else:
-                result = check_eligibility(self.opensea, candidate.slug, state.wallet, state.quantity)
+                # Manual eligibility is a yes/no check. Use one-token preflight
+                # to avoid quantity-search API bursts; actual mint quantity is
+                # resolved later by the execution engine.
+                result = check_eligibility(self.opensea, candidate.slug, state.wallet, 1)
+                if result.eligible is True:
+                    result.quantity_used = None
             balance = None
             try:
                 balance = pool.balance_native(state.wallet.address)
@@ -2566,7 +2883,10 @@ class Bot:
                 pass
             return state, result, balance
 
-        workers = min(self.max_parallel_wallets, len(states))
+        workers = min(
+            self.max_parallel_wallets if candidate.mint_backend == "seadrop" else self.opensea_eligibility_workers,
+            len(states),
+        )
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [executor.submit(one, state) for state in states]
             for future in as_completed(futures):
@@ -2583,6 +2903,7 @@ class Bot:
                 )
                 if result.mint_value_native is not None and result.mint_value_native > 0:
                     candidate.paid_detected = True
+        lines.extend(["", self.mint_link_block(candidate)])
         return "\n".join(lines)[:3900]
 
     def notify_state_change(self, candidate: Candidate, state: WalletState, status: str, detail: str | None = None) -> None:
@@ -2590,6 +2911,10 @@ class Bot:
             return
         state.last_notified_status = status
         if status in {"not_mintable_yet", "not_active_yet", "paid_wallet_selection_required"}:
+            return
+        if status == "rate_limited" and self.silent_rate_limit_telegram:
+            # 429 is an API transport condition, not a wallet/mint failure. The
+            # central REST limiter logs it once and retries after Retry-After.
             return
         # Auto discovery can evaluate many drops every scan. Routine skips are
         # intentionally silent to avoid flooding Telegram; successful submitted
@@ -2617,11 +2942,12 @@ class Bot:
         }
         if status in labels:
             self.notify_all(
-                f"{labels[status]}\n"
-                f"المشروع: {candidate.slug}\n"
-                f"المحفظة: {state.wallet.name} {short_address(state.wallet.address)}\n"
-                f"الشبكة: {chain_label(candidate.chain)}\n"
-                f"{(detail or '')[:600]}"
+                f"{labels[status]}\n\n"
+                f"📦 المشروع: {candidate.slug}\n"
+                f"🌐 الشبكة: {chain_label(candidate.chain)}\n"
+                f"👛 المحفظة: {state.wallet.name} {short_address(state.wallet.address)}\n"
+                + (f"📝 التفاصيل: {(detail or '')[:500]}\n\n" if detail else "\n")
+                + self.mint_link_block(candidate)
             )
 
     def notify_paid_selection(self, candidate: Candidate) -> None:
@@ -2767,18 +3093,19 @@ class Bot:
                     url = explorer_tx_url(candidate.chain, result.tx_hash or "")
                     kind = "مجاني" if (result.mint_value_native or Decimal("0")) == 0 else "مدفوع"
                     self.notify_all(
-                        f"🚀 تم إرسال معاملة Mint\n"
-                        f"المشروع: {candidate.slug}\n"
-                        f"المرحلة: {state.stage_label}\n"
-                        f"النوع: {kind}\n"
-                        f"الشبكة: {chain_label(candidate.chain)}\n"
-                        f"المحفظة: {state.wallet.name} {short_address(state.wallet.address)}\n"
-                        f"الكمية: {state.pending_quantity}\n"
-                        f"قيمة المنت: {result.mint_value_native} {native_symbol(candidate.chain)}\n"
-                        f"أقصى تقدير للغاز: {result.gas_cost_native} {native_symbol(candidate.chain)}"
+                        "🚀 تم إرسال معاملة Mint\n\n"
+                        f"📦 المشروع: {candidate.slug}\n"
+                        f"🎟 المرحلة: {state.stage_label or 'Mint'}\n"
+                        f"🏷 النوع: {kind}\n"
+                        f"🌐 الشبكة: {chain_label(candidate.chain)}\n"
+                        f"👛 المحفظة: {state.wallet.name} {short_address(state.wallet.address)}\n"
+                        f"🔢 الكمية: {state.pending_quantity}\n"
+                        f"💰 قيمة المنت: {result.mint_value_native} {native_symbol(candidate.chain)}\n"
+                        f"⛽ أقصى تقدير للغاز: {result.gas_cost_native} {native_symbol(candidate.chain)}"
                         + (f" ≈ ${result.gas_cost_usd:.4f}" if result.gas_cost_usd is not None else "")
-                        + "\n"
-                        f"TX: {result.tx_hash}\n{url}"
+                        + "\n\n"
+                        + self.mint_link_block(candidate)
+                        + "\n\n🔎 المعاملة:\n" + str(url)
                     )
                     continue
 
@@ -2803,7 +3130,8 @@ class Bot:
                     state.eligibility = "not_eligible_now"
                     state.next_attempt = time.time() + self.qualification_recheck_seconds
                 elif result.status == "rate_limited":
-                    state.next_attempt = time.time() + self.rate_limit_retry_seconds
+                    cooldown = self.opensea.cooldown_remaining()
+                    state.next_attempt = time.time() + max(self.rate_limit_retry_seconds, cooldown)
                 elif result.status in {"gas_usd_too_high", "gas_price_unavailable"}:
                     state.next_attempt = time.time() + self.gas_over_budget_retry_seconds
                 elif result.status in {"gas_too_high", "insufficient_balance", "mint_price_too_high", "total_spend_too_high"}:
@@ -2845,14 +3173,15 @@ class Bot:
                 )
                 total = self.confirmed_total_for_wallet(candidate, state.wallet.address)
                 self.notify_all(
-                    f"✅ تم تأكيد الـMint بنجاح\n"
-                    f"المشروع: {candidate.slug}\n"
-                    f"المرحلة: {state.stage_label or 'Mint'}\n"
-                    f"المحفظة: {state.wallet.name} {short_address(state.wallet.address)}\n"
-                    f"الكمية المؤكدة الآن: {confirmed_qty}\n"
-                    f"إجمالي ما أخذه البوت لهذه المحفظة من المشروع: {total}\n"
-                    f"الشبكة: {chain_label(candidate.chain)}\n"
-                    f"TX: {state.tx_hash}\n{explorer_tx_url(candidate.chain, state.tx_hash)}"
+                    "✅ تم تأكيد الـMint بنجاح\n\n"
+                    f"📦 المشروع: {candidate.slug}\n"
+                    f"🎟 المرحلة: {state.stage_label or 'Mint'}\n"
+                    f"🌐 الشبكة: {chain_label(candidate.chain)}\n"
+                    f"👛 المحفظة: {state.wallet.name} {short_address(state.wallet.address)}\n"
+                    f"🔢 الكمية المؤكدة الآن: {confirmed_qty}\n"
+                    f"📊 إجمالي هذه المحفظة من المشروع: {total}\n\n"
+                    + self.mint_link_block(candidate)
+                    + "\n\n🔎 المعاملة:\n" + explorer_tx_url(candidate.chain, state.tx_hash)
                 )
                 self.prepare_state_after_receipt(candidate, state)
             else:
@@ -2878,11 +3207,13 @@ class Bot:
                 # new stage will reset final=False automatically.
                 state.final = True
                 self.notify_all(
-                    f"❌ فشلت معاملة الـMint على الشبكة\n"
-                    f"المشروع: {candidate.slug}\n"
-                    f"المرحلة: {state.stage_label or 'Mint'}\n"
-                    f"المحفظة: {state.wallet.name} {short_address(state.wallet.address)}\n"
-                    f"TX: {failed_hash}"
+                    "❌ فشلت معاملة الـMint على الشبكة\n\n"
+                    f"📦 المشروع: {candidate.slug}\n"
+                    f"🎟 المرحلة: {state.stage_label or 'Mint'}\n"
+                    f"🌐 الشبكة: {chain_label(candidate.chain)}\n"
+                    f"👛 المحفظة: {state.wallet.name} {short_address(state.wallet.address)}\n\n"
+                    + self.mint_link_block(candidate)
+                    + "\n\n🔎 TX:\n" + str(failed_hash)
                 )
 
     # ---------- Telegram UI ----------
@@ -2924,7 +3255,7 @@ class Bot:
         total = len(self.store.list_wallets(enabled_only=False))
         self.telegram.send(
             chat_id,
-            "🤖 OpenSea Mint Guardian V4.6\n\n"
+            "🤖 OpenSea Mint Guardian V4.7\n\n"
             f"🆓/🎟 الاكتشاف التلقائي: مفعّل كل {self.auto_free_scan_seconds:g} ثانية\n"
             f"⚡ الاستعداد للـPublic: آخر {self.public_preopen_window_seconds:g} ثوانٍ\n"
             f"📦 سياسة الكمية: حد المنت ≤100 يؤخذ كما هو، وإذا كان >100/غير محدود فالهدف {self.auto_stage_high_limit_quantity}\n"
@@ -3037,66 +3368,73 @@ class Bot:
                 f"  {stage_text}\n"
                 f"  Public: {format_ts(candidate.public_start, self.display_tz)}"
                 + (f"\n  {paid}" if paid else "")
+                + f"\n  🔗 {self.candidate_mint_url(candidate)}"
             )
         return "\n".join(lines)[:3900]
 
     def settings_text(self) -> str:
+        rate = self.opensea.rate_status()
+        cooldown = float(rate.get("cooldown") or 0)
+        rest_state = "جاهز" if cooldown <= 0 else f"تهدئة {cooldown:.1f}s"
+        remaining = rate.get("remaining")
+        limit = rate.get("limit")
+        quota = "غير معروف" if remaining is None else f"{remaining}/{limit or '?'}"
         return (
-            "⚙️ إعدادات التشغيل الحالية\n"
-            f"تنفيذ الـMint: {'⏸ متوقف' if self.paused else '▶️ يعمل'}\n"
-            f"Auto Discovery: {'مفعّل' if self.auto_free_enabled else 'متوقف'} — دورة شاملة كل {self.auto_free_scan_seconds:g} ثانية\n"
-            f"OpenSea Stream: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} | Events fallback: {'مفعّل' if self.auto_event_fallback_enabled else 'متوقف'}\n"
-            f"إعادة فحص التأهيل أثناء المرحلة: كل {self.qualification_recheck_seconds:g} ثانية\n"
-            f"استعداد Public قبل الفتح: {self.public_preopen_window_seconds:g} ثوانٍ | إعادة محاولة سريعة: {self.public_fast_retry_seconds:g} ثانية\n"
-            f"سياسة الكمية التلقائية: حد ≤{self.auto_stage_high_limit_threshold} يؤخذ كهدف؛ أعلى منه/غير محدود = {self.auto_stage_high_limit_quantity}\n"
-            f"Public المدفوع: يحتاج موافقة + محافظ + كمية كل محفظة\n"
-            f"سقف الغاز بالدولار: ${self.max_gas_usd}\n"
-            f"سقف الغاز Native: {'بدون حد' if self.max_gas_native <= 0 else self.max_gas_native}\n"
-            f"أقصى سعر Mint: {'بدون حد' if self.max_mint_price_default <= 0 else self.max_mint_price_default}\n"
-            f"استراتيجية الغاز: {self.gas_strategy} | Buffer={self.gas_limit_buffer}\n"
-            f"المحافظ المتوازية: {self.max_parallel_wallets}"
+            "⚙️ إعدادات التشغيل الحالية\n\n"
+            f"▶️ التنفيذ: {'متوقف' if self.paused else 'يعمل'}\n"
+            f"⚡ Stream اللحظي: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} — أولوية قصوى ولا يستهلك REST quota\n"
+            f"🛟 Mint Events احتياطي: كل {self.auto_event_scan_seconds:g} ثانية\n"
+            f"⏰ Upcoming schedules: كل {self.auto_upcoming_scan_seconds:g} ثانية\n"
+            f"📚 بقية Drops backfill: كل {self.auto_drop_scan_seconds:g} ثانية\n"
+            f"🚦 OpenSea REST: {rest_state} | المتبقي: {quota}\n"
+            f"🎟 إعادة محاولة التأهيل المؤقت فقط: كل {self.qualification_recheck_seconds:g} ثانية\n"
+            f"🚀 استعداد Public: قبل الفتح بـ {self.public_preopen_window_seconds:g}s | retry={self.public_fast_retry_seconds:g}s\n"
+            f"📦 سياسة الكمية: حد ≤{self.auto_stage_high_limit_threshold} كهدف؛ أعلى/غير محدود = {self.auto_stage_high_limit_quantity}\n"
+            f"💳 Public المدفوع: موافقة + محافظ + كمية لكل محفظة\n"
+            f"⛽ سقف الغاز: ${self.max_gas_usd} | Native={'بدون حد' if self.max_gas_native <= 0 else self.max_gas_native}\n"
+            f"🧠 Gas strategy: {self.gas_strategy} | Buffer={self.gas_limit_buffer}\n"
+            f"👛 المحافظ المتوازية: {self.max_parallel_wallets}"
         )
 
     def history_text(self) -> str:
-        rows = self.store.recent_history(15)
+        rows = self.store.recent_history(12)
         if not rows:
             return "📜 لا يوجد سجل Mint حتى الآن."
-        status_labels = {
-            "submitted": "🚀 أُرسلت",
-            "confirmed": "✅ تأكدت",
-            "reverted": "❌ فشلت",
-        }
-        lines = ["📜 آخر عمليات الـMint"]
+        status_labels = {"submitted": "🚀 أُرسلت", "confirmed": "✅ تأكدت", "reverted": "❌ فشلت"}
+        lines = ["📜 سجل عمليات الـMint", ""]
         for row in rows:
             ts = format_ts(float(row["created_at"]), self.display_tz)
             label = status_labels.get(str(row["status"]), str(row["status"]))
-            lines.append(
-                f"• {label} | {row['slug']} | {row['wallet_name']}\n"
-                f"  {ts}" + (f"\n  TX: {row['tx_hash']}" if row.get("tx_hash") else "")
-            )
+            url = self.row_mint_url(row)
+            lines.extend([
+                f"{label} — {row['slug']}",
+                f"🌐 {chain_label(str(row.get('chain') or ''))} | 👛 {row['wallet_name']}",
+                f"🕒 {ts}",
+                f"🔗 {url}" + (f"\n🔎 TX: {row['tx_hash']}" if row.get("tx_hash") else ""),
+                "",
+            ])
         return "\n".join(lines)[:3900]
 
     def free_mints_text(self) -> str:
-        rows = self.store.free_mint_summary(30)
+        rows = self.store.free_mint_summary(25)
         if not rows:
             return (
                 "🆓 لا توجد Free Mints مؤكدة أخذها البوت حتى الآن.\n\n"
-                "عندما تنجح معاملة مجانية ستظهر هنا فقط بعد تأكيدها على الشبكة."
+                "عندما تنجح معاملة مجانية ستظهر هنا بعد تأكيدها على الشبكة."
             )
         lines = ["🆓 المنتات المجانية التي تم أخذها", ""]
         for row in rows:
             names = [x.strip() for x in str(row.get("wallet_names") or "").split(",") if x.strip()]
-            if len(names) > 4:
-                wallet_text = "، ".join(names[:4]) + f" +{len(names)-4}"
-            else:
-                wallet_text = "، ".join(names) or "غير معروف"
-            lines.append(
-                f"• {row.get('slug')} | {chain_label(str(row.get('chain') or ''))}\n"
-                f"  الكمية الإجمالية: {int(row.get('total_quantity') or 0)} | المحافظ: {int(row.get('wallet_count') or 0)}\n"
-                f"  الأسماء: {wallet_text}\n"
-                f"  آخر تأكيد: {format_ts(float(row.get('last_confirmed_at') or 0), self.display_tz)}"
-            )
-        lines.append("\nهذه القائمة تعرض الـMint المجاني المؤكد فقط، ولا تعرض المحاولات أو المعاملات الفاشلة.")
+            wallet_text = "، ".join(names[:4]) + (f" +{len(names)-4}" if len(names) > 4 else "")
+            lines.extend([
+                f"✅ {row.get('slug')}",
+                f"🌐 الشبكة: {chain_label(str(row.get('chain') or ''))}",
+                f"🔢 الكمية الإجمالية: {int(row.get('total_quantity') or 0)}",
+                f"👛 المحافظ: {int(row.get('wallet_count') or 0)} — {wallet_text or 'غير معروف'}",
+                f"🕒 آخر تأكيد: {format_ts(float(row.get('last_confirmed_at') or 0), self.display_tz)}",
+                f"🔗 رابط المنت: {self.row_mint_url(row)}",
+                "",
+            ])
         return "\n".join(lines)[:3900]
 
     def _is_timestamp_today(self, ts: float | None) -> bool:
@@ -3113,17 +3451,19 @@ class Bot:
                 plans = json.loads(str(row.get("stages_json") or "[]"))
             except Exception:
                 plans = []
-            today_plans = [
-                p for p in plans if self._is_timestamp_today(p.get("start")) or plan_is_active(p, now)
-            ]
+            today_plans = [p for p in plans if self._is_timestamp_today(p.get("start")) or plan_is_active(p, now)]
             if today_plans:
                 today_rows.append((row, today_plans))
         if not today_rows:
             return "🎟 لا توجد منتات تأهيل مسجلة لتاريخ اليوم حتى الآن."
-        lines = ["📅 تأهيلات اليوم"]
-        for row, plans in today_rows[:15]:
+        lines = ["📅 تأهيلات اليوم", ""]
+        for row, plans in today_rows[:12]:
             project_key = str(row["project_key"])
-            lines.append(f"\n• {row['slug']} | {chain_label(str(row['chain']))}")
+            lines.extend([
+                f"🎟 {row['slug']}",
+                f"🌐 الشبكة: {chain_label(str(row['chain']))}",
+                f"🔗 رابط المنت: {self.row_mint_url(row)}",
+            ])
             for plan in plans[:6]:
                 stage_key = str(plan.get("key") or "")
                 wallet_rows = self.store.qualification_wallet_rows(project_key, stage_key)
@@ -3136,14 +3476,16 @@ class Bot:
                         chain=str(row["chain"]), contract_address=row.get("contract_address"),
                     )
                     target = int(wallet_row.get("target_total") or 0)
-                    suffix = f" (مأخوذ {confirmed}/{target})" if target else (f" (مأخوذ {confirmed})" if confirmed else "")
+                    suffix = f" ({confirmed}/{target})" if target else (f" ({confirmed})" if confirmed else "")
                     eligible_names.append(str(wallet_row["wallet_name"]) + suffix)
                 eligible_text = "، ".join(eligible_names) if eligible_names else "لا توجد محفظة مؤهلة حتى آخر فحص"
-                lines.append(
-                    f"  🎫 {plan.get('label')} | {format_ts(plan.get('start'), self.display_tz)}"
-                    f" | {'عام' if plan.get('is_public') else 'تأهيل'}"
-                )
-                lines.append(f"     المؤهلة: {eligible_text}")
+                mode = "🌍 Public" if plan.get("is_public") else "🎫 تأهيل"
+                lines.extend([
+                    f"  {mode} — {plan.get('label')}",
+                    f"  ⏰ {format_ts(plan.get('start'), self.display_tz)}",
+                    f"  👛 المؤهلة: {eligible_text}",
+                ])
+            lines.append("")
         return "\n".join(lines)[:3900]
 
     def qualification_old_text(self) -> str:
@@ -3159,42 +3501,51 @@ class Bot:
                 old.append(row)
         if not old:
             return "🗄 لا توجد تأهيلات قديمة محفوظة بعد."
-        lines = ["🗄 التأهيلات القديمة"]
-        for row in old[:25]:
+        lines = ["🗄 التأهيلات القديمة", ""]
+        for row in old[:20]:
             status = "منتهٍ" if str(row.get("status")) != "active" else "من تاريخ سابق"
-            lines.append(
-                f"• {row['slug']} | {chain_label(str(row['chain']))} | {status}\n"
-                f"  آخر مرحلة: {row.get('last_stage_label') or 'غير معروف'}"
-                + (f" | السبب: {row.get('archive_reason')}" if row.get("archive_reason") else "")
-            )
+            lines.extend([
+                f"🎟 {row['slug']} — {status}",
+                f"🌐 {chain_label(str(row['chain']))}",
+                f"🏁 آخر مرحلة: {row.get('last_stage_label') or 'غير معروف'}" + (f" | {row.get('archive_reason')}" if row.get("archive_reason") else ""),
+                f"🔗 {self.row_mint_url(row)}",
+                "",
+            ])
         return "\n".join(lines)[:3900]
 
     def monitoring_active_text(self) -> str:
         rows = self.store.list_watches(active_only=True)
         if not rows:
             return "📡 لا توجد منتات محفوظة تحت المراقبة حاليًا."
-        lines = ["📡 المنتات تحت المراقبة"]
-        for row in rows[:30]:
-            kind = {"manual": "يدوي", "auto_stage": "تلقائي/مراحل", "auto_free": "تلقائي/مجاني"}.get(str(row.get("watch_kind")), str(row.get("watch_kind") or ""))
+        lines = ["📡 المنتات تحت المراقبة", ""]
+        for row in rows[:25]:
+            kind = {"manual": "🖐 يدوي", "auto_stage": "🤖 تلقائي/مراحل", "auto_free": "🆓 تلقائي/مجاني"}.get(str(row.get("watch_kind")), str(row.get("watch_kind") or ""))
             paid = str(row.get("paid_decision") or "")
-            paid_text = {"pending": " | 💳 بانتظار قرار", "confirmed": " | 💳 شراء مؤكد", "declined": " | 🚫 المدفوع مرفوض"}.get(paid, "")
-            lines.append(
-                f"• {row['slug']} | {chain_label(str(row.get('chain') or ''))}\n"
-                f"  {kind} | المرحلة القادمة: {format_ts(row.get('next_stage_start'), self.display_tz)}{paid_text}"
-            )
+            paid_text = {"pending": "💳 بانتظار قرار", "confirmed": "✅ شراء مدفوع مؤكد", "declined": "🚫 المدفوع مرفوض"}.get(paid, "")
+            lines.extend([
+                f"📦 {row['slug']}",
+                f"🌐 {chain_label(str(row.get('chain') or ''))} | {kind}" + (f" | {paid_text}" if paid_text else ""),
+                f"⏰ المرحلة القادمة: {format_ts(row.get('next_stage_start'), self.display_tz)}",
+                f"🔗 {self.row_mint_url(row)}",
+                "",
+            ])
         return "\n".join(lines)[:3900]
 
     def monitoring_old_text(self) -> str:
-        rows = self.store.list_archived_watches(40)
+        rows = self.store.list_archived_watches(30)
         if not rows:
             return "🗄 لا توجد منتات مراقبة قديمة حتى الآن."
-        lines = ["🗄 المنتات القديمة"]
-        for row in rows:
+        lines = ["🗄 المنتات القديمة", ""]
+        for row in rows[:25]:
             when = row.get("archived_at") or row.get("updated_at")
-            lines.append(
-                f"• {row['slug']} | {chain_label(str(row.get('chain') or ''))}\n"
-                f"  انتهت: {format_ts(when, self.display_tz)} | السبب: {row.get('archive_reason') or 'انتهت المراقبة'}"
-            )
+            lines.extend([
+                f"📦 {row['slug']}",
+                f"🌐 {chain_label(str(row.get('chain') or ''))}",
+                f"🏁 انتهت: {format_ts(when, self.display_tz)}",
+                f"📝 السبب: {row.get('archive_reason') or 'انتهت المراقبة'}",
+                f"🔗 {self.row_mint_url(row)}",
+                "",
+            ])
         return "\n".join(lines)[:3900]
 
     def check_and_track_qualification_link(self, raw: str) -> str:
@@ -3301,9 +3652,13 @@ class Bot:
         }.get(candidate.paid_decision or "pending", "⏳ يحتاج إعداد/تأكيد")
         open_text = format_ts(plan.get("start"), self.display_tz) if plan else format_ts(candidate.paid_stage_start, self.display_tz)
         return (
-            f"• {candidate.slug} | {chain_label(candidate.chain)}\n"
-            f"  السعر: {native_text} | {usdt_text}\n"
-            f"  الفتح: {open_text} | {decision}"
+            f"💳 {candidate.slug}\n"
+            f"🌐 {chain_label(candidate.chain)}\n"
+            f"💰 السعر: {native_text}\n"
+            f"💵 التقريبي: {usdt_text}\n"
+            f"⏰ الفتح: {open_text}\n"
+            f"📌 الحالة: {decision}\n"
+            f"🔗 {self.candidate_mint_url(candidate)}"
         )
 
     def paid_quantity_cap(self, candidate: Candidate) -> int:
@@ -3357,7 +3712,8 @@ class Bot:
             "اختر المحافظ، ثم اضغط زر الكمية بجانب كل محفظة وأدخل الكمية المطلوبة.\n"
             "لن يتم توقيع أي Mint مدفوع قبل الضغط على «🚀 تأكيد خطة الشراء».\n"
             "أي Public مجاني سيبقى تلقائيًا لجميع المحافظ النشطة.\n\n"
-            f"المحدد حاليًا:\n{selected_text}"
+            f"المحدد حاليًا:\n{selected_text}\n\n"
+            f"{self.mint_link_block(candidate)}"
         )[:3900]
 
     def paid_selector_buttons(self, candidate: Candidate) -> list[list[tuple[str, str]]]:
@@ -3669,8 +4025,10 @@ class Bot:
             self.persist_paid_plan(candidate, "declined")
             self.edit_or_send(
                 event,
-                f"🚫 تم رفض شراء Public Mint المدفوع للمشروع {candidate.slug}.\n"
-                "ستستمر مراقبة بقية المراحل، وأي Public مجاني سيبقى تلقائيًا لجميع المحافظ النشطة.",
+                "🚫 تم رفض شراء Public Mint المدفوع\n\n"
+                f"📦 المشروع: {candidate.slug}\n"
+                "⚙️ ستستمر مراقبة بقية المراحل، وأي Public مجاني سيبقى تلقائيًا لجميع المحافظ النشطة.\n\n"
+                f"{self.mint_link_block(candidate)}",
                 self.paid_watches_buttons(),
             )
             return
@@ -3809,10 +4167,12 @@ class Bot:
                     names.append(f"• {state.wallet.name}: {candidate.paid_wallet_quantities[address]}")
             self.edit_or_send(
                 event,
-                f"✅ تم تأكيد خطة شراء {candidate.slug}.\n"
-                f"وقت الفتح: {format_ts(candidate.paid_stage_start, self.display_tz)}\n\n"
-                + "\n".join(names)
-                + "\n\nسيبدأ الاستعداد قبل الفتح مباشرة، مع تطبيق سقف الغاز والسعر قبل التوقيع.",
+                "✅ تم تأكيد خطة الشراء\n\n"
+                f"📦 المشروع: {candidate.slug}\n"
+                f"⏰ وقت الفتح: {format_ts(candidate.paid_stage_start, self.display_tz)}\n\n"
+                + "👛 المحافظ والكميات:\n" + "\n".join(names)
+                + "\n\n⚙️ سيبدأ الاستعداد قبل الفتح مباشرة، مع تطبيق سقف الغاز والسعر قبل التوقيع.\n\n"
+                + self.mint_link_block(candidate),
                 self.paid_watches_buttons(),
             )
             return
@@ -3829,8 +4189,10 @@ class Bot:
             self.persist_paid_plan(candidate, "declined")
             self.edit_or_send(
                 event,
-                f"🚫 لن يتم شراء Public Mint المدفوع للمشروع {candidate.slug}.\n"
-                "المراقبة ستستمر لبقية المراحل وأي Public مجاني لاحق.",
+                "🚫 تم إلغاء شراء Public Mint المدفوع\n\n"
+                f"📦 المشروع: {candidate.slug}\n"
+                "⚙️ المراقبة ستستمر لبقية المراحل وأي Public مجاني لاحق.\n\n"
+                f"{self.mint_link_block(candidate)}",
                 self.paid_watches_buttons(),
             )
             return
@@ -4134,8 +4496,29 @@ class Bot:
 
     def drain_commands(self) -> None:
         # Kept only for compatibility with older code paths. The dedicated
-        # worker is the sole consumer in V4.6 to avoid races/double handling.
+        # worker is the sole consumer from V4.6 onward to avoid races/double handling.
         return
+
+    def candidate_loop_priority(self, candidate: Candidate) -> tuple[int, float]:
+        """Prioritize live/free/public work ahead of background stage bookkeeping."""
+        now = time.time()
+        if any(st.submitted and not st.confirmed for st in candidate.wallets.values()):
+            return (0, 0.0)
+        current = self.current_plan_for_candidate(candidate, now) if candidate.stage_plans else None
+        if current and current.get("is_public") and current.get("is_free"):
+            return (1, float(current.get("start") or 0))
+        if current and current.get("is_free"):
+            return (2, float(current.get("start") or 0))
+        future = self.next_plan_for_candidate(candidate, now) if candidate.stage_plans else None
+        if future and future.get("is_public") and future.get("is_free"):
+            remaining = float(future.get("start") or (now + 999999)) - now
+            if remaining <= self.public_preopen_window_seconds:
+                return (3, remaining)
+        if candidate.watch_kind == "auto_free":
+            return (4, candidate.next_refresh)
+        if current:
+            return (5, float(current.get("start") or 0))
+        return (6, float(candidate.next_stage_start or 9e18))
 
     def notify_all(self, text: str) -> None:
         if not self.telegram.enabled:
@@ -4146,7 +4529,7 @@ class Bot:
     # ---------- main loop ----------
     def run(self) -> None:
         start_health_server()
-        log.info("Mint Guardian V4.6 starting")
+        log.info("Mint Guardian V4.7 starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
@@ -4156,12 +4539,17 @@ class Bot:
         self.bootstrap_watches()
         self.start_auto_free_discovery()
         log.info(
+            "Discovery priority ready | stream-fast=%s | upcoming=%.1fs | mint-events=%.1fs | catalog-backfill=%.1fs | REST concurrency=%s",
+            self.auto_stream_fast_path, self.auto_upcoming_scan_seconds, self.auto_event_scan_seconds,
+            self.auto_drop_scan_seconds, getattr(self.opensea, "rest_concurrency", "?"),
+        )
+        log.info(
             "Stage planner ready | qualification recheck=%.1fs | public preopen=%.1fs | public retry=%.2fs | high/unknown qty=%s",
             self.qualification_recheck_seconds, self.public_preopen_window_seconds,
             self.public_fast_retry_seconds, self.auto_stage_high_limit_quantity,
         )
         self.notify_all(
-            "🟢 OpenSea Mint Guardian V4.6 يعمل الآن على Railway.\n"
+            "🟢 OpenSea Mint Guardian V4.7 يعمل الآن على Railway.\n"
             f"الاكتشاف التلقائي: {'مفعّل كل ' + format(self.auto_free_scan_seconds, 'g') + ' ثانية' if self.auto_free_enabled else 'متوقف'}.\n"
             f"OpenSea Stream: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} | REST Mint Events: {'مفعّل' if self.auto_event_fallback_enabled else 'متوقف'}.\n"
             f"التأهيل: إعادة فحص كل {self.qualification_recheck_seconds:g} ثانية أثناء المرحلة.\n"
@@ -4172,7 +4560,8 @@ class Bot:
         while not STOP:
             self.drain_auto_discovery()
             self.cleanup_auto_candidates()
-            for key, candidate in list(self.candidates.items()):
+            ordered = sorted(list(self.candidates.items()), key=lambda kv: self.candidate_loop_priority(kv[1]))
+            for key, candidate in ordered:
                 self.refresh_candidate(candidate)
                 self.process_stage_schedule(candidate)
                 self.try_candidate(candidate)
@@ -4181,7 +4570,10 @@ class Bot:
                     pending = any(s.submitted and not s.confirmed for s in candidate.wallets.values())
                     if not pending:
                         self.candidates.pop(key, None)
-            time.sleep(0.12)
+                # Pull in any live Stream mint that arrived while this candidate
+                # was being processed; it will be first on the next sorted pass.
+                self.drain_auto_discovery()
+            time.sleep(0.05)
         log.info("Stopped")
 
 
