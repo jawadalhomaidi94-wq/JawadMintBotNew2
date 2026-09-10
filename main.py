@@ -60,6 +60,34 @@ logging.basicConfig(
 )
 log = logging.getLogger("opensea-mint-guardian")
 
+
+class _SecretRedactionFilter(logging.Filter):
+    """Redact configured service credentials from every emitted log line."""
+    def __init__(self) -> None:
+        super().__init__()
+        names = ("ALCHEMY_API_KEY", "OPENSEA_API_KEY", "TELEGRAM_BOT_TOKEN", "WALLET_ENCRYPTION_KEY")
+        self.secrets = [os.getenv(name, "").strip() for name in names if os.getenv(name, "").strip()]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        for secret in self.secrets:
+            if len(secret) >= 6:
+                message = message.replace(secret, "***REDACTED***")
+        # Telegram bot tokens have a distinctive form; protect even if the
+        # environment list above changes later.
+        message = re.sub(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b", "***REDACTED_BOT_TOKEN***", message)
+        record.msg = message
+        record.args = ()
+        return True
+
+
+_secret_filter = _SecretRedactionFilter()
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_secret_filter)
+
 STOP = False
 
 
@@ -104,6 +132,19 @@ def csv_values(value: str | None) -> list[str]:
 
 def short_address(address: str) -> str:
     return f"{address[:6]}…{address[-4:]}" if len(address) >= 12 else address
+
+
+def safe_endpoint_for_log(url: str) -> str:
+    """Return a useful endpoint label without API credentials/query secrets."""
+    try:
+        parsed = urlparse(str(url or ""))
+        if not parsed.scheme or not parsed.netloc:
+            return "<rpc>"
+        path = parsed.path or ""
+        path = re.sub(r"(/v2/)[^/]+$", r"\1***", path, flags=re.IGNORECASE)
+        return f"{parsed.scheme}://{parsed.netloc}{path}"
+    except Exception:
+        return "<rpc>"
 
 
 def parse_time(value: Any) -> float | None:
@@ -1043,7 +1084,11 @@ class TelegramController(threading.Thread):
                     if not self.authorized(chat_id):
                         self.send(chat_id, f"⛔ هذه المحادثة غير مصرح لها بالتحكم في البوت.\nمعرّف المحادثة: {chat_id}")
                         continue
-                    log.info("Telegram message received | chat_id=%s | text=%s", chat_id, text[:80])
+                    # Never log raw Telegram input: wallet private keys and other
+                    # secrets are entered through this same channel. Only slash
+                    # commands are safe/useful to identify in operational logs.
+                    command_label = text.split(None, 1)[0] if text.startswith("/") else "<private-input>"
+                    log.info("Telegram message received | chat_id=%s | input=%s | len=%s", chat_id, command_label, len(text))
                     self.bot.command_queue.put({
                         "type": "message",
                         "chat_id": chat_id,
@@ -1125,6 +1170,7 @@ class Bot:
         self.fast_stage_refresh_seconds = max(1.0, env_float("FAST_STAGE_REFRESH_SECONDS", 3.0))
         self.fast_refresh_window = max(15.0, env_float("FAST_REFRESH_WINDOW", 120.0))
         self.receipt_check_seconds = max(2.0, env_float("RECEIPT_CHECK_SECONDS", 5.0))
+        self.low_balance_retry_seconds = max(1.0, env_float("LOW_BALANCE_RETRY_SECONDS", 2.0))
         self.max_parallel_wallets = max(1, env_int("MAX_PARALLEL_WALLETS", 10))
         self.drop_limit = max(1, min(env_int("DROP_LIMIT", 25), 100))
 
@@ -1712,7 +1758,7 @@ class Bot:
                     broadcast_workers=env_int("RPC_BROADCAST_WORKERS", 4),
                 )
                 self.rpc_pools[chain] = pool
-                log.info("RPC %s ready | primary=%s | verified=%s", chain, pool.primary_url, len(pool.urls))
+                log.info("RPC %s ready | primary=%s | verified=%s", chain, safe_endpoint_for_log(pool.primary_url), len(pool.urls))
             except Exception as exc:
                 log.warning("RPC pool disabled for %s: %s", chain, exc)
 
@@ -2627,8 +2673,13 @@ class Bot:
         work: list[tuple[WalletState, int]] = []
         is_paid = bool(plan.get("is_paid"))
         target_total = self.stage_target_total(candidate, plan)
+        now = time.time()
         for state in candidate.wallets.values():
             if state.submitted:
+                continue
+            # Prevent a wallet with no native gas balance from being hammered on
+            # every 40ms Race retry. Healthy wallets still enter immediately.
+            if state.next_attempt and state.next_attempt > now:
                 continue
             address = state.wallet.address.lower()
             if is_paid:
@@ -2654,6 +2705,42 @@ class Bot:
             state.stage_label = str(plan.get("label") or "Public SeaDrop")
             work.append((state, qty))
         return work
+
+    def notify_insufficient_balance(self, candidate: Candidate, state: WalletState, result: Any | None = None, detail: str | None = None) -> None:
+        """Always alert when a mint cannot proceed because native funds are insufficient.
+
+        This notification intentionally bypasses the routine monitoring/stage
+        notification toggle. It is a transaction-safety alert, not dashboard noise.
+        """
+        alert_key = f"insufficient_balance:{state.stage_key or candidate.current_stage_key or 'mint'}"
+        if state.last_notified_status == alert_key:
+            return
+        state.last_notified_status = alert_key
+        symbol = native_symbol(candidate.chain)
+        mint_value = getattr(result, "mint_value_native", None) if result is not None else None
+        gas_value = getattr(result, "gas_cost_native", None) if result is not None else None
+        gas_usd = getattr(result, "gas_cost_usd", None) if result is not None else None
+        kind = "مدفوع" if (mint_value is not None and mint_value > 0) else "مجاني"
+        lines = [
+            "💸 فشل أخذ المنت — رصيد رسوم الشبكة غير كافٍ",
+            "",
+            f"📦 المشروع: {candidate.slug}",
+            f"🏷 النوع: {kind}",
+            f"🌐 الشبكة: {chain_label(candidate.chain)}",
+            f"👛 المحفظة: {state.wallet.name} {short_address(state.wallet.address)}",
+        ]
+        if mint_value is not None:
+            lines.append(f"💰 قيمة المنت: {mint_value} {symbol}")
+        if gas_value is not None:
+            gas_line = f"⛽ أقصى تقدير للغاز: {gas_value} {symbol}"
+            if gas_usd is not None:
+                gas_line += f" ≈ ${gas_usd:.4f}"
+            lines.append(gas_line)
+        lines.append(f"⚠️ أضف رصيد {symbol} كافيًا لهذه المحفظة ثم سيعيد البوت المحاولة تلقائيًا إذا كانت المرحلة ما زالت مفتوحة.")
+        if detail:
+            lines.append(f"📝 السبب: {str(detail)[:350]}")
+        lines.extend(["", self.mint_link_block(candidate)])
+        self.notify_all("\n".join(lines)[:3900])
 
     def _apply_race_results(self, candidate: Candidate, plan: dict[str, Any], results: dict[str, Any]) -> int:
         submitted = 0
@@ -2697,12 +2784,23 @@ class Bot:
                 )
             else:
                 # Keep hot failures retryable while the short launch window is
-                # still open. Gas policy and paid-policy failures keep their
-                # normal slower retry semantics.
-                if result.status in {"gas_usd_too_high", "gas_price_unavailable", "gas_too_high"}:
+                # still open. Safety/policy failures use a slower retry so they
+                # cannot consume every Race tick.
+                if result.status == "insufficient_balance":
+                    state.next_attempt = now + self.low_balance_retry_seconds
+                    self.notify_insufficient_balance(candidate, state, result=result, detail=result.detail)
+                elif result.status in {"gas_usd_too_high", "gas_price_unavailable", "gas_too_high"}:
                     state.next_attempt = now + self.gas_over_budget_retry_seconds
                 elif result.status in {"paid_not_allowed", "paid_wallet_selection_required", "mint_price_too_high"}:
                     state.next_attempt = now + 15.0
+                elif result.status == "precondition_failed" and any(
+                    marker in str(result.detail or "").lower()
+                    for marker in ("wallet already reached", "no on-chain supply remains", "sold out")
+                ):
+                    # Nothing useful can happen again in the same stage. A new
+                    # stage automatically resets final=False in process_stage_schedule.
+                    state.final = True
+                    state.next_attempt = now + max(15.0, self.stage_refresh_seconds)
                 else:
                     state.next_attempt = now + self.race_retry_seconds
         return submitted
@@ -2738,7 +2836,7 @@ class Bot:
 
     def _prewarm_candidate_race(self, candidate: Candidate, plan: dict[str, Any]) -> None:
         prep_perf = time.perf_counter()
-        if not self.race_enabled or not candidate.contract_address:
+        if self.paused or not self.race_enabled or not candidate.contract_address:
             return
         # Prewarm is intentionally allowed before the social decision: building
         # and signing locally spends no gas. Only broadcast is trust-gated.
@@ -2756,6 +2854,17 @@ class Bot:
             if price_wei > 0 and candidate.paid_decision != "confirmed":
                 return
             bundle = self._prepare_race_bundle(candidate, plan, public)
+            if bundle:
+                for addr_l, result in (bundle.get("results") or {}).items():
+                    if getattr(result, "status", "") == "insufficient_balance":
+                        state = candidate.wallets.get(str(addr_l).lower())
+                        if state is not None:
+                            state.next_attempt = time.time() + self.low_balance_retry_seconds
+                            self.notify_insufficient_balance(candidate, state, result=result, detail=getattr(result, "detail", None))
+            # Pause may have been pressed while prewarm was doing RPC work. Do
+            # not retain a signed bundle in that case.
+            if self.paused:
+                return
             if bundle and bundle.get("entries"):
                 with self.race_state_lock:
                     self.race_prepared[key] = bundle
@@ -2779,7 +2888,7 @@ class Bot:
 
     def _launch_candidate_race(self, candidate: Candidate, plan: dict[str, Any], *, live: bool = False) -> None:
         launch_perf = time.perf_counter()
-        if not self.race_enabled or not candidate.contract_address:
+        if self.paused or not self.race_enabled or not candidate.contract_address:
             return
         if not self.social_protection_allows(candidate, plan):
             return
@@ -2835,10 +2944,10 @@ class Bot:
             if not bundle:
                 log.info("RACE skipped | %s | %s | no bundle", candidate.slug, candidate.chain)
                 return
-            # Final zero-cost guard immediately before broadcast. This is a RAM
-            # check when trust already passed and prevents a mid-flight settings
-            # toggle from allowing an unverified automatic Free Mint.
-            if not self.social_protection_allows(candidate, plan):
+            # Final zero-cost guards immediately before broadcast. Pause must
+            # stop Race just like the normal path, and social protection remains
+            # a RAM check when already resolved.
+            if self.paused or not self.social_protection_allows(candidate, plan):
                 return
             results = broadcast_seadrop_race_transactions(
                 rpc_pool=self.rpc_pools[candidate.chain],
@@ -2890,6 +2999,9 @@ class Bot:
                     candidate.paid_detected = True
                     self.maybe_offer_paid_public(candidate)
                     return
+                if self.paused:
+                    # Discovery continues while paused, but no signing/broadcast.
+                    return
                 if not self.social_protection_allows(candidate, plan):
                     log.debug("Fast free mint waiting for social trust | %s | %s", candidate.slug, chain)
                     return
@@ -2922,6 +3034,8 @@ class Bot:
         This prevents a 10ms scheduler tick from filling the executor with
         duplicate work while the first launch thread is still being scheduled.
         """
+        if self.paused:
+            return
         stage_key = str(plan.get("key") or candidate.current_stage_key or "public")
         key = self._race_key(candidate, stage_key)
         with self.race_state_lock:
@@ -2943,6 +3057,9 @@ class Bot:
             self.race_scheduler_tick, self.race_prewarm_seconds, self.race_static_gas_limit,
         )
         while not STOP:
+            if self.paused:
+                time.sleep(max(0.01, self.race_scheduler_tick))
+                continue
             now = time.time()
             with self.candidates_lock:
                 snapshot = list(self.candidates.values())
@@ -4034,6 +4151,9 @@ class Bot:
         return "\n".join(lines)[:3900]
 
     def notify_state_change(self, candidate: Candidate, state: WalletState, status: str, detail: str | None = None) -> None:
+        if status == "insufficient_balance":
+            self.notify_insufficient_balance(candidate, state, detail=detail)
+            return
         if status == state.last_notified_status:
             return
         state.last_notified_status = status
@@ -4288,7 +4408,11 @@ class Bot:
                         state.next_attempt = time.time() + (self.public_fast_retry_seconds if plan and plan.get("is_public") else self.open_retry_interval)
                 elif result.status == "precondition_failed":
                     state.eligibility = "not_eligible_now"
-                    if plan and plan.get("is_public") and not plan.get("is_paid"):
+                    detail_l = str(result.detail or "").lower()
+                    if any(marker in detail_l for marker in ("wallet already reached", "sold out", "no on-chain supply remains")):
+                        state.final = True
+                        state.next_attempt = time.time() + max(15.0, self.stage_refresh_seconds)
+                    elif plan and plan.get("is_public") and not plan.get("is_paid"):
                         state.next_attempt = time.time() + self.public_fast_retry_seconds
                     else:
                         state.next_attempt = time.time() + self.qualification_recheck_seconds
@@ -4297,7 +4421,9 @@ class Bot:
                     state.next_attempt = time.time() + max(self.rate_limit_retry_seconds, cooldown)
                 elif result.status in {"gas_usd_too_high", "gas_price_unavailable"}:
                     state.next_attempt = time.time() + self.gas_over_budget_retry_seconds
-                elif result.status in {"gas_too_high", "insufficient_balance", "mint_price_too_high", "total_spend_too_high"}:
+                elif result.status == "insufficient_balance":
+                    state.next_attempt = time.time() + max(self.low_balance_retry_seconds, 2.0)
+                elif result.status in {"gas_too_high", "mint_price_too_high", "total_spend_too_high"}:
                     state.next_attempt = time.time() + max(10, self.eligibility_retry_seconds)
                 elif result.status in {"paid_not_allowed", "target_not_allowed"}:
                     state.next_attempt = time.time() + 30
@@ -4305,7 +4431,10 @@ class Bot:
                     state.next_attempt = time.time() + 15
                 else:
                     state.next_attempt = time.time() + self.monitor_retry_interval
-                self.notify_state_change(candidate, state, result.status, result.detail)
+                if result.status == "insufficient_balance":
+                    self.notify_insufficient_balance(candidate, state, result=result, detail=result.detail)
+                else:
+                    self.notify_state_change(candidate, state, result.status, result.detail)
 
     def check_receipts(self, candidate: Candidate) -> None:
         pool = self.rpc_pools[candidate.chain]
@@ -4380,6 +4509,16 @@ class Bot:
                 )
 
     # ---------- Telegram UI ----------
+    def set_execution_paused(self, paused: bool) -> None:
+        """Pause/resume every signing+broadcast path, including Race Lane."""
+        self.paused = bool(paused)
+        if self.paused:
+            # Prepared transactions are intentionally discarded so Resume never
+            # broadcasts a stale nonce/fee snapshot built before the pause.
+            with self.race_state_lock:
+                self.race_prepared.clear()
+                self.race_queued.clear()
+
     def menu_buttons(self) -> list[list[tuple[str, str]]]:
         return [
             [("➕ إضافة محفظة", "add_wallet"), ("👛 المحافظ", "wallets")],
@@ -4461,7 +4600,7 @@ class Bot:
         total = len(self.store.list_wallets(enabled_only=False))
         self.telegram.send(
             chat_id,
-            "🤖 OpenSea Mint Guardian V4.11\n\n"
+            "🤖 OpenSea Mint Guardian V4.11.1\n\n"
             "🆓 الاكتشاف المجاني: Stream لحظي + SeaDrop مباشر + REST احتياطي\n"
             f"⚡ الاستعداد للـPublic: آخر {self.public_preopen_window_seconds:g} ثوانٍ\n"
             f"📦 سياسة الكمية: حد المنت ≤100 يؤخذ كما هو، وإذا كان >100/غير محدود فالهدف {self.auto_stage_high_limit_quantity}\n"
@@ -4599,6 +4738,7 @@ class Bot:
             f"💳 Public المدفوع: موافقة + محافظ + كمية لكل محفظة\n"
             f"🛡 حماية Free Mint: {'مفعلة — يشترط X أو Website للمنت التلقائي بدون تأهيل' if self.free_social_protection_enabled else 'متوقفة — يأخذ جميع Free Mints كما في V4.10.1'}\n"
             f"⛽ الحد العام: ${self.max_gas_usd} | Ethereum=${self.max_gas_usd_for_chain('ethereum')} | Ink=${self.max_gas_usd_for_chain('ink')} | Robinhood=${self.max_gas_usd_for_chain('robinhood')}\n"
+            f"💸 تنبيه نقص رصيد الغاز: مفعّل دائمًا | إعادة المحاولة كل {self.low_balance_retry_seconds:g}s\n"
             f"🔕 إشعارات المراقبة/التأهيل التلقائية: {'مفعلة' if self.routine_stage_notifications else 'متوقفة'}\n"
             f"🧠 Gas strategy: {self.gas_strategy} | Buffer={self.gas_limit_buffer}\n"
             f"👛 المحافظ المتوازية: {self.max_parallel_wallets}"
@@ -5307,7 +5447,7 @@ class Bot:
             )
             return
         if data == "toggle_pause":
-            self.paused = not self.paused
+            self.set_execution_paused(not self.paused)
             self.edit_or_send(
                 event,
                 "⏸ تم إيقاف توقيع وإرسال معاملات الـMint. الاكتشاف والمراقبة مستمران."
@@ -5832,11 +5972,11 @@ class Bot:
             self.telegram.send(chat_id, self.history_text(), self.menu_buttons())
             return
         if command in {"/pause", "/panic"}:
-            self.paused = True
-            self.telegram.send(chat_id, "⏸ تم إيقاف توقيع وإرسال معاملات الـMint. المراقبة مستمرة.", self.menu_buttons())
+            self.set_execution_paused(True)
+            self.telegram.send(chat_id, "⏸ تم إيقاف توقيع وإرسال جميع معاملات الـMint بما فيها Race Lane. المراقبة مستمرة.", self.menu_buttons())
             return
         if command == "/resume":
-            self.paused = False
+            self.set_execution_paused(False)
             self.telegram.send(chat_id, "▶️ تم استئناف توقيع وإرسال معاملات الـMint.", self.menu_buttons())
             return
         if command == "/eligibility":
@@ -5976,7 +6116,7 @@ class Bot:
     # ---------- main loop ----------
     def run(self) -> None:
         start_health_server()
-        log.info("Mint Guardian V4.11 starting")
+        log.info("Mint Guardian V4.11.1 starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
@@ -6001,7 +6141,7 @@ class Bot:
             self.public_fast_retry_seconds, self.auto_stage_high_limit_quantity,
         )
         log.info(
-            "RACE LANE V4.11 STABLE ready | enabled=%s | prewarm=%.2fs | scheduler=%.3fs | retry=%.3fs | staticGas=%s | signal/prep/launch=%s/%s/%s | SeaDrop-WSS=%s | fee-cache=%.2fs | race-gas=%s",
+            "RACE LANE V4.11.1 STABLE ready | enabled=%s | prewarm=%.2fs | scheduler=%.3fs | retry=%.3fs | staticGas=%s | signal/prep/launch=%s/%s/%s | SeaDrop-WSS=%s | fee-cache=%.2fs | race-gas=%s",
             self.race_enabled, self.race_prewarm_seconds, self.race_scheduler_tick,
             self.race_retry_seconds, self.race_static_gas_limit,
             self.race_stream_workers, self.race_prep_workers, self.race_launch_workers,
@@ -6013,7 +6153,7 @@ class Bot:
             self.social_trust_pass_ttl, self.social_trust_reject_ttl,
         )
         self.notify_all(
-            "🟢 OpenSea Mint Guardian V4.11 يعمل الآن على Railway.\n"
+            "🟢 OpenSea Mint Guardian V4.11.1 يعمل الآن على Railway.\n"
             f"الاكتشاف التلقائي: {'مفعّل كل ' + format(self.auto_free_scan_seconds, 'g') + ' ثانية' if self.auto_free_enabled else 'متوقف'}.\n"
             f"OpenSea Stream: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} | REST Mint Events: {'مفعّل' if self.auto_event_fallback_enabled else 'متوقف'}.\n"
             f"التأهيل/المراقبة: تعمل بصمت وتظهر تفاصيلها عند فتح الأقسام.\n"

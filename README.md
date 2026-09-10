@@ -1,80 +1,73 @@
-# OpenSea Mint Guardian V4.11 — Protected Free Mint Shield
+# OpenSea Mint Guardian V4.11.1 — Stable Safety Hotfix
 
-V4.11 is built directly on the known-working V4.10.1/V4.9 transaction path. The Race transaction construction/signing/broadcast logic is intentionally unchanged.
+V4.11.1 is a conservative hotfix built on V4.11. The protected Free Mint shield and the stable V4.10.1/V4.9 Race transaction path remain in place. The changes below target the exact issues observed in Railway logs without redesigning the successful speed architecture.
 
-## New: Protected Free Mint Shield
+## Fixed: SeaDrop wallet-limit simulation failures
 
-The shield is **enabled by default** and can be toggled from Telegram > ⚙️ الإعدادات.
+SeaDrop enforces the public wallet cap using the NFT contract's `getMintStats(minter)` values. A wallet may have minted outside this bot, so SQLite history alone is not authoritative.
 
-When enabled, it applies only to:
+V4.11.1 now:
 
-- automatically discovered Free Public mints;
-- projects that are not qualification/allowlist projects;
-- projects the user did not add manually.
+- reads `getMintStats(minter)` from the NFT contract;
+- subtracts the wallet's actual on-chain minted count from `maxTotalMintableByWallet`;
+- lowers the requested quantity to the remaining allowance;
+- detects a wallet that already reached its cap and does not send a guaranteed-revert transaction;
+- uses the reported current/max supply to avoid knowingly preparing more wallet transactions than the remaining on-chain supply.
 
-A project passes if OpenSea collection metadata contains **at least one** of:
+For a scheduled Public mint these calls happen during Race prewarm, before the opening timestamp. For a surprise live mint the wallet-stat reads run concurrently.
 
-- an X/Twitter identity (`twitter_username` / X/Twitter link), or
-- an external project website (`external_url` / website link).
+## Fixed: Pause now stops Race Lane
 
-No X/Twitter API is required in V4.11. Follower count, account age, recent posts, suspended status, and verification are intentionally reserved for a later version.
+`⏸ إيقاف التنفيذ`, `/pause`, and `/panic` now stop both the normal mint path and Race Lane signing/broadcast. Prepared signed bundles are discarded when pausing so Resume does not send stale nonce/fee data. Discovery and monitoring continue while paused.
 
-## Safety behavior
+Transactions already broadcast before Pause cannot be cancelled by the bot.
 
-Protected mode is fail-closed. If the project has neither X nor a website, or OpenSea metadata cannot be verified yet, the automatic non-qualification free mint is not sent. This prevents gas spend on anonymous/spam drops.
+## New: native-balance failure alert
 
-Manual watches, qualification/allowlist projects, and paid projects are exempt from this shield. Paid Public still requires the existing explicit wallet/quantity confirmation.
+An `insufficient_balance` failure is always treated as a transaction-safety notification, even when routine monitoring/stage notifications are disabled. Telegram shows:
 
-If the shield is disabled from Telegram, behavior immediately returns to V4.10.1: all otherwise-valid automatic Free Mints may proceed.
+- project;
+- free/paid type when known;
+- network;
+- wallet name and short address;
+- estimated mint value and gas when available;
+- copyable mint link.
 
-## Speed design
+Live Race intentionally skips one balance read for speed. If the RPC itself replies with messages such as `insufficient funds for gas`, V4.11.1 classifies the response as `insufficient_balance` instead of the generic `rpc_or_tx_error`, so the same Telegram alert is sent. The wallet is retried after `LOW_BALANCE_RETRY_SECONDS` (default 2s) while the opportunity remains active, without Telegram spam for every Race tick.
 
-The social check is project-level, never wallet-level:
+## Fixed: sensitive data in logs
 
-```text
-Project discovered
-   ├─ Race/prewarm preparation
-   └─ OpenSea social identity lookup (parallel, once per project)
-            ↓
-       RAM + SQLite cache
-            ↓
-PASS → Race lane can broadcast to all active wallets
-```
+Raw Telegram input is no longer logged. Non-command input is represented only as `<private-input>` plus its length. RPC endpoints are printed with API credentials redacted, and configured Alchemy/OpenSea/Telegram/encryption secrets are filtered from emitted log messages.
 
-The social metadata worker has its own executor and never occupies Race signal/prewarm/launch workers. For projects known before Public, verification is normally cached before opening. For a completely new project first seen only after Public is already live, protected mode necessarily waits for the one identity lookup before spending gas.
+If an older deployment already printed a wallet private key or API key into Railway logs, rotate that credential. This hotfix prevents future raw-input logging; it cannot make an already-exposed key secret again.
 
-Cache defaults:
+## Existing V4.11 behavior preserved
+
+- Protected Free Mint Shield is ON by default.
+- Automatic non-qualification Free Mints require X or an external website while the shield is ON.
+- Manual watches and qualification/allowlist projects remain exempt from the social shield.
+- Paid Public still requires explicit user approval, wallet selection, and quantity.
+- OpenSea Stream, SeaDrop WSS, REST fallback, qualification tracking, cumulative quantities, SQLite persistence, Telegram UI, and project-specific gas settings remain available.
+- The known Public Race scheduler defaults remain `prewarm=2.5s`, `tick=0.005s`, and `retry=0.04s`.
+
+## New optional setting
 
 ```env
-SOCIAL_TRUST_PASS_TTL_SECONDS=86400
-SOCIAL_TRUST_REJECT_TTL_SECONDS=120
-SOCIAL_TRUST_ERROR_RETRY_SECONDS=5
-SOCIAL_TRUST_WORKERS=2
+LOW_BALANCE_RETRY_SECONDS=2
 ```
 
-## Telegram setting
-
-Inside ⚙️ الإعدادات:
-
-- `🛡 حماية Free Mint: مفعلة` — only X/Website-backed automatic non-qualification free mints are allowed.
-- `⚠️ حماية Free Mint: متوقفة` — use the previous V4.10.1 behavior and allow all automatic free mints.
-
-The setting is persisted in SQLite on the Railway Volume.
-
-## Persistence
-
-V4.11 adds an additive `social_trust_cache` SQLite table. Existing wallets, watches, paid plans, gas settings, qualification data, and mint history remain intact.
-
-Do **not** change `WALLET_ENCRYPTION_KEY` and do **not** delete the Railway Volume.
+No new Railway variable is required; the default is built into the code.
 
 ## Expected startup logs
 
 ```text
-Mint Guardian V4.11 starting
-RACE LANE V4.11 STABLE ready
+Mint Guardian V4.11.1 starting
+RACE LANE V4.11.1 STABLE ready
 Protected Free Mint Shield ready | enabled=True | rule=X-or-website
 ```
 
+RPC startup logs should now show a redacted endpoint, for example `/v2/***`, not the API credential. Raw wallet keys must never appear in Telegram receive logs.
+
 ## Deployment
 
-Replace `main.py` and `storage.py`. `buyer.py` remains the stable transaction path used by V4.10.1; replacing it with the V4.11 copy is safe because it is unchanged. Commit/push and let Railway redeploy.
+Replace the project files with this package and redeploy through GitHub/Railway. Keep the existing Railway Volume and keep the existing `WALLET_ENCRYPTION_KEY` value unchanged.

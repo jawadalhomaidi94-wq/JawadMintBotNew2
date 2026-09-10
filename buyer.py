@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import random
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -407,11 +408,11 @@ class RpcPool:
                 actual = int(w3.eth.chain_id)
                 latency = time.perf_counter() - started
                 if actual != self.chain_id:
-                    log.warning("Ignoring RPC wrong chain id %s: got %s expected %s", url, actual, self.chain_id)
+                    log.warning("Ignoring RPC wrong chain id %s: got %s expected %s", _safe_rpc_url_for_log(url), actual, self.chain_id)
                     continue
                 self.clients.append((latency, url, w3))
             except Exception as exc:
-                log.warning("RPC unavailable %s: %s", url, exc)
+                log.warning("RPC unavailable %s: %s", _safe_rpc_url_for_log(url), exc)
 
         self.clients.sort(key=lambda item: item[0])
         if not self.clients:
@@ -590,6 +591,36 @@ def max_gas_cost_wei(gas_limit: int, fee_fields: dict[str, int]) -> int:
 
 def _http_status(exc: requests.HTTPError) -> int | None:
     return exc.response.status_code if exc.response is not None else None
+
+
+def _classify_tx_exception_status(exc: Exception | str) -> str:
+    """Map provider errors that really mean an empty/underfunded wallet.
+
+    Live Race intentionally skips a pre-broadcast balance read for speed, so the
+    RPC node can be the first component to report insufficient native funds.
+    Classifying that response here lets the controller alert the user instead of
+    hiding it behind a generic rpc_or_tx_error.
+    """
+    text = str(exc or "").lower()
+    insufficient_markers = (
+        "insufficient funds",
+        "insufficient balance",
+        "funds for gas",
+        "gas * price + value",
+        "gas required exceeds allowance (0)",
+        "sender doesn't have enough funds",
+        "sender does not have enough funds",
+        "not enough funds",
+    )
+    return "insufficient_balance" if any(marker in text for marker in insufficient_markers) else "rpc_or_tx_error"
+
+
+def _safe_rpc_url_for_log(url: str) -> str:
+    """Never print API credentials embedded in RPC URLs."""
+    text = str(url or "")
+    text = re.sub(r"(/v2/)[^/?\s]+", r"\1***", text, flags=re.IGNORECASE)
+    text = re.sub(r"([?&](?:api[_-]?key|key|token)=)[^&\s]+", r"\1***", text, flags=re.IGNORECASE)
+    return text
 
 
 def _build_mint_best_quantity(
@@ -803,7 +834,7 @@ def mint_drop(
             detail=(f"Quantity adjusted from {requested_quantity} to {quantity_used}." if quantity_used != requested_quantity else None),
         )
     except Exception as exc:
-        return MintResult(False, "rpc_or_tx_error", mint_value_native=mint_value_native, target=target, detail=str(exc),
+        return MintResult(False, _classify_tx_exception_status(exc), mint_value_native=mint_value_native, target=target, detail=str(exc),
                           quantity_used=locals().get("quantity_used"))
 
 
@@ -861,6 +892,67 @@ SUPPLY_ABI = [
     {"inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "maxSupply", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
 ]
+
+
+# Every ERC721 SeaDrop token implements getMintStats(minter). SeaDrop itself
+# calls this method before minting to enforce max-per-wallet and max-supply.
+# Reading it lets the bot account for tokens minted outside this bot/DB and
+# avoids paying gas for a transaction that is guaranteed to exceed a wallet cap.
+NFT_MINT_STATS_ABI = [
+    {
+        "inputs": [{"name": "minter", "type": "address"}],
+        "name": "getMintStats",
+        "outputs": [
+            {"name": "minterNumMinted", "type": "uint256"},
+            {"name": "currentTotalSupply", "type": "uint256"},
+            {"name": "maxSupply", "type": "uint256"},
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    }
+]
+
+
+def read_nft_mint_stats(w3: Web3, nft_contract: str, minter: str) -> dict[str, int] | None:
+    """Return SeaDrop token mint stats for one wallet, or None if unavailable."""
+    try:
+        token = w3.eth.contract(address=Web3.to_checksum_address(nft_contract), abi=NFT_MINT_STATS_ABI)
+        raw = token.functions.getMintStats(Web3.to_checksum_address(minter)).call()
+        if not isinstance(raw, (list, tuple)) or len(raw) < 3:
+            return None
+        return {
+            "minter_num_minted": int(raw[0]),
+            "current_total_supply": int(raw[1]),
+            "max_supply": int(raw[2]),
+        }
+    except Exception as exc:
+        log.debug("NFT getMintStats unavailable %s %s: %s", nft_contract, minter, exc)
+        return None
+
+
+def _adjust_quantity_from_mint_stats(
+    *,
+    desired: int,
+    max_per_wallet: int | None,
+    stats: dict[str, int] | None,
+) -> tuple[int, str | None]:
+    """Cap desired quantity using authoritative on-chain SeaDrop token stats."""
+    q = max(1, int(desired))
+    if not stats:
+        return q, None
+    if max_per_wallet:
+        remaining_wallet = max(0, int(max_per_wallet) - int(stats.get("minter_num_minted", 0)))
+        if remaining_wallet <= 0:
+            return 0, "wallet_limit_reached"
+        q = min(q, remaining_wallet)
+    max_supply = int(stats.get("max_supply", 0))
+    current_supply = int(stats.get("current_total_supply", 0))
+    if max_supply > 0:
+        remaining_supply = max(0, max_supply - current_supply)
+        if remaining_supply <= 0:
+            return 0, "sold_out"
+        q = min(q, remaining_supply)
+    return max(0, q), None
 
 
 def seadrop_is_deployed(w3: Web3) -> bool:
@@ -1043,10 +1135,26 @@ def check_seadrop_eligibility(
     if not fee_recipient:
         return EligibilityResult(False, "no_fee_recipient", detail="SeaDrop restricts fee recipients but none were returned.")
     desired = max(1, min(int(quantity), 100))
-    if public.get("max_per_wallet"):
-        desired = min(desired, int(public["max_per_wallet"]))
+    max_wallet = int(public.get("max_per_wallet") or 0) or None
+    if max_wallet:
+        desired = min(desired, max_wallet)
     if public.get("remaining_supply") is not None:
         desired = min(desired, max(1, int(public["remaining_supply"])))
+
+    # The bot DB is not authoritative: the wallet may have minted previously
+    # outside this bot. Use the NFT's SeaDrop getMintStats before simulation.
+    stats = read_nft_mint_stats(w3, nft_contract, wallet.address)
+    desired, blocked = _adjust_quantity_from_mint_stats(
+        desired=desired, max_per_wallet=max_wallet, stats=stats,
+    )
+    if desired <= 0:
+        return EligibilityResult(
+            False, "not_eligible_now",
+            mint_value_native=Decimal(int(public["mint_price_wei"])) / Decimal(10**18),
+            target=SEADROP_ADDRESS,
+            detail=("Wallet already reached the on-chain public mint limit." if blocked == "wallet_limit_reached" else "Sold out according to on-chain getMintStats."),
+            quantity_used=0,
+        )
     try:
         used, _estimated, _tx = _best_seadrop_quantity(
             w3, payer=wallet.address, nft_contract=nft_contract, fee_recipient=fee_recipient,
@@ -1101,10 +1209,23 @@ def mint_seadrop_public(
 
     price_each = int(public.get("mint_price_wei") or 0)
     desired = max(1, min(int(quantity), 100))
-    if public.get("max_per_wallet"):
-        desired = min(desired, int(public["max_per_wallet"]))
+    max_wallet = int(public.get("max_per_wallet") or 0) or None
+    if max_wallet:
+        desired = min(desired, max_wallet)
     if remaining is not None:
         desired = min(desired, max(1, int(remaining)))
+
+    # Account for mints made outside this bot. SeaDrop enforces the same stats
+    # immediately before minting, so this prevents guaranteed per-wallet reverts.
+    stats = read_nft_mint_stats(w3, nft_contract, address)
+    desired, blocked = _adjust_quantity_from_mint_stats(
+        desired=desired, max_per_wallet=max_wallet, stats=stats,
+    )
+    if desired <= 0:
+        return MintResult(
+            False, "precondition_failed", target=SEADROP_ADDRESS, quantity_used=0,
+            detail=("Wallet already reached the on-chain public mint limit." if blocked == "wallet_limit_reached" else "Sold out according to on-chain getMintStats."),
+        )
 
     # Paid policy is enforced before any simulation/signature work.
     preliminary_value = price_each * desired
@@ -1163,7 +1284,7 @@ def mint_seadrop_public(
         tx_hash, rpc_url = rpc_pool.broadcast_raw_transaction(raw)
         return MintResult(True, "submitted", tx_hash=tx_hash, mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd, total_max_native=total_max_native, rpc=rpc_url, target=SEADROP_ADDRESS, quantity_used=quantity_used, detail=(f"Direct SeaDrop; quantity adjusted from {quantity} to {quantity_used}." if quantity_used != quantity else "Direct SeaDrop mintPublic."))
     except Exception as exc:
-        return MintResult(False, "rpc_or_tx_error", target=SEADROP_ADDRESS, detail=str(exc))
+        return MintResult(False, _classify_tx_exception_status(exc), target=SEADROP_ADDRESS, detail=str(exc))
 
 # ---------------------------------------------------------------------------
 # V4.9 — Ultra-fast public SeaDrop race lane
@@ -1352,9 +1473,54 @@ def prepare_seadrop_race_transactions(
     paid_set = {x.lower() for x in (paid_wallet_addresses or set())}
     adjusted: list[tuple[WalletConfig, int]] = []
     results: dict[str, MintResult] = {}
+
+    # Authoritative per-wallet mint counts. These calls run concurrently. For a
+    # scheduled Public they happen during prewarm, before the opening timestamp.
+    # For a surprise live mint they add only one parallel eth_call round-trip,
+    # preventing guaranteed reverts (and wasted gas) when a wallet minted before.
+    mint_stats: dict[str, dict[str, int] | None] = {}
+    if max_per_wallet:
+        def read_stats(wallet: WalletConfig) -> tuple[str, dict[str, int] | None]:
+            return wallet.address.lower(), read_nft_mint_stats(w3, nft_contract, wallet.address)
+        with ThreadPoolExecutor(max_workers=max(1, min(32, len(cleaned)))) as stats_executor:
+            stats_futures = [stats_executor.submit(read_stats, wallet) for wallet, _q in cleaned]
+            for future in as_completed(stats_futures):
+                try:
+                    addr_l, stats = future.result()
+                    mint_stats[addr_l] = stats
+                except Exception:
+                    pass
+
+    # Use the smallest observed global remaining supply to avoid knowingly
+    # preparing more transactions than the NFT can still mint.
+    global_remaining: int | None = None
+    for stats in mint_stats.values():
+        if not stats:
+            continue
+        maximum = int(stats.get("max_supply", 0))
+        current = int(stats.get("current_total_supply", 0))
+        if maximum > 0:
+            remaining_now = max(0, maximum - current)
+            global_remaining = remaining_now if global_remaining is None else min(global_remaining, remaining_now)
+
     for wallet, quantity in cleaned:
         q = min(quantity, max_per_wallet) if max_per_wallet else quantity
         q = max(1, min(q, 100))
+        q, blocked = _adjust_quantity_from_mint_stats(
+            desired=q, max_per_wallet=max_per_wallet, stats=mint_stats.get(wallet.address.lower()),
+        )
+        if q <= 0:
+            results[wallet.address.lower()] = MintResult(
+                False, "precondition_failed", target=SEADROP_ADDRESS, quantity_used=0,
+                detail=("Wallet already reached the on-chain public mint limit." if blocked == "wallet_limit_reached" else "Sold out according to on-chain getMintStats."),
+            )
+            continue
+        if global_remaining is not None:
+            if global_remaining <= 0:
+                results[wallet.address.lower()] = MintResult(False, "precondition_failed", target=SEADROP_ADDRESS, quantity_used=0, detail="No on-chain supply remains.")
+                continue
+            q = min(q, global_remaining)
+            global_remaining -= q
         value = price_each * q
         value_native = Decimal(value) / Decimal(10**18)
         if value > 0 and not allow_paid:
@@ -1571,7 +1737,7 @@ def broadcast_seadrop_race_transactions(
         except Exception as exc:
             return addr_l, MintResult(
                 False,
-                "rpc_or_tx_error",
+                _classify_tx_exception_status(exc),
                 mint_value_native=entry["mint_value_native"],
                 gas_cost_native=entry["gas_cost_native"],
                 gas_cost_usd=entry["gas_cost_usd"],
