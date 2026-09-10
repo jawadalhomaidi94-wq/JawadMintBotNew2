@@ -1239,6 +1239,12 @@ class Bot:
         self.race_stream_workers = max(4, min(env_int("RACE_STREAM_WORKERS", 24), 64))
         self.race_prep_workers = max(2, min(env_int("RACE_PREP_WORKERS", 8), 32))
         self.race_launch_workers = max(2, min(env_int("RACE_LAUNCH_WORKERS", 8), 32))
+        # V4.11.3 signal coalescer: the first live signal still enters immediately,
+        # while duplicate Stream/SeaDrop events for the same contract/stage are
+        # merged in RAM instead of consuming more race workers and RPC reads.
+        self.race_signal_stream_quiet_seconds = max(0.20, env_float("RACE_SIGNAL_STREAM_QUIET_SECONDS", 1.50))
+        self.race_signal_seadrop_quiet_seconds = max(0.10, env_float("RACE_SIGNAL_SEADROP_QUIET_SECONDS", 0.40))
+        self.race_signal_unknown_quiet_seconds = max(0.05, env_float("RACE_SIGNAL_UNKNOWN_QUIET_SECONDS", 0.20))
         self.race_gas_strategy = os.getenv("RACE_GAS_STRATEGY", "fast").strip().lower()
         if self.race_gas_strategy not in {"economy", "balanced", "smart", "fast", "turbo"}:
             self.race_gas_strategy = "fast"
@@ -1308,7 +1314,17 @@ class Bot:
         self.race_preparing: set[str] = set()
         self.race_active: set[str] = set()
         self.race_queued: set[str] = set()
-        self.race_signal_seen: dict[str, float] = {}
+        # Only one live signal worker may resolve a contract at a time. Any
+        # concurrent duplicate is merged into one pending hint. Once a stage is
+        # resolved, a short source-specific RAM quiet window prevents item-mint
+        # storms from re-reading the same SeaDrop config. Scheduled Race retries
+        # remain independent and therefore keep their original 40ms timing.
+        self.race_signal_inflight: set[str] = set()
+        self.race_signal_pending: dict[str, dict[str, Any]] = {}
+        self.race_signal_stage_cache: dict[str, dict[str, Any]] = {}
+        self.race_signal_stage_seen: dict[str, float] = {}
+        self.race_signal_coalesced = 0
+        self.race_signal_stage_suppressed = 0
         self.race_scheduler_thread: threading.Thread | None = None
         self.seadrop_log_threads: list[threading.Thread] = []
         self.race_market_thread: threading.Thread | None = None
@@ -1517,7 +1533,7 @@ class Bot:
                     )
                     launched_from_plan = True
 
-                # Critical V4.11.2 fallback: a social PASS is also a fresh fast
+                # Critical V4.11.3 fallback: a social PASS is also a fresh fast
                 # contract signal. If stage_plans were not populated yet, read
                 # SeaDrop on-chain immediately and launch the active free Public
                 # instead of waiting for the next catalog/stream event.
@@ -2993,25 +3009,127 @@ class Bot:
             with self.race_state_lock:
                 self.race_active.discard(key)
 
-    def _fast_live_contract_signal(self, chain: str, contract: str, slug: str | None, source: str) -> None:
-        signal_perf = time.perf_counter()
-        if not self.race_enabled or chain not in self.rpc_pools or not Web3.is_address(contract):
+    def _signal_contract_key(self, chain: str, contract: str) -> str:
+        return f"{normalize_chain(chain)}:{str(contract).lower()}"
+
+    @staticmethod
+    def _signal_source_priority(source: str) -> int:
+        # social-pass must never be lost: it is the event that unlocks the
+        # Protected Free Mint Shield. SeaDrop WSS is next because it can reflect
+        # an on-chain config change; OpenSea Stream is primarily mint activity.
+        return {
+            "social-pass": 100,
+            "seadrop-wss": 80,
+            "stream": 60,
+            "events": 40,
+        }.get(str(source or "").lower(), 20)
+
+    def _signal_quiet_seconds(self, source: str, *, stage_known: bool) -> float:
+        if not stage_known:
+            return self.race_signal_unknown_quiet_seconds
+        if source == "stream":
+            return self.race_signal_stream_quiet_seconds
+        if source == "seadrop-wss":
+            return self.race_signal_seadrop_quiet_seconds
+        return self.race_signal_unknown_quiet_seconds
+
+    def _merge_pending_fast_signal(
+        self,
+        contract_key: str,
+        *,
+        slug: str | None,
+        source: str,
+        force: bool,
+    ) -> None:
+        """Keep only the most useful pending hint while one worker is in flight."""
+        current = self.race_signal_pending.get(contract_key)
+        incoming = {
+            "slug": slug,
+            "source": source,
+            "force": bool(force),
+            "queued_at": time.time(),
+        }
+        if current is None:
+            self.race_signal_pending[contract_key] = incoming
             return
-        contract = Web3.to_checksum_address(contract)
-        dedupe = f"{chain}:{contract.lower()}"
+        # Prefer a real slug over an anonymous contract hint, and never let an
+        # ordinary mint event overwrite a social-pass wake-up.
+        cur_slug = str(current.get("slug") or "")
+        new_slug = str(slug or "")
+        if new_slug and (not cur_slug or cur_slug.startswith("contract-")):
+            current["slug"] = slug
+        if force or self._signal_source_priority(source) > self._signal_source_priority(str(current.get("source") or "")):
+            current["source"] = source
+        current["force"] = bool(current.get("force")) or bool(force)
+        current["queued_at"] = incoming["queued_at"]
+
+    def _apply_fast_slug_hint(self, chain: str, contract: str, slug: str | None) -> Candidate | None:
+        """Enrich an existing contract candidate without another RPC call."""
+        if not slug or str(slug).startswith("contract-"):
+            return None
+        contract_l = str(contract).lower()
+        with self.candidates_lock:
+            candidate = next((
+                existing for existing in self.candidates.values()
+                if existing.chain == chain and existing.contract_address
+                and existing.contract_address.lower() == contract_l
+            ), None)
+            if candidate is None:
+                return None
+            # Match _ensure_fast_candidate's proven behavior: enrich the object
+            # only. Do not re-key the candidates dict inside the signal coalescer.
+            if candidate.slug.startswith("contract-"):
+                candidate.slug = slug
+            return candidate
+
+    def _record_resolved_signal_stage(
+        self,
+        chain: str,
+        contract: str,
+        plan: dict[str, Any],
+        *,
+        source: str,
+    ) -> None:
+        contract_key = self._signal_contract_key(chain, contract)
+        stage_key = str(plan.get("key") or "public")
         now = time.time()
         with self.race_state_lock:
-            # A social PASS is not a duplicate discovery event: it is the event
-            # that unlocks broadcast. Never discard it merely because the first
-            # SeaDrop/Stream signal happened <200ms earlier.
-            if source != "social-pass" and now - self.race_signal_seen.get(dedupe, 0.0) < 0.20:
-                return
-            self.race_signal_seen[dedupe] = now
+            self.race_signal_stage_cache[contract_key] = {
+                "stage_key": stage_key,
+                "start": plan.get("start"),
+                "end": plan.get("end"),
+                "is_paid": bool(plan.get("is_paid")),
+                "resolved_at": now,
+            }
+            self.race_signal_stage_seen[f"{contract_key}:{stage_key}:{source}"] = now
+            self.race_signal_stage_seen[f"{contract_key}:{stage_key}:any"] = now
+            # Long Railway uptimes can see many contracts. Bound both maps while
+            # keeping recent stages hot in RAM.
+            if len(self.race_signal_stage_cache) > 5000:
+                cutoff = now - 1800.0
+                self.race_signal_stage_cache = {
+                    k: v for k, v in self.race_signal_stage_cache.items()
+                    if float(v.get("resolved_at") or 0.0) >= cutoff
+                }
+            if len(self.race_signal_stage_seen) > 12000:
+                cutoff = now - 1800.0
+                self.race_signal_stage_seen = {
+                    k: ts for k, ts in self.race_signal_stage_seen.items() if ts >= cutoff
+                }
+
+    def _fast_live_contract_signal(self, chain: str, contract: str, slug: str | None, source: str) -> bool:
+        """Resolve one contract signal. Return True once a stable SeaDrop stage is known."""
+        signal_perf = time.perf_counter()
+        if not self.race_enabled or chain not in self.rpc_pools or not Web3.is_address(contract):
+            return False
+        contract = Web3.to_checksum_address(contract)
+        now = time.time()
         try:
             public = read_seadrop_public_fast(self.rpc_pools[chain].primary, contract)
             if not public or not public.get("configured"):
-                return
+                return False
             plan = self._fast_plan_from_public(public, contract)
+            self._record_resolved_signal_stage(chain, contract, plan, source=source)
             candidate = self._ensure_fast_candidate(chain, contract, slug, public, source)
             start = float(plan.get("start") or 0)
             end = float(plan.get("end") or 0)
@@ -3020,13 +3138,13 @@ class Bot:
                 if plan.get("is_paid") and candidate.paid_decision != "confirmed":
                     candidate.paid_detected = True
                     self.maybe_offer_paid_public(candidate)
-                    return
+                    return True
                 if self.paused:
                     # Discovery continues while paused, but no signing/broadcast.
-                    return
+                    return True
                 if not self.social_protection_allows(candidate, plan):
                     log.debug("Fast free mint waiting for social trust | %s | %s", candidate.slug, chain)
-                    return
+                    return True
                 self._launch_candidate_race(candidate, plan, live=True)
                 log.info(
                     "Fast signal handled | source=%s | %s | %s | %.3fs",
@@ -3041,19 +3159,140 @@ class Bot:
                     self.persist_candidate_planning(candidate)
                 except Exception:
                     pass
+            return True
         except Exception as exc:
             log.debug("Fast live contract signal failed %s %s: %s", chain, contract, exc)
+            return False
 
-    def submit_fast_contract_signal(self, chain: str | None, contract: str | None, slug: str | None, source: str) -> None:
+    def _run_coalesced_fast_signal(
+        self,
+        chain: str,
+        contract: str,
+        slug: str | None,
+        source: str,
+        contract_key: str,
+    ) -> None:
+        """Single-flight worker for one chain+contract.
+
+        A dense burst can enqueue hundreds of item_transferred events. We run one
+        RPC resolver only. If a high-priority social-pass arrives during that
+        resolver it is replayed exactly once; ordinary duplicate mint events are
+        folded into metadata hints and discarded once the stage is already known.
+        """
+        current_slug = slug
+        current_source = source
+        try:
+            while not STOP:
+                stable_stage = self._fast_live_contract_signal(chain, contract, current_slug, current_source)
+                with self.race_state_lock:
+                    pending = self.race_signal_pending.pop(contract_key, None)
+                if pending:
+                    hint_slug = pending.get("slug")
+                    if hint_slug:
+                        candidate = self._apply_fast_slug_hint(chain, contract, str(hint_slug))
+                        # If the anonymous contract social lookup failed before the
+                        # Stream supplied a slug, kick the gate again asynchronously.
+                        if (
+                            candidate is not None and candidate.auto_discovered and not candidate.qualification_tracked
+                            and candidate.social_trust_status == "error" and self.free_social_protection_enabled
+                        ):
+                            self.ensure_social_trust_async(candidate, force=True)
+                    # social-pass is an unlock event and must be replayed even if
+                    # the first worker resolved the same stage. If the first read
+                    # did not yet see a configured stage, replay one merged hint as
+                    # well; this avoids losing a config transition during the RPC.
+                    if bool(pending.get("force")) or not stable_stage:
+                        current_slug = str(hint_slug or current_slug or "") or None
+                        current_source = str(pending.get("source") or current_source)
+                        continue
+                    self.race_signal_coalesced += 1
+                break
+        finally:
+            with self.race_state_lock:
+                self.race_signal_inflight.discard(contract_key)
+                # A signal may have arrived after our last pending pop but before
+                # the inflight flag was cleared. Resubmit that one merged signal.
+                late = self.race_signal_pending.pop(contract_key, None)
+            if late and not STOP:
+                self.submit_fast_contract_signal(
+                    chain,
+                    contract,
+                    str(late.get("slug") or current_slug or "") or None,
+                    str(late.get("source") or current_source),
+                    force=bool(late.get("force")),
+                )
+
+    def submit_fast_contract_signal(
+        self,
+        chain: str | None,
+        contract: str | None,
+        slug: str | None,
+        source: str,
+        *,
+        force: bool | None = None,
+    ) -> None:
+        """Submit a live signal with contract single-flight + stage-aware de-duplication."""
         chain_n = normalize_chain(chain or "")
         if not self.race_enabled or chain_n not in self.rpc_pools or not contract or not Web3.is_address(contract):
             return
-        self.race_signal_executor.submit(self._fast_live_contract_signal, chain_n, contract, slug, source)
+        contract_c = Web3.to_checksum_address(contract)
+        contract_key = self._signal_contract_key(chain_n, contract_c)
+        source = str(source or "signal")
+        force = (source == "social-pass") if force is None else bool(force)
+        now = time.time()
+
+        with self.race_state_lock:
+            if contract_key in self.race_signal_inflight:
+                self._merge_pending_fast_signal(contract_key, slug=slug, source=source, force=force)
+                self.race_signal_coalesced += 1
+                return
+
+            # Once the stage fingerprint is known, raw mint-event storms do not
+            # need another SeaDrop read every 100-200ms. This RAM-only gate never
+            # delays the *first* signal and never suppresses social-pass. Scheduled
+            # Race retry remains independent at RACE_RETRY_SECONDS (40ms).
+            cache = self.race_signal_stage_cache.get(contract_key)
+            if not force and cache:
+                stage_key = str(cache.get("stage_key") or "public")
+                seen_key = f"{contract_key}:{stage_key}:any"
+                quiet = self._signal_quiet_seconds(source, stage_known=True)
+                last = self.race_signal_stage_seen.get(seen_key, 0.0)
+                if now - last < quiet:
+                    self.race_signal_stage_suppressed += 1
+                    return
+
+            # Before the first stage fingerprint is known use only the old short
+            # contract guard. It prevents an immediate duplicate executor submit
+            # but keeps discovery responsiveness unchanged.
+            if not force and not cache:
+                seen_key = f"{contract_key}:unknown:{source}"
+                last = self.race_signal_stage_seen.get(seen_key, 0.0)
+                quiet = self._signal_quiet_seconds(source, stage_known=False)
+                if now - last < quiet:
+                    self.race_signal_stage_suppressed += 1
+                    return
+                self.race_signal_stage_seen[seen_key] = now
+
+            self.race_signal_inflight.add(contract_key)
+
+        try:
+            self.race_signal_executor.submit(
+                self._run_coalesced_fast_signal,
+                chain_n,
+                contract_c,
+                slug,
+                source,
+                contract_key,
+            )
+        except Exception:
+            with self.race_state_lock:
+                self.race_signal_inflight.discard(contract_key)
+            raise
 
     def _submit_scheduled_race(self, candidate: Candidate, plan: dict[str, Any]) -> None:
         """Queue at most one scheduled launch for a stage at a time.
 
-        This prevents a 10ms scheduler tick from filling the executor with
+        This prevents the scheduler tick from filling the executor with
         duplicate work while the first launch thread is still being scheduled.
         """
         if self.paused:
@@ -4623,7 +4862,7 @@ class Bot:
         total = len(self.store.list_wallets(enabled_only=False))
         self.telegram.send(
             chat_id,
-            "🤖 OpenSea Mint Guardian V4.11.2\n\n"
+            "🤖 OpenSea Mint Guardian V4.11.3\n\n"
             "🆓 الاكتشاف المجاني: Stream لحظي + SeaDrop مباشر + REST احتياطي\n"
             f"⚡ الاستعداد للـPublic: آخر {self.public_preopen_window_seconds:g} ثوانٍ\n"
             f"📦 سياسة الكمية: حد المنت ≤100 يؤخذ كما هو، وإذا كان >100/غير محدود فالهدف {self.auto_stage_high_limit_quantity}\n"
@@ -6139,7 +6378,7 @@ class Bot:
     # ---------- main loop ----------
     def run(self) -> None:
         start_health_server()
-        log.info("Mint Guardian V4.11.2 starting")
+        log.info("Mint Guardian V4.11.3 starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
@@ -6164,11 +6403,16 @@ class Bot:
             self.public_fast_retry_seconds, self.auto_stage_high_limit_quantity,
         )
         log.info(
-            "RACE LANE V4.11.2 STABLE ready | enabled=%s | prewarm=%.2fs | scheduler=%.3fs | retry=%.3fs | staticGas=%s | signal/prep/launch=%s/%s/%s | SeaDrop-WSS=%s | fee-cache=%.2fs | race-gas=%s",
+            "RACE LANE V4.11.3 STABLE ready | enabled=%s | prewarm=%.2fs | scheduler=%.3fs | retry=%.3fs | staticGas=%s | signal/prep/launch=%s/%s/%s | SeaDrop-WSS=%s | fee-cache=%.2fs | race-gas=%s",
             self.race_enabled, self.race_prewarm_seconds, self.race_scheduler_tick,
             self.race_retry_seconds, self.race_static_gas_limit,
             self.race_stream_workers, self.race_prep_workers, self.race_launch_workers,
             self.seadrop_wss_enabled, self.race_fee_refresh_seconds, self.race_gas_strategy,
+        )
+        log.info(
+            "Race signal coalescer ready | single-flight=True | stream-quiet=%.2fs | seadrop-quiet=%.2fs | unknown-quiet=%.2fs",
+            self.race_signal_stream_quiet_seconds, self.race_signal_seadrop_quiet_seconds,
+            self.race_signal_unknown_quiet_seconds,
         )
         log.info(
             "Protected Free Mint Shield ready | enabled=%s | rule=X-or-website | workers=%s | passTTL=%.0fs | rejectTTL=%.0fs",
@@ -6176,7 +6420,7 @@ class Bot:
             self.social_trust_pass_ttl, self.social_trust_reject_ttl,
         )
         self.notify_all(
-            "🟢 OpenSea Mint Guardian V4.11.2 يعمل الآن على Railway.\n"
+            "🟢 OpenSea Mint Guardian V4.11.3 يعمل الآن على Railway.\n"
             f"الاكتشاف التلقائي: {'مفعّل كل ' + format(self.auto_free_scan_seconds, 'g') + ' ثانية' if self.auto_free_enabled else 'متوقف'}.\n"
             f"OpenSea Stream: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} | REST Mint Events: {'مفعّل' if self.auto_event_fallback_enabled else 'متوقف'}.\n"
             f"التأهيل/المراقبة: تعمل بصمت وتظهر تفاصيلها عند فتح الأقسام.\n"

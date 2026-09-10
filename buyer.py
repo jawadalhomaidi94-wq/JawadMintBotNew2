@@ -1764,7 +1764,7 @@ def broadcast_seadrop_race_transactions(
 ) -> dict[str, MintResult]:
     """Broadcast a pre-signed SeaDrop race bundle concurrently.
 
-    V4.11.2 keeps the proven RpcPool broadcaster from V4.11.1, but serializes
+    V4.11.3 keeps the proven RpcPool broadcaster from V4.11.1, but serializes
     broadcasts only per wallet+chain long enough to guarantee a fresh nonce.
     Different wallets still broadcast fully in parallel. If the provider still
     reports ``nonce too low``, the entry is re-signed once with a freshly read
@@ -1848,7 +1848,7 @@ def broadcast_seadrop_race_transactions(
                     gas_cost_native=entry["gas_cost_native"],
                     gas_cost_usd=entry["gas_cost_usd"],
                     total_max_native=entry["total_max_native"],
-                    detail=f"V4.11.2 nonce-safe race-lane SeaDrop transaction (nonce={chosen_nonce}).",
+                    detail=f"V4.11.3 nonce-safe race-lane SeaDrop transaction (nonce={chosen_nonce}).",
                     rpc=rpc_url,
                     target=SEADROP_ADDRESS,
                     quantity_used=int(entry["quantity"]),
