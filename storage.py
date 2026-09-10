@@ -104,17 +104,26 @@ class SecureStore:
 
                 CREATE INDEX IF NOT EXISTS idx_mint_history_created ON mint_history(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_mint_history_slug ON mint_history(slug);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_name_nocase ON wallets(name COLLATE NOCASE);
+
+                -- V4.13.1: rows older than 24h are compacted here before being
+                -- deleted from mint_history. This preserves cumulative mint
+                -- accounting/anti-duplicate state without keeping an unbounded
+                -- visible history table. target_key is contract-first when the
+                -- NFT contract is known, otherwise it falls back to the slug.
                 CREATE TABLE IF NOT EXISTS mint_totals (
-                    slug TEXT NOT NULL COLLATE NOCASE,
-                    chain TEXT NOT NULL COLLATE NOCASE,
-                    wallet_address TEXT NOT NULL COLLATE NOCASE,
-                    contract_address TEXT NOT NULL DEFAULT '' COLLATE NOCASE,
+                    chain TEXT NOT NULL,
+                    wallet_address TEXT NOT NULL,
+                    target_key TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    contract_address TEXT,
                     confirmed_quantity INTEGER NOT NULL DEFAULT 0,
-                    last_confirmed_at REAL NOT NULL,
-                    PRIMARY KEY(slug,chain,wallet_address,contract_address)
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(chain, wallet_address, target_key)
                 );
 
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_name_nocase ON wallets(name COLLATE NOCASE);
+                CREATE INDEX IF NOT EXISTS idx_mint_totals_lookup
+                    ON mint_totals(chain,wallet_address,target_key);
 
                 CREATE TABLE IF NOT EXISTS qualification_projects (
                     project_key TEXT PRIMARY KEY,
@@ -697,6 +706,11 @@ class SecureStore:
                 ).fetchone()
         return dict(row) if row else None
 
+    @staticmethod
+    def _mint_target_key(slug: str, contract_address: str | None = None) -> str:
+        contract = str(contract_address or "").strip().lower()
+        return contract if contract else str(slug or "").strip().lower()
+
     def confirmed_quantity_for_target(
         self,
         slug: str,
@@ -705,28 +719,32 @@ class SecureStore:
         chain: str,
         contract_address: str | None = None,
     ) -> int:
-        """Confirmed cumulative quantity, including compacted records older than 24h."""
-        contract = str(contract_address or "")
+        """Return cumulative confirmed quantity from recent rows + compacted totals.
+
+        Visible mint history is intentionally kept to 24h in V4.13.1, but the
+        bot must still remember older confirmed quantity to avoid duplicate
+        mints and to calculate cumulative stage targets correctly.
+        """
+        target_key = self._mint_target_key(slug, contract_address)
         with self.lock:
-            if contract:
-                hist = self.conn.execute(
+            total_row = self.conn.execute(
+                """
+                SELECT COALESCE(confirmed_quantity,0) AS qty FROM mint_totals
+                WHERE chain=? COLLATE NOCASE AND wallet_address=? COLLATE NOCASE AND target_key=? COLLATE NOCASE
+                """,
+                (chain, wallet_address, target_key),
+            ).fetchone()
+            if contract_address:
+                row = self.conn.execute(
                     """
                     SELECT COALESCE(SUM(COALESCE(quantity,0)),0) AS qty FROM mint_history
                     WHERE status='confirmed' AND wallet_address=? COLLATE NOCASE AND chain=? COLLATE NOCASE
                       AND (slug=? COLLATE NOCASE OR contract_address=? COLLATE NOCASE)
                     """,
-                    (wallet_address, chain, slug, contract),
-                ).fetchone()
-                old = self.conn.execute(
-                    """
-                    SELECT COALESCE(SUM(confirmed_quantity),0) AS qty FROM mint_totals
-                    WHERE wallet_address=? COLLATE NOCASE AND chain=? COLLATE NOCASE
-                      AND (slug=? COLLATE NOCASE OR contract_address=? COLLATE NOCASE)
-                    """,
-                    (wallet_address, chain, slug, contract),
+                    (wallet_address, chain, slug, contract_address),
                 ).fetchone()
             else:
-                hist = self.conn.execute(
+                row = self.conn.execute(
                     """
                     SELECT COALESCE(SUM(COALESCE(quantity,0)),0) AS qty FROM mint_history
                     WHERE status='confirmed' AND wallet_address=? COLLATE NOCASE AND chain=? COLLATE NOCASE
@@ -734,16 +752,61 @@ class SecureStore:
                     """,
                     (wallet_address, chain, slug),
                 ).fetchone()
-                old = self.conn.execute(
-                    """
-                    SELECT COALESCE(SUM(confirmed_quantity),0) AS qty FROM mint_totals
-                    WHERE wallet_address=? COLLATE NOCASE AND chain=? COLLATE NOCASE
-                      AND slug=? COLLATE NOCASE
-                    """,
-                    (wallet_address, chain, slug),
-                ).fetchone()
-        return int((hist["qty"] if hist else 0) or 0) + int((old["qty"] if old else 0) or 0)
+        return int((total_row["qty"] if total_row else 0) or 0) + int((row["qty"] if row else 0) or 0)
 
+    def compact_mint_history(self, *, max_age_seconds: float = 86400.0) -> dict[str, int]:
+        """Compact confirmed mint rows then delete visible history older than max_age_seconds.
+
+        This operation is transactionally safe: confirmed quantities are merged
+        into mint_totals before any old rows are removed. It is designed for a
+        low-priority maintenance thread, never the Race Lane.
+        """
+        cutoff = time.time() - max(60.0, float(max_age_seconds))
+        compacted = 0
+        deleted = 0
+        with self.lock, self.conn:
+            rows = self.conn.execute(
+                """
+                SELECT slug,chain,wallet_address,contract_address,
+                       COALESCE(SUM(COALESCE(quantity,0)),0) AS qty
+                FROM mint_history
+                WHERE status='confirmed' AND created_at < ?
+                GROUP BY slug,chain,wallet_address,contract_address
+                """,
+                (cutoff,),
+            ).fetchall()
+            for row in rows:
+                qty = int(row["qty"] or 0)
+                if qty <= 0:
+                    continue
+                slug = str(row["slug"] or "")
+                contract = str(row["contract_address"] or "") or None
+                target_key = self._mint_target_key(slug, contract)
+                self.conn.execute(
+                    """
+                    INSERT INTO mint_totals(chain,wallet_address,target_key,slug,contract_address,confirmed_quantity,updated_at)
+                    VALUES(?,?,?,?,?,?,?)
+                    ON CONFLICT(chain,wallet_address,target_key) DO UPDATE SET
+                        confirmed_quantity=mint_totals.confirmed_quantity + excluded.confirmed_quantity,
+                        slug=excluded.slug,
+                        contract_address=COALESCE(excluded.contract_address,mint_totals.contract_address),
+                        updated_at=excluded.updated_at
+                    """,
+                    (str(row["chain"] or ""), str(row["wallet_address"] or ""), target_key,
+                     slug, contract, qty, time.time()),
+                )
+                compacted += qty
+            cur = self.conn.execute("DELETE FROM mint_history WHERE created_at < ?", (cutoff,))
+            deleted = int(cur.rowcount or 0)
+        return {"compacted_quantity": compacted, "deleted_rows": deleted}
+
+    def cleanup_transient_cache(self, *, social_max_age_seconds: float = 172800.0) -> dict[str, int]:
+        """Delete stale non-authoritative cache rows without touching watches/wallets/offers."""
+        cutoff = time.time() - max(3600.0, float(social_max_age_seconds))
+        with self.lock, self.conn:
+            cur = self.conn.execute("DELETE FROM social_trust_cache WHERE checked_at < ?", (cutoff,))
+            social_deleted = int(cur.rowcount or 0)
+        return {"social_cache_deleted": social_deleted}
 
     def upsert_qualification_project(
         self,
@@ -859,10 +922,9 @@ class SecureStore:
             )
             return cur.rowcount > 0
 
-    def free_mint_summary(self, limit: int = 30, *, hours: float = 24.0) -> list[dict[str, Any]]:
-        """Confirmed zero-cost mints visible for the requested recent window."""
+    def free_mint_summary(self, limit: int = 30) -> list[dict[str, Any]]:
+        """Aggregate confirmed zero-cost mints by logical project."""
         limit = max(1, min(int(limit), 100))
-        cutoff = time.time() - max(0.1, float(hours)) * 3600.0
         with self.lock:
             rows = self.conn.execute(
                 """
@@ -874,69 +936,23 @@ class SecureStore:
                     GROUP_CONCAT(DISTINCT wallet_name) AS wallet_names
                 FROM mint_history
                 WHERE status='confirmed'
-                  AND created_at>=?
                   AND mint_value_native IS NOT NULL
                   AND ABS(CAST(mint_value_native AS REAL)) < 0.000000000000000001
                 GROUP BY slug COLLATE NOCASE, chain COLLATE NOCASE, COALESCE(contract_address,'') COLLATE NOCASE
                 ORDER BY last_confirmed_at DESC
                 LIMIT ?
                 """,
-                (cutoff, limit),
+                (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def recent_history(self, limit: int = 15, *, hours: float = 24.0) -> list[dict[str, Any]]:
+    def recent_history(self, limit: int = 15) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 100))
-        cutoff = time.time() - max(0.1, float(hours)) * 3600.0
         with self.lock:
             rows = self.conn.execute(
-                "SELECT * FROM mint_history WHERE created_at>=? ORDER BY created_at DESC LIMIT ?",
-                (cutoff, limit),
+                "SELECT * FROM mint_history ORDER BY created_at DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(row) for row in rows]
-
-    def purge_runtime_history(self, *, older_than_hours: float = 24.0) -> dict[str, int]:
-        """Compact confirmed mint rows, then delete all visible mint history older than retention.
-
-        mint_totals preserves cumulative quantities so stage accounting and duplicate
-        protection remain correct after the 24-hour visible-history cleanup.
-        """
-        cutoff = time.time() - max(1.0, float(older_than_hours)) * 3600.0
-        with self.lock, self.conn:
-            groups = self.conn.execute(
-                """
-                SELECT slug,chain,wallet_address,COALESCE(contract_address,'') AS contract_address,
-                       COALESCE(SUM(COALESCE(quantity,0)),0) AS qty,MAX(created_at) AS last_at
-                FROM mint_history
-                WHERE created_at<? AND status='confirmed'
-                GROUP BY slug COLLATE NOCASE,chain COLLATE NOCASE,wallet_address COLLATE NOCASE,
-                         COALESCE(contract_address,'') COLLATE NOCASE
-                """,
-                (cutoff,),
-            ).fetchall()
-            for row in groups:
-                self.conn.execute(
-                    """
-                    INSERT INTO mint_totals(slug,chain,wallet_address,contract_address,confirmed_quantity,last_confirmed_at)
-                    VALUES(?,?,?,?,?,?)
-                    ON CONFLICT(slug,chain,wallet_address,contract_address) DO UPDATE SET
-                        confirmed_quantity=mint_totals.confirmed_quantity+excluded.confirmed_quantity,
-                        last_confirmed_at=MAX(mint_totals.last_confirmed_at,excluded.last_confirmed_at)
-                    """,
-                    (row["slug"], row["chain"], row["wallet_address"], row["contract_address"],
-                     int(row["qty"] or 0), float(row["last_at"] or cutoff)),
-                )
-            deleted = self.conn.execute("DELETE FROM mint_history WHERE created_at<?", (cutoff,)).rowcount
-            # Old qualification-wallet detail is dashboard cache, not execution truth.
-            q_deleted = self.conn.execute(
-                "DELETE FROM qualification_wallets WHERE checked_at<? AND project_key IN "
-                "(SELECT project_key FROM qualification_projects WHERE status<>'active')",
-                (cutoff,),
-            ).rowcount
-            # Expired social cache can always be rebuilt outside Race.
-            social_deleted = self.conn.execute("DELETE FROM social_trust_cache WHERE checked_at<?", (cutoff,)).rowcount
-        return {"history": int(deleted or 0), "qualification": int(q_deleted or 0), "social": int(social_deleted or 0)}
-
 
     # ---------- V4.12.0 Collection Offer persistence ----------
     def record_offer(

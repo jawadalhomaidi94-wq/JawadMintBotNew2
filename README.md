@@ -1,242 +1,197 @@
-# OpenSea Mint Guardian V4.12.0 — Isolated Collection Offers
+# OpenSea Mint Guardian V4.13.1 — Ultra Race Recovery
 
-V4.12.0 is built directly on the uploaded working V4.11.3 codebase. The existing Mint/Race behavior is intentionally preserved: OpenSea Stream discovery, SeaDrop WSS discovery, Race signal coalescing, prewarm/signing, nonce-safe parallel broadcast, stage/qualification planning, Protected Free Mint Shield, gas budgets, SQLite persistence, Railway Volume behavior, and Telegram wallet management remain in place.
+V4.13.1 is an in-place performance/reliability upgrade over the working V4.12.x line. It preserves the existing Free Mint, qualification, Safe Protection, paid-mint confirmation, multi-wallet, Collection Offer, Telegram, SQLite, and Railway behavior. The changes are concentrated around Race latency, gas/balance recovery, stale fee handling, 24-hour visible history, and cache maintenance.
 
-The new feature is a separate, user-triggered **Collection Offer subsystem**. It does not poll from `Bot.run()`, does not register with the Race scheduler, and does not share the Race signal/prep/launch executors.
+## What V4.13.1 fixes
 
-## New Telegram Offer flow
+### 1. Native-gas top-up auto resume
 
-Collection Offers can be opened from:
+`insufficient_balance` no longer behaves like a sticky failure. Whenever any mint path (prewarm, live Race, scheduled Race, or fallback execution) sees insufficient native gas, the wallet enters a dedicated RAM-only balance watcher.
 
-- `💳 المنتات المدفوعة` → choose a project → `💰 تقديم Collection Offer`
-- `🎟 التأهيل` → `💰 تقديم Collection Offer` → choose a qualification project
-- Main menu → `📨 عروضي الحالية`
-- `/offers`
+- Default recheck: `0.35s`.
+- Reads are deduplicated by `(chain, wallet)`: several blocked projects for the same wallet still use one balance read per cycle.
+- Any real balance increase wakes a fresh mint attempt immediately while the stage is open.
+- If the balance reaches the previously reported requirement, it also wakes immediately.
+- The old prepared transaction is discarded and rebuilt so nonce/gas are current.
+- Healthy wallets never wait for this watcher and Race executors are not shared with it.
 
-Typical flow:
-
-```text
-💳 المنتات المدفوعة / 🎟 التأهيل
-        ↓
-اختر المشروع
-        ↓
-💰 تقديم Collection Offer
-        ↓
-📊 Top 3 Collection Offers الحالية
-        ↓
-[🏆 Top Offer] [✍️ عرض مخصص]
-[السعر 1] [السعر 2] [السعر 3]
-        ↓
-👛 اختيار المحافظ
-        ↓
-🔢 كمية مستقلة لكل محفظة
-        ↓
-🔎 مراجعة WETH + Approval + المدة
-        ↓
-[✅ تأكيد تقديم العرض]
-        ↓
-EIP-712 sign + OpenSea POST
-```
-
-Pressing `🏆 Top Offer` does **not** sign or submit anything. The bot fetches the live collection offers, reads the current top price, adds the configured USDT increment, and shows the proposal. The current Top Offer is checked again immediately before final signing. If it changed, signing is stopped and the user must review and confirm the new price again.
-
-## USDT UI, WETH execution
-
-The Telegram interface accepts and displays offer prices in USDT-style USD values. At review/signing time the bot obtains a fresh ETH/USD price and converts the commitment to WETH:
-
-```text
-💵 Offer: 12.50 USDT / NFT
-Ξ Actual OpenSea value: ≈ 0.00317 WETH / NFT
-👛 Wallet: Wallet-1
-🔢 Quantity: 2
-⏳ Duration: 24 hours
-```
-
-The Seaport order itself uses WETH. No WETH is transferred when the offer is merely created; it is a signed marketplace order that can be fulfilled later.
-
-## Top Offer increment settings
-
-Telegram → `⚙️ الإعدادات` → `💰 Offers`:
-
-```text
-0.01 USDT
-0.05 USDT
-0.10 USDT
-0.25 USDT
-✏️ custom
-```
-
-Default: `0.05 USDT`.
-
-Offer duration is also configurable. Default: `24 hours`.
-
-Both values are persisted in SQLite and survive Railway restarts/redeploys.
-
-## Wallet funding and WETH Approval
-
-Before final confirmation, each selected wallet is checked independently:
-
-- WETH balance
-- WETH allowance to the OpenSea conduit
-- required WETH for `price × quantity`
-- wallet enabled state / chain support
-
-If WETH is insufficient, the Offer cannot be signed. If allowance is insufficient, Telegram shows an explicit `🔓 Approval` button. Approval is **never automatic** and is a separate on-chain transaction. V4.12.0 approves only the reviewed amount rather than granting an unlimited allowance.
-
-The Approval transaction respects the bot's existing native/USD gas limits.
-
-## Real OpenSea Collection Offers
-
-The implementation uses the current OpenSea V2 criteria-offer flow:
-
-- `POST /api/v2/offers/build`
-- `POST /api/v2/offers`
-- `GET /api/v2/offers/collection/{slug}`
-- `GET /api/v2/offers/collection/{slug}/all`
-- `GET /api/v2/account/{address}/offers`
-- `POST /api/v2/orders/chain/{chain}/protocol/{protocol_address}/{order_hash}/cancel`
-
-Orders are built for Seaport 1.6 and use OpenSea offer protection. Required collection fees returned by the Collection API are added to the Seaport consideration. Existing older Seaport 1.5 order addresses are recognized when signing an off-chain cancellation.
-
-## My Offers
-
-`📨 عروضي الحالية` refreshes active offers from OpenSea for the enabled wallets and reconciles them into the separate local `offer_history` table.
-
-Each offer supports:
-
-- details
-- off-chain SignedZone cancellation
-- raise/reprice flow
-
-For `⬆️ رفع العرض`, V4.12.0 refreshes market prices and requires a new confirmation. The previous active offer is cancelled before the replacement is posted so the bot does not intentionally leave two active commitments for the same raise operation.
-
-## Offer storage is separate from Mint storage
-
-V4.12.0 adds:
-
-```text
-offer_history
-```
-
-It does not reuse `mint_history`, qualification quantity accounting, watch history, or Race state. This prevents Offers from changing cumulative Mint calculations or duplicate-Mint protection.
-
-## Race Lane isolation
-
-The Offer module lives in `offers.py` and has its own executor:
-
-```text
-Offer System
-  offer-api executor       (read-only/background UI work)
-  offer-sign executor      (approval/final sign/cancel work)
-  per-session offer price snapshot/cache
-  OpenSea offer reads/build/post
-  WETH funding/approval checks
-  EIP-712 offer signing
-  offer_history
-
-Race Lane (unchanged critical path)
-  race-signal
-  race-prep
-  race-launch
-  SeaDrop WSS
-  OpenSea Stream
-```
-
-There is deliberately no Offer timer, no Offer polling worker, and no Offer call in:
-
-- `_race_scheduler_loop()`
-- `_launch_candidate_race()`
-- `_fast_live_contract_signal()`
-- `_queue_mint_event()`
-
-Offer GET/build calls use the existing OpenSea client's **background** REST class, preserving the configured REST reserve for Mint/stage work. The final user-confirmed Offer POST uses normal priority; it never receives Race/critical priority.
-
-The existing Race settings remain unchanged:
+Optional tuning:
 
 ```env
-RACE_PREWARM_SECONDS=2.5
+LOW_BALANCE_RECHECK_SECONDS=0.35
+LOW_BALANCE_RETRY_SECONDS=0.35
+```
+
+The code accepts a minimum of `0.15s`, but very aggressive values can rate-limit public RPC providers.
+
+### 2. Stale prewarm gas fee recovery
+
+A pre-signed transaction can become invalid if `baseFee` rises between prewarm and the Public opening. V4.13.1:
+
+- refreshes prepared fee fields from the already-warmed in-memory fee snapshot before broadcast, without another network request;
+- classifies `max fee per gas less than block base fee` separately;
+- if a provider rejects a stale fee, performs one live fee refresh, re-signs locally, and re-broadcasts immediately;
+- never intentionally clamps `maxFeePerGas` below a `baseFee` explicitly reported by the provider;
+- if the configured native/USD gas budget cannot fund even the current base fee, it reports a gas-budget status instead of repeatedly sending an invalid transaction.
+
+### 3. Faster live Free Mint hot path
+
+The Stream/SeaDrop signal already reads the public SeaDrop configuration. Earlier code then entered Race and read the same configuration a second time. V4.13.1 passes the first verified result directly into Race.
+
+This removes one duplicate RPC round-trip from the live path without changing mint eligibility, quantity, gas policy, Safe Protection, or target checks.
+
+The fee warmer also uses a persistent executor instead of creating a new ThreadPool every refresh cycle, reducing scheduler/GC noise near the Race workers.
+
+Default Race values:
+
+```env
+RACE_PREWARM_SECONDS=6.0
 RACE_SCHEDULER_TICK=0.005
 RACE_RETRY_SECONDS=0.04
+RACE_PUBLIC_GAS_LIMIT=300000
+RACE_FEE_REFRESH_SECONDS=0.20
 RACE_STREAM_WORKERS=24
 RACE_PREP_WORKERS=8
 RACE_LAUNCH_WORKERS=8
 RACE_GAS_STRATEGY=fast
-RACE_FEE_REFRESH_SECONDS=0.35
 SEADROP_WSS_DISCOVERY=true
 ```
 
-## New optional environment variables
+### 4. Final Public priority for qualification projects
 
-No new variable is required for normal Offer creation if the existing OpenSea API key, RPCs, Alchemy key and wallet encryption configuration are already present.
+If an allowlist/qualification stage overlaps the final Public stage, the active Public stage now takes priority. This prevents an older qualification stage from hiding a newly opened Public.
+
+When a free Public opens:
+
+- all active compatible wallets are activated immediately;
+- the previous-stage low-balance state is cleared;
+- cumulative confirmed quantity is preserved;
+- a wallet that already minted during qualification only requests the additional amount still available/required for the Public;
+- no OpenSea eligibility REST preflight is placed in front of a free Public Race.
+
+### 5. Final Public completion / monitoring cleanup
+
+After the final Public mint is confirmed and all active wallets are resolved, the project is immediately archived from active Monitoring/Qualification. The confirmed mint remains visible in `🆓 المجانية المأخوذة` / history for the configured 24-hour window.
+
+A project is **not** prematurely archived while another active wallet is still recoverable because of low balance, gas budget, pending receipt, or another retryable condition.
+
+### 6. 24-hour visible Mint history without losing cumulative totals
+
+Old `mint_history` rows are compacted into `mint_totals` before deletion. Therefore:
+
+- visible operation/mint history is automatically cleaned after 24 hours by default;
+- cumulative per-wallet/per-project mint totals remain correct after cleanup;
+- old confirmed quantities still prevent accidental over-minting later.
 
 Optional:
 
 ```env
-# Dedicated Offer read/API executor only; default 2, max 4.
-OFFER_API_WORKERS=2
-
-# Dedicated financial/signing executor; default 1, max 2.
-OFFER_SIGN_WORKERS=1
-
-# Optional wallet-scoped OpenSea token for deployments/accounts that require it
-# for an authenticated off-chain order action. Normal SignedZone cancellation
-# is attempted with X-API-KEY + offererSignature.
-OPENSEA_SCOPED_TOKEN=
+MINT_HISTORY_RETENTION_SECONDS=86400
+MAINTENANCE_INTERVAL_SECONDS=300
+CACHE_RETENTION_SECONDS=3600
 ```
 
-Keep the existing `WALLET_ENCRYPTION_KEY` unchanged when upgrading, otherwise previously stored private keys cannot be decrypted.
+### 7. Safe Protection remains enabled and faster where possible
+
+The rule remains unchanged for ordinary auto-discovered Free Mints without qualification:
+
+```text
+X account OR website must be present
+```
+
+Qualification/manual projects keep their existing exemptions.
+
+V4.13.1 also:
+
+- reuses X/website identity already present in discovery metadata instead of making a duplicate Collection REST request;
+- when OpenSea responds with `429`, respects the actual OpenSea cooldown instead of retrying the same social lookup every few seconds;
+- does not weaken a rejection (`X=False` and `website=False`).
+
+### 8. USD price oracle fallback
+
+Alchemy remains the first native/USD source. If it is temporarily unavailable/rate-limited, the bot can fall back to Coinbase and then Binance. Race launch itself still uses warmed/cached price data so HTTP price discovery does not sit in front of broadcast.
+
+### 9. Ethereum RPC fallback
+
+Ethereum now includes this fallback after configured/Alchemy RPCs:
+
+```text
+https://ethereum-rpc.publicnode.com
+```
+
+A dedicated provider should still be configured for latency-sensitive production/Race use.
+
+### 10. Manual live wallet balance view
+
+Telegram `👛 المحافظ` now includes `💰 عرض الأرصدة الآن`, plus a per-wallet `🔄 تحديث الرصيد`. This is manual-only and not connected to Race/discovery loops. Where an ETH/USD price is available it also displays the approximate USDT value.
+
+## Collection Offers
+
+The V4.12 Collection Offer subsystem is preserved unchanged and isolated:
+
+- Telegram price entry/display in USDT-style USD;
+- actual Seaport offer in WETH;
+- Top Offer + configurable increment;
+- final confirmation before signing;
+- multi-wallet quantities;
+- WETH balance/allowance checks and explicit Approval;
+- current account offers from OpenSea;
+- cancel and raise;
+- separate `offer_history` table;
+- separate `offer-api` and `offer-sign` executors;
+- no Offer polling/hook in Race Lane.
+
+## Reading Railway logs
+
+Expected non-fatal states include:
+
+- `Free social trust rejected ... X=False | website=False` — Safe Protection intentionally rejected that ordinary auto Free Mint.
+- `precondition_failed ... Wallet already reached ...` — wallet already reached the on-chain limit.
+- `Sold out according to on-chain getMintStats` — no supply remains.
+- OpenSea Stream `4002 ... Service restarting` followed by `OpenSea Stream connected` — automatic reconnect.
+- provider `429` — RPC/API rate limit; fallback/provider configuration matters.
+
+Important recovery logs in this release:
+
+```text
+Low-balance auto-resume ready | recheck=0.35s | isolated=True
+Gas top-up detected | ...
+Race fee refreshed | ...
+FINAL PUBLIC COMPLETE | ... | archived=True
+Maintenance cleanup | ...
+```
+
+## Upgrade on Railway
+
+1. Back up the Railway Volume/database.
+2. Keep exactly the same `WALLET_ENCRYPTION_KEY`; changing it makes existing encrypted private keys unreadable.
+3. Replace the project files with this release.
+4. Keep your current environment settings unless you intentionally want to tune the new optional values above.
+5. Redeploy with the included `railway.json` (`python main.py`).
+6. Check startup logs for working RPC pools. A chain with no verified RPC cannot mint on that chain.
 
 ## Files
 
 ```text
-main.py       existing bot + minimal Offer UI integration points
-buyer.py      existing Mint/RPC code + OpenSea Offer API methods
-offers.py     NEW isolated Collection Offer service/controller
-storage.py    existing DB + separate offer_history persistence
-health.py     unchanged
-railway.json  unchanged
+main.py
+buyer.py
+offers.py
+storage.py
+health.py
 requirements.txt
+railway.json
 README.md
 CHANGELOG.md
+RELEASE_VALIDATION.md
 VERSION
 ```
 
-## Upgrade / Railway
+## Security / execution behavior retained
 
-1. Back up the current Railway Volume/database.
-2. Keep the same `WALLET_ENCRYPTION_KEY`.
-3. Replace the project files with this package.
-4. Redeploy normally with the existing `railway.json`.
-5. On startup, SQLite creates `offer_history` automatically without deleting the existing tables.
-6. Open Telegram → `⚙️ الإعدادات` → `💰 Offers` to review the Top increment and duration.
-
-Expected startup logs include:
-
-```text
-Mint Guardian V4.12.0 starting
-RACE LANE V4.11.3 STABLE (unchanged) ready
-Race signal coalescer ready
-Protected Free Mint Shield ready
-Offer subsystem V4.12.0 ready | ... | loop-hooks=0
-Collection Offers ready | isolated-executor=True | main-loop-polling=False | Race-hooks=0
-```
-
-## Important execution policy
-
-- Free Mint behavior remains automatic according to the existing V4.11.3 policies.
-- Paid Mint still requires the existing explicit paid-Mint plan confirmation.
-- Collection Offers are always user-triggered.
-- Selecting Top Offer does not sign.
-- Selecting a price does not sign.
-- Selecting wallets/quantity does not sign.
-- WETH Approval requires its own explicit button press.
-- The Offer itself requires the final `✅ تأكيد تقديم العرض` action.
-
-
-## V4.13.0 — USDT display and Wallet balances
-
-Telegram now displays native-token amounts together with an approximate USDT equivalent across qualification, paid/free mint, gas/fee, eligibility, history, and Offer financial messages. The Wallets section includes a manual `💰 عرض الرصيد` action that reads balances on enabled networks and shows the native balance plus its approximate USDT value. Balance reads are isolated from the mint Main Loop and Race Lane.
-
-
-## Ultra Race V4.13.0
-Known stages prewarm earlier. Fast live signals reuse their already-read SeaDrop public configuration, and free live Race uses the configured static race gas limit so estimateGas is not in front of broadcast. The existing protection/qualification decisions are unchanged.
+- Private keys remain Fernet-encrypted in SQLite.
+- Telegram raw private-key input is not logged.
+- Pause stops signing/broadcast while monitoring continues.
+- Paid Mint still requires the existing explicit paid plan.
+- Collection Offers still require explicit user confirmation.
+- Free Safe Protection policy is unchanged.
+- Gas/native/total-spend guards remain enforced according to the configured policy.

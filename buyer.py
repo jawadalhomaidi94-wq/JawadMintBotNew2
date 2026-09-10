@@ -27,7 +27,7 @@ CHAIN_CONFIGS: dict[str, dict[str, Any]] = {
         "opensea_chain": "ethereum",
         "alchemy_slug": "eth-mainnet",
         "explorer": "https://etherscan.io/tx/",
-        "default_rpcs": [],
+        "default_rpcs": ["https://ethereum-rpc.publicnode.com"],
     },
     "ink": {
         "chain_id": 57073,
@@ -169,7 +169,7 @@ class OpenSeaClient:
                 "X-API-KEY": self.api_key,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "OpenSea-Mint-Guardian/4.12",
+                "User-Agent": "OpenSea-Mint-Guardian/4.13.1",
             })
             self._local.session = session
         return session
@@ -181,6 +181,17 @@ class OpenSeaClient:
             return int(float(value)) if value not in (None, "") else None
         except Exception:
             return None
+
+    def prune_cache(self, *, max_age_seconds: float = 3600.0) -> int:
+        """Drop stale in-memory REST cache entries without touching rate state."""
+        cutoff = time.time() - max(60.0, float(max_age_seconds))
+        removed = 0
+        with self._cache_lock:
+            for key, (created, _payload) in list(self._cache.items()):
+                if created < cutoff:
+                    self._cache.pop(key, None)
+                    removed += 1
+        return removed
 
     def cooldown_remaining(self) -> float:
         with self._rate_lock:
@@ -710,6 +721,14 @@ def _classify_tx_exception_status(exc: Exception | str) -> str:
     )
     if any(marker in text for marker in nonce_markers):
         return "nonce_too_low"
+    fee_low_markers = (
+        "max fee per gas less than block base fee",
+        "fee cap less than block base fee",
+        "maxfeepergas less than block basefee",
+        "max fee per gas less than base fee",
+    )
+    if any(marker in text for marker in fee_low_markers):
+        return "fee_too_low"
     insufficient_markers = (
         "insufficient funds",
         "insufficient balance",
@@ -1572,6 +1591,7 @@ def prepare_seadrop_race_transactions(
     static_gas_limit: int | None = None,
     skip_balance_check: bool = False,
     clamp_fees_to_gas_budget: bool = False,
+    allow_missing_usd_for_free: bool = False,
 ) -> dict[str, Any]:
     """Pre-build and sign a batch of SeaDrop public transactions.
 
@@ -1798,14 +1818,15 @@ def prepare_seadrop_race_transactions(
 
         if max_gas_usd > 0:
             if gas_cost_usd is None:
-                # V4.12.1: FREE SeaDrop Race must not lose a scarce Public
-                # only because the background USD oracle is temporarily empty.
-                # Paid mints remain fail-closed.
-                if mint_value_native > 0:
+                # V4.13.1: free Race may continue when the USD oracle is temporarily
+                # unavailable. This matches the prior Ultra-Race behavior: the
+                # transaction is still constrained by the native cap (if set) and
+                # by the wallet's actual balance/provider acceptance. Paid mints
+                # remain fail-closed.
+                if not (allow_missing_usd_for_free and value == 0):
                     results[addr_l] = MintResult(False, "gas_price_unavailable", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=q, detail="USD gas budget enabled but native/USD price unavailable")
                     continue
-                log.warning("FREE RACE USD oracle unavailable; continuing with RPC/native gas safeguards | chain=%s | wallet=%s", rpc_pool.chain, wallet.name)
-            if gas_cost_usd is not None and gas_cost_usd > max_gas_usd:
+            elif gas_cost_usd > max_gas_usd:
                 results[addr_l] = MintResult(False, "gas_usd_too_high", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=q, detail=f"Estimated max gas ${gas_cost_usd:.6f} > USD cap ${max_gas_usd}")
                 continue
         if max_gas_native > 0 and gas_cost_native > max_gas_native:
@@ -1858,7 +1879,99 @@ def prepare_seadrop_race_transactions(
         "nft_contract": Web3.to_checksum_address(nft_contract),
         "prepared_at": time.time(),
         "static_gas": static_gas_limit is not None,
+        "chain_id": int(rpc_pool.chain_id),
+        "gas_strategy": gas_strategy,
+        "max_gas_native": max_gas_native,
+        "max_gas_usd": max_gas_usd,
+        "native_usd_price": native_usd_price,
+        "clamp_fees_to_gas_budget": bool(clamp_fees_to_gas_budget),
+        "allow_missing_usd_for_free": bool(allow_missing_usd_for_free),
     }
+
+
+def refresh_seadrop_race_bundle_fees(
+    bundle: dict[str, Any],
+    fee_fields: dict[str, int] | None,
+    *,
+    native_usd_price: Decimal | None = None,
+    w3: Web3 | None = None,
+) -> dict[str, Any]:
+    """Locally re-sign a prepared bundle when the warmed fee snapshot moved up.
+
+    No RPC call is performed here. The caller supplies the already-warmed fee
+    snapshot. This closes the common prewarm gap where a transaction is signed
+    a few seconds early and the chain base fee rises before opening.
+    """
+    if not fee_fields or not bundle.get("entries"):
+        return bundle
+    public = dict(bundle.get("public") or {})
+    fee_recipient = bundle.get("fee_recipient") or public.get("fee_recipient")
+    nft_contract = bundle.get("nft_contract")
+    if not fee_recipient or not nft_contract:
+        return bundle
+
+    old_fees = dict(bundle.get("fees") or {})
+    old_cap = int(old_fees.get("maxFeePerGas") or old_fees.get("gasPrice") or 0)
+    new_cap = int(fee_fields.get("maxFeePerGas") or fee_fields.get("gasPrice") or 0)
+    if new_cap <= old_cap:
+        return bundle
+
+    max_gas_native = Decimal(str(bundle.get("max_gas_native") or "0"))
+    max_gas_usd = Decimal(str(bundle.get("max_gas_usd") or "0"))
+    price_usd = native_usd_price if native_usd_price is not None else bundle.get("native_usd_price")
+    if price_usd is not None and not isinstance(price_usd, Decimal):
+        price_usd = Decimal(str(price_usd))
+    allow_missing_usd = bool(bundle.get("allow_missing_usd_for_free"))
+    clamp = bool(bundle.get("clamp_fees_to_gas_budget"))
+    price_each = int(public.get("mint_price_wei") or 0)
+
+    refreshed: list[dict[str, Any]] = []
+    for entry in list(bundle.get("entries") or []):
+        gas_limit = int(entry.get("gas_limit") or 0)
+        candidate_fees = dict(fee_fields)
+        if clamp:
+            candidate_fees = _clamp_fee_fields_to_budget(
+                candidate_fees, gas_limit=gas_limit, max_gas_native=max_gas_native,
+                max_gas_usd=max_gas_usd, native_usd_price=price_usd,
+            )
+        gas_cost_wei = max_gas_cost_wei(gas_limit, candidate_fees)
+        gas_cost_native = Decimal(gas_cost_wei) / Decimal(10**18)
+        gas_cost_usd = gas_cost_native * price_usd if price_usd is not None else None
+        if max_gas_native > 0 and gas_cost_native > max_gas_native:
+            return bundle
+        if max_gas_usd > 0:
+            if gas_cost_usd is None and not (allow_missing_usd and price_each == 0):
+                return bundle
+            if gas_cost_usd is not None and gas_cost_usd > max_gas_usd:
+                return bundle
+
+        wallet: WalletConfig = entry["wallet"]
+        base_tx = _seadrop_base_tx(
+            w3 or Web3(), payer=wallet.address, nft_contract=nft_contract, fee_recipient=fee_recipient,
+            quantity=int(entry["quantity"]), mint_price_wei=price_each,
+            chain_id=int(bundle.get("chain_id") or 0) or None, nonce=int(entry["nonce"]),
+        )
+        # Encoding/signing is local-only. ``w3`` may be the live primary Web3
+        # instance, but this helper performs no network request.
+        tx = {**base_tx, "gas": gas_limit, **candidate_fees}
+        account = Account.from_key(wallet.private_key)
+        signed = account.sign_transaction(tx)
+        raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
+        updated = dict(entry)
+        updated.update({
+            "raw": raw,
+            "fee_fields": candidate_fees,
+            "gas_cost_native": gas_cost_native,
+            "gas_cost_usd": gas_cost_usd,
+            "total_max_native": Decimal(price_each * int(entry["quantity"])) / Decimal(10**18) + gas_cost_native,
+        })
+        refreshed.append(updated)
+    bundle = dict(bundle)
+    bundle["entries"] = refreshed
+    bundle["fees"] = dict(fee_fields)
+    bundle["native_usd_price"] = price_usd
+    bundle["fee_refreshed_at"] = time.time()
+    return bundle
 
 
 def broadcast_seadrop_race_transactions(
@@ -1885,10 +1998,10 @@ def broadcast_seadrop_race_transactions(
     nft_contract = bundle.get("nft_contract")
     price_each = int(public.get("mint_price_wei") or 0)
 
-    def resign(entry: dict[str, Any], nonce: int):
+    def resign(entry: dict[str, Any], nonce: int, fee_fields: dict[str, int] | None = None):
         wallet: WalletConfig = entry["wallet"]
         if not nft_contract or not fee_recipient:
-            raise RuntimeError("Race bundle missing SeaDrop contract metadata for nonce refresh.")
+            raise RuntimeError("Race bundle missing SeaDrop contract metadata for nonce/fee refresh.")
         base_tx = _seadrop_base_tx(
             rpc_pool.primary,
             payer=wallet.address,
@@ -1899,10 +2012,86 @@ def broadcast_seadrop_race_transactions(
             chain_id=rpc_pool.chain_id,
             nonce=int(nonce),
         )
-        tx = {**base_tx, "gas": int(entry["gas_limit"]), **dict(entry.get("fee_fields") or {})}
+        chosen_fees = dict(fee_fields if fee_fields is not None else (entry.get("fee_fields") or {}))
+        tx = {**base_tx, "gas": int(entry["gas_limit"]), **chosen_fees}
         account = Account.from_key(wallet.private_key)
         signed = account.sign_transaction(tx)
         return getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
+
+    def refreshed_fee_fields(
+        entry: dict[str, Any], rejected_error: Exception | str | None = None
+    ) -> tuple[dict[str, int] | None, MintResult | None]:
+        """Get one live fee quote after an RPC explicitly rejects a stale prewarm fee.
+
+        This path is only entered after ``fee_too_low``; normal successful races
+        pay zero extra RPC latency. The user's configured gas limits are checked
+        again before the replacement signature is broadcast.
+        """
+        try:
+            fields = build_fee_fields(rpc_pool.primary, str(bundle.get("gas_strategy") or "fast"))
+        except Exception as exc:
+            return None, MintResult(False, "rpc_or_tx_error", target=SEADROP_ADDRESS, quantity_used=int(entry.get("quantity") or 1), detail=f"Live fee refresh failed: {exc}")
+
+        gas_limit = int(entry.get("gas_limit") or 0)
+        max_gas_native = Decimal(str(bundle.get("max_gas_native") or "0"))
+        max_gas_usd = Decimal(str(bundle.get("max_gas_usd") or "0"))
+        price_usd = bundle.get("native_usd_price")
+        if price_usd is not None and not isinstance(price_usd, Decimal):
+            price_usd = Decimal(str(price_usd))
+        unclamped_fields = dict(fields)
+        if bool(bundle.get("clamp_fees_to_gas_budget")):
+            fields = _clamp_fee_fields_to_budget(
+                fields, gas_limit=gas_limit, max_gas_native=max_gas_native,
+                max_gas_usd=max_gas_usd, native_usd_price=price_usd,
+            )
+
+        # If the provider explicitly told us the current block base fee, never
+        # re-sign a replacement below that fee just to satisfy a user budget.
+        # Such a transaction is invalid and only wastes the race opportunity.
+        # This check adds zero RPC calls: the baseFee comes from the rejection.
+        rejected_text = str(rejected_error or "")
+        base_match = re.search(r"base\s*fee(?:pergas)?\s*[:=]\s*(\d+)|basefee\s*[:=]\s*(\d+)", rejected_text, flags=re.IGNORECASE)
+        rejected_base_fee = None
+        if base_match:
+            try:
+                rejected_base_fee = int(base_match.group(1) or base_match.group(2))
+            except Exception:
+                rejected_base_fee = None
+        if rejected_base_fee is not None and "maxFeePerGas" in fields:
+            fee_cap = int(fields.get("maxFeePerGas") or 0)
+            if fee_cap < rejected_base_fee:
+                min_native = Decimal(gas_limit * rejected_base_fee) / Decimal(10**18)
+                min_usd = min_native * price_usd if price_usd is not None else None
+                mint_value_native = Decimal(price_each * int(entry.get("quantity") or 1)) / Decimal(10**18)
+                status = "gas_usd_too_high" if max_gas_usd > 0 and min_usd is not None else "gas_too_high"
+                cap_text = (
+                    f"USD cap ${max_gas_usd}" if status == "gas_usd_too_high"
+                    else f"native cap {max_gas_native}"
+                )
+                return None, MintResult(
+                    False, status, mint_value_native=mint_value_native,
+                    gas_cost_native=min_native, gas_cost_usd=min_usd,
+                    total_max_native=mint_value_native + min_native, target=SEADROP_ADDRESS,
+                    quantity_used=int(entry.get("quantity") or 1),
+                    detail=(f"Current block base fee requires at least {rejected_base_fee} wei/gas; "
+                            f"configured {cap_text} cannot fund a valid replacement at gasLimit={gas_limit}."),
+                )
+
+        gas_cost_wei = max_gas_cost_wei(gas_limit, fields)
+        gas_cost_native = Decimal(gas_cost_wei) / Decimal(10**18)
+        gas_cost_usd = gas_cost_native * price_usd if price_usd is not None else None
+        mint_value_native = Decimal(price_each * int(entry.get("quantity") or 1)) / Decimal(10**18)
+        total_max_native = mint_value_native + gas_cost_native
+
+        if max_gas_native > 0 and gas_cost_native > max_gas_native:
+            return None, MintResult(False, "gas_too_high", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=int(entry.get("quantity") or 1), detail=f"Fresh gas estimate {gas_cost_native} > native cap {max_gas_native}")
+        if max_gas_usd > 0:
+            allow_missing = bool(bundle.get("allow_missing_usd_for_free")) and price_each == 0
+            if gas_cost_usd is None and not allow_missing:
+                return None, MintResult(False, "gas_price_unavailable", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=int(entry.get("quantity") or 1), detail="USD gas budget enabled but native/USD price unavailable during live fee refresh")
+            if gas_cost_usd is not None and gas_cost_usd > max_gas_usd:
+                return None, MintResult(False, "gas_usd_too_high", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=int(entry.get("quantity") or 1), detail=f"Fresh max gas ${gas_cost_usd:.6f} > USD cap ${max_gas_usd}")
+        return fields, None
 
     def send(entry: dict[str, Any]) -> tuple[str, MintResult]:
         wallet: WalletConfig = entry["wallet"]
@@ -1931,18 +2120,45 @@ def broadcast_seadrop_race_transactions(
                     tx_hash, rpc_url = rpc_pool.broadcast_raw_transaction(raw)
                 except Exception as first_exc:
                     status = _classify_tx_exception_status(first_exc)
-                    if status != "nonce_too_low":
+                    if status == "nonce_too_low":
+                        # A different transaction may have landed between the first
+                        # nonce read and broadcast. Refresh and retry once immediately.
+                        retry_nonce = max(_race_choose_nonce(rpc_pool, wallet.address), chosen_nonce + 1)
+                        raw = resign(entry, retry_nonce)
+                        chosen_nonce = retry_nonce
+                        log.info(
+                            "Race nonce retry | chain=%s | wallet=%s | nonce=%s",
+                            rpc_pool.chain, wallet.address[:6] + "…" + wallet.address[-4:], chosen_nonce,
+                        )
+                        tx_hash, rpc_url = rpc_pool.broadcast_raw_transaction(raw)
+                    elif status == "fee_too_low":
+                        # A pre-signed transaction can become stale if the chain's
+                        # base fee jumps between prewarm and opening. Refresh one
+                        # live fee snapshot, re-sign locally, and retry immediately
+                        # instead of waiting for another Stream event.
+                        fresh_fields, blocked = refreshed_fee_fields(entry, first_exc)
+                        if blocked is not None:
+                            return addr_l, blocked
+                        assert fresh_fields is not None
+                        raw = resign(entry, chosen_nonce, fresh_fields)
+                        log.info(
+                            "Race fee refreshed | chain=%s | wallet=%s | old=%s | new=%s",
+                            rpc_pool.chain, wallet.address[:6] + "…" + wallet.address[-4:],
+                            (entry.get("fee_fields") or {}).get("maxFeePerGas") or (entry.get("fee_fields") or {}).get("gasPrice"),
+                            fresh_fields.get("maxFeePerGas") or fresh_fields.get("gasPrice"),
+                        )
+                        tx_hash, rpc_url = rpc_pool.broadcast_raw_transaction(raw)
+                        # Keep result accounting aligned with the replacement tx.
+                        gas_cost_wei = max_gas_cost_wei(int(entry["gas_limit"]), fresh_fields)
+                        entry["fee_fields"] = fresh_fields
+                        entry["gas_cost_native"] = Decimal(gas_cost_wei) / Decimal(10**18)
+                        price_usd = bundle.get("native_usd_price")
+                        if price_usd is not None and not isinstance(price_usd, Decimal):
+                            price_usd = Decimal(str(price_usd))
+                        entry["gas_cost_usd"] = entry["gas_cost_native"] * price_usd if price_usd is not None else None
+                        entry["total_max_native"] = entry["mint_value_native"] + entry["gas_cost_native"]
+                    else:
                         raise
-                    # A different transaction may have landed between the first
-                    # nonce read and broadcast. Refresh and retry once immediately.
-                    retry_nonce = max(_race_choose_nonce(rpc_pool, wallet.address), chosen_nonce + 1)
-                    raw = resign(entry, retry_nonce)
-                    chosen_nonce = retry_nonce
-                    log.info(
-                        "Race nonce retry | chain=%s | wallet=%s | nonce=%s",
-                        rpc_pool.chain, wallet.address[:6] + "…" + wallet.address[-4:], chosen_nonce,
-                    )
-                    tx_hash, rpc_url = rpc_pool.broadcast_raw_transaction(raw)
 
                 _race_mark_nonce_submitted(rpc_pool, wallet.address, chosen_nonce)
                 return addr_l, MintResult(
@@ -1953,7 +2169,7 @@ def broadcast_seadrop_race_transactions(
                     gas_cost_native=entry["gas_cost_native"],
                     gas_cost_usd=entry["gas_cost_usd"],
                     total_max_native=entry["total_max_native"],
-                    detail=f"V4.11.3 nonce-safe race-lane SeaDrop transaction (nonce={chosen_nonce}).",
+                    detail=f"V4.13.1 nonce/fee-safe race-lane SeaDrop transaction (nonce={chosen_nonce}).",
                     rpc=rpc_url,
                     target=SEADROP_ADDRESS,
                     quantity_used=int(entry["quantity"]),

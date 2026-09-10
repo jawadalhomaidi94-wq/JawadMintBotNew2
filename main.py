@@ -42,6 +42,7 @@ from buyer import (
     mint_seadrop_public,
     prepare_seadrop_race_transactions,
     broadcast_seadrop_race_transactions,
+    refresh_seadrop_race_bundle_fees,
     read_seadrop_public_fast,
     native_symbol,
     normalize_chain,
@@ -786,10 +787,11 @@ def format_ts(ts: float | None, tz: ZoneInfo) -> str:
 
 
 class AlchemyPriceOracle:
-    """Small cached USD price oracle using the existing Alchemy API key.
+    """Cached native/USD oracle with provider fallbacks.
 
-    The bot only needs a fresh native-token price to enforce a hard dollar gas
-    ceiling. Results are cached so parallel wallets do not multiply API calls.
+    Alchemy remains first choice. V4.13.1 adds public Coinbase/Binance fallbacks
+    so a temporary Alchemy 429 cannot unnecessarily block a free Race. A small
+    single-flight lock prevents concurrent wallets from multiplying HTTP calls.
     """
 
     def __init__(self, api_key: str, *, ttl_seconds: float = 60.0, timeout: float = 5.0):
@@ -798,19 +800,22 @@ class AlchemyPriceOracle:
         self.timeout = max(2.0, float(timeout))
         self._cache: dict[str, tuple[float, Decimal]] = {}
         self._lock = threading.Lock()
+        self._fetch_lock = threading.Lock()
 
-    def get_usd(self, symbol: str) -> Decimal | None:
-        symbol = symbol.upper().strip()
-        if not self.api_key or not symbol:
+    def _store(self, symbol: str, value: Decimal | str | float | int | None) -> Decimal | None:
+        try:
+            price = Decimal(str(value))
+        except Exception:
             return None
-        now = time.time()
-        # Never hold the cache lock while doing HTTP. The V4.9 race lane calls
-        # peek_usd(), and a background price refresh must not make that hot
-        # read wait behind a multi-second network request.
+        if price <= 0:
+            return None
         with self._lock:
-            cached = self._cache.get(symbol)
-            if cached and now - cached[0] <= self.ttl_seconds:
-                return cached[1]
+            self._cache[symbol] = (time.time(), price)
+        return price
+
+    def _alchemy(self, symbol: str) -> Decimal | None:
+        if not self.api_key:
+            return None
         try:
             url = f"https://api.g.alchemy.com/prices/v1/{self.api_key}/tokens/by-symbol"
             response = requests.get(url, params={"symbols": symbol}, timeout=self.timeout)
@@ -823,45 +828,77 @@ class AlchemyPriceOracle:
                 prices = row.get("prices", [])
                 for price in prices if isinstance(prices, list) else []:
                     if str(price.get("currency", "")).upper() == "USD":
-                        value = Decimal(str(price.get("value")))
-                        if value > 0:
-                            with self._lock:
-                                self._cache[symbol] = (time.time(), value)
-                            return value
+                        return self._store(symbol, price.get("value"))
         except Exception as exc:
             log.debug("Alchemy price lookup failed for %s: %s", symbol, exc)
-        # A recent stale value is safer than disabling execution entirely
-        # because of one transient HTTP error. Limit stale use to 10 minutes.
+        return None
+
+    def _coinbase(self, symbol: str) -> Decimal | None:
+        try:
+            response = requests.get(
+                f"https://api.coinbase.com/v2/prices/{symbol}-USD/spot",
+                timeout=min(self.timeout, 4.0),
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data", {}) if isinstance(payload, dict) else {}
+            return self._store(symbol, data.get("amount"))
+        except Exception as exc:
+            log.debug("Coinbase price lookup failed for %s: %s", symbol, exc)
+            return None
+
+    def _binance(self, symbol: str) -> Decimal | None:
+        try:
+            response = requests.get(
+                "https://api.binance.com/api/v3/ticker/price",
+                params={"symbol": f"{symbol}USDT"},
+                timeout=min(self.timeout, 4.0),
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            return self._store(symbol, payload.get("price") if isinstance(payload, dict) else None)
+        except Exception as exc:
+            log.debug("Binance price lookup failed for %s: %s", symbol, exc)
+            return None
+
+    def get_usd(self, symbol: str) -> Decimal | None:
+        symbol = symbol.upper().strip()
+        if not symbol:
+            return None
+        now = time.time()
         with self._lock:
             cached = self._cache.get(symbol)
-            if cached and now - cached[0] <= 3600:
+            if cached and now - cached[0] <= self.ttl_seconds:
                 return cached[1]
-        # Background-only independent fallbacks. Race itself uses peek_usd()
-        # and therefore never waits on these HTTP requests.
-        if symbol in {"ETH", "WETH"}:
-            sources = (
-                ("https://api.coinbase.com/v2/prices/ETH-USD/spot", lambda p: p.get("data", {}).get("amount")),
-                ("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT", lambda p: p.get("price")),
-            )
-            for url, extractor in sources:
-                try:
-                    response = requests.get(url, timeout=min(self.timeout, 2.5))
-                    response.raise_for_status()
-                    value = Decimal(str(extractor(response.json())))
-                    if value > 0:
-                        with self._lock:
-                            self._cache[symbol] = (time.time(), value)
-                        return value
-                except Exception:
-                    continue
+
+        # Only one thread performs external price discovery at a time. Other
+        # callers can still use peek_usd without ever waiting on this lock.
+        with self._fetch_lock:
+            now = time.time()
+            with self._lock:
+                cached = self._cache.get(symbol)
+                if cached and now - cached[0] <= self.ttl_seconds:
+                    return cached[1]
+            value = self._alchemy(symbol)
+            if value is None:
+                value = self._coinbase(symbol)
+            if value is None:
+                value = self._binance(symbol)
+            if value is not None:
+                return value
+
+        # A recent stale value is better than disabling execution because one
+        # provider is briefly unavailable. Keep the stale window bounded.
+        with self._lock:
+            cached = self._cache.get(symbol)
+            if cached and now - cached[0] <= 1800:
+                return cached[1]
         return None
 
     def peek_usd(self, symbol: str, *, max_age_seconds: float = 600.0) -> Decimal | None:
-        """Return an already-cached price without performing network I/O.
-
-        The hot mint path must never pause on an HTTP price request. A separate
-        background warmer keeps this cache fresh.
-        """
+        """Return cached price only; never perform network I/O."""
         symbol = symbol.upper().strip()
         if not symbol:
             return None
@@ -871,6 +908,16 @@ class AlchemyPriceOracle:
             if cached and now - cached[0] <= max(10.0, float(max_age_seconds)):
                 return cached[1]
         return None
+
+    def prune_cache(self, *, max_age_seconds: float = 3600.0) -> int:
+        cutoff = time.time() - max(60.0, float(max_age_seconds))
+        removed = 0
+        with self._lock:
+            for key, (created, _value) in list(self._cache.items()):
+                if created < cutoff:
+                    self._cache.pop(key, None)
+                    removed += 1
+        return removed
 
 
 @dataclass
@@ -894,6 +941,12 @@ class WalletState:
     target_total: int = 0
     confirmed_total: int = 0
     pending_quantity: int = 0
+    # V4.13.1 low-balance recovery state. These are RAM-only and never persist
+    # secrets; they let a dedicated lightweight watcher wake Race immediately
+    # after the user tops up native gas.
+    last_balance_wei: int | None = None
+    required_balance_wei: int | None = None
+    balance_recheck_at: float = 0.0
 
 
 @dataclass
@@ -964,6 +1017,7 @@ class Candidate:
     social_twitter_url: str | None = None
     social_website_url: str | None = None
     social_trust_detail: str = ""
+    social_trust_retry_at: float = 0.0
 
     def submitted_count(self) -> int:
         return sum(1 for s in self.wallets.values() if s.submitted)
@@ -1190,13 +1244,9 @@ class Bot(OfferControllerMixin):
         self.fast_stage_refresh_seconds = max(1.0, env_float("FAST_STAGE_REFRESH_SECONDS", 3.0))
         self.fast_refresh_window = max(15.0, env_float("FAST_REFRESH_WINDOW", 120.0))
         self.receipt_check_seconds = max(2.0, env_float("RECEIPT_CHECK_SECONDS", 5.0))
-        self.low_balance_retry_seconds = max(1.0, env_float("LOW_BALANCE_RETRY_SECONDS", 2.0))
+        self.low_balance_retry_seconds = max(0.15, env_float("LOW_BALANCE_RETRY_SECONDS", 0.35))
+        self.low_balance_recheck_seconds = max(0.15, env_float("LOW_BALANCE_RECHECK_SECONDS", 0.35))
         self.max_parallel_wallets = max(1, env_int("MAX_PARALLEL_WALLETS", 10))
-        # V4.12.2: balance reads are manual-only and isolated from Race/Main Loop.
-        self.wallet_balance_executor = ThreadPoolExecutor(
-            max_workers=max(2, min(self.max_parallel_wallets, 6)),
-            thread_name_prefix="wallet-balance",
-        )
         self.drop_limit = max(1, min(env_int("DROP_LIMIT", 25), 100))
 
         # V4.2 automatic free-mint discovery. The list scan itself runs every
@@ -1276,13 +1326,10 @@ class Bot(OfferControllerMixin):
         # Hot market snapshots are refreshed outside the launch path. This
         # avoids spending precious milliseconds on fee/price HTTP/RPC reads
         # when a small public mint opens.
-        self.race_fee_refresh_seconds = max(0.15, env_float("RACE_FEE_REFRESH_SECONDS", 0.35))
+        self.race_fee_refresh_seconds = max(0.10, env_float("RACE_FEE_REFRESH_SECONDS", 0.20))
         self.race_price_refresh_seconds = max(10.0, env_float("RACE_PRICE_REFRESH_SECONDS", 30.0))
         self.seadrop_wss_enabled = env_bool("SEADROP_WSS_DISCOVERY", True)
         self.qualification_recheck_seconds = max(5.0, env_float("QUALIFICATION_RECHECK_SECONDS", 15.0))
-        self.history_retention_hours = max(1.0, env_float("HISTORY_RETENTION_HOURS", 24.0))
-        self.cache_cleanup_seconds = max(300.0, env_float("CACHE_CLEANUP_SECONDS", 900.0))
-        self.maintenance_thread: threading.Thread | None = None
         # OpenSea's wallet-specific mint builder is quota-sensitive. Direct
         # SeaDrop checks stay fully parallel, while OpenSea qualification calls
         # use a small worker cap to avoid a many-wallet 429 burst.
@@ -1304,6 +1351,11 @@ class Bot(OfferControllerMixin):
         self.social_trust_workers = max(1, min(env_int("SOCIAL_TRUST_WORKERS", 2), 6))
         self.social_trust_lock = threading.RLock()
         self.social_trust_inflight: set[str] = set()
+
+        # V4.13.1 maintenance is deliberately isolated from Main/Race.
+        self.history_retention_seconds = max(3600.0, env_float("MINT_HISTORY_RETENTION_SECONDS", 86400.0))
+        self.maintenance_interval_seconds = max(60.0, env_float("MAINTENANCE_INTERVAL_SECONDS", 300.0))
+        self.cache_retention_seconds = max(600.0, env_float("CACHE_RETENTION_SECONDS", 3600.0))
 
         self.paused = env_bool("START_PAUSED", False)
 
@@ -1338,6 +1390,16 @@ class Bot(OfferControllerMixin):
         self.social_trust_executor = ThreadPoolExecutor(
             max_workers=self.social_trust_workers, thread_name_prefix="social-trust"
         )
+        # Dedicated low-balance reads never consume Race signal/prep/launch workers.
+        self.balance_recheck_executor = ThreadPoolExecutor(
+            max_workers=max(1, min(self.max_parallel_wallets, 8)), thread_name_prefix="balance-recheck"
+        )
+        # Reuse fee-warmer workers instead of constructing a ThreadPool every
+        # ~200ms. This reduces scheduler/GC noise next to the latency-sensitive
+        # Race executors without changing how often fees are refreshed.
+        self.race_fee_executor = ThreadPoolExecutor(
+            max_workers=max(1, min(len(self.enabled_chains), 8)), thread_name_prefix="race-fee-warm"
+        )
         self.race_prepared: dict[str, dict[str, Any]] = {}
         self.race_preparing: set[str] = set()
         self.race_active: set[str] = set()
@@ -1359,6 +1421,8 @@ class Bot(OfferControllerMixin):
         self.race_market_lock = threading.RLock()
         self.race_fee_cache: dict[str, tuple[float, dict[str, int]]] = {}
         self.race_last_price_refresh = 0.0
+        self.low_balance_thread: threading.Thread | None = None
+        self.maintenance_thread: threading.Thread | None = None
 
         self.pending_wallet_name: dict[str, float] = {}
         self.pending_wallet_import: dict[str, dict[str, Any]] = {}
@@ -1373,7 +1437,7 @@ class Bot(OfferControllerMixin):
         self.load_rpc_pools()
         self.import_env_wallets()
         self.reload_wallets()
-        # V4.12.2: Offers have their own executor/state and are user-triggered.
+        # V4.12.0: Offers have their own executor/state and are user-triggered.
         # This initialization adds no polling/thread into the Mint/Race path.
         self.init_offer_subsystem()
         self.load_env_watches_to_store()
@@ -1531,6 +1595,7 @@ class Bot(OfferControllerMixin):
             )
             candidate.social_trust_status = status
             candidate.social_trust_checked_at = checked
+            candidate.social_trust_retry_at = 0.0
             candidate.social_twitter_username = twitter_username
             candidate.social_twitter_url = twitter_url
             candidate.social_website_url = website_url
@@ -1580,8 +1645,15 @@ class Bot(OfferControllerMixin):
         except Exception as exc:
             checked = time.time()
             detail = str(exc)[:800]
+            cooldown = 0.0
+            try:
+                cooldown = float(self.opensea.cooldown_remaining())
+            except Exception:
+                cooldown = 0.0
+            retry_after = max(self.social_trust_error_retry, cooldown)
             candidate.social_trust_status = "error"
             candidate.social_trust_checked_at = checked
+            candidate.social_trust_retry_at = checked + retry_after
             candidate.social_trust_detail = detail
             try:
                 self.store.upsert_social_trust(
@@ -1591,7 +1663,10 @@ class Bot(OfferControllerMixin):
                 )
             except Exception:
                 pass
-            log.info("Free social trust temporary error | %s | %s | %s", candidate.slug, candidate.chain, detail[:250])
+            log.info(
+                "Free social trust temporary error | %s | %s | retry=%.1fs | %s",
+                candidate.slug, candidate.chain, retry_after, detail[:250],
+            )
         finally:
             with self.social_trust_lock:
                 self.social_trust_inflight.discard(project_key)
@@ -1609,6 +1684,12 @@ class Bot(OfferControllerMixin):
             return "bypassed"
         project_key = self.project_key_for_candidate(candidate)
         now = time.time()
+
+        # Honor the real OpenSea cooldown after a transient error. Re-submitting
+        # the same metadata lookup every few seconds during a 429 only burns
+        # workers/logs and can steal REST quota from more important operations.
+        if not force and candidate.social_trust_retry_at and now < candidate.social_trust_retry_at:
+            return candidate.social_trust_status if candidate.social_trust_status == "error" else "pending"
 
         # Hot scheduler path: while one worker is already resolving this project,
         # return from RAM only. Never hit SQLite every few milliseconds.
@@ -1676,10 +1757,17 @@ class Bot(OfferControllerMixin):
         now = time.time() if now is None else now
         active = active_plans(candidate.stage_plans, now)
         if active:
-            # OpenSea chooses the first eligible active stage. Preserve stage
-            # order so our scheduling mirrors the drop metadata as closely as
-            # possible; the mint builder remains the final eligibility oracle.
-            return min(active, key=lambda p: int(p.get("index") or 0))
+            # V4.13.1: once a Public stage is actually open it must win over an
+            # older overlapping allowlist/qualification stage. Otherwise a
+            # long-running allowlist can hide the final Public and prevent the
+            # all-wallet race. Among same-kind stages prefer the most recently
+            # opened stage, which matches the effective current sale phase.
+            public_active = [p for p in active if p.get("is_public")]
+            pool = public_active or active
+            return max(
+                pool,
+                key=lambda p: (float(p.get("start") or 0), int(p.get("index") or 0)),
+            )
         return None
 
     def next_plan_for_candidate(self, candidate: Candidate, now: float | None = None) -> dict[str, Any] | None:
@@ -1864,8 +1952,8 @@ class Bot(OfferControllerMixin):
         if candidate.ignore_gas_cap:
             return "🔥 بدون حد لهذا المنت (تجاوز صريح)"
         if candidate.gas_override_usd is not None:
-            return f"⛽ حد خاص: {candidate.gas_override_usd} USDT"
-        return f"⛽ يرث حد الشبكة: {self.max_gas_usd_for_chain(candidate.chain)} USDT"
+            return f"⛽ حد خاص: ${candidate.gas_override_usd}"
+        return f"⛽ يرث حد الشبكة: ${self.max_gas_usd_for_chain(candidate.chain)}"
 
     def set_candidate_gas_policy(
         self, candidate: Candidate, *, ignore: bool = False, override_usd: Decimal | None = None
@@ -1881,86 +1969,6 @@ class Bot(OfferControllerMixin):
 
     def native_usd_price_for_chain(self, chain: str) -> Decimal | None:
         return self.price_oracle.get_usd(native_symbol(chain))
-
-    def native_usdt_value(
-        self,
-        chain: str,
-        amount: Any,
-        *,
-        allow_network: bool = False,
-        known_usdt: Decimal | None = None,
-    ) -> Decimal | None:
-        """Convert a native-token amount to the Telegram USDT display value.
-
-        `allow_network=False` is used by Race/receipt hot paths so display
-        formatting can never add HTTP latency to mint execution.
-        """
-        try:
-            native_amount = Decimal(str(amount))
-        except Exception:
-            return None
-        if known_usdt is not None:
-            try:
-                return Decimal(str(known_usdt))
-            except Exception:
-                pass
-        if native_amount == 0:
-            return Decimal("0")
-        price = (
-            self.native_usd_price_for_chain(chain)
-            if allow_network
-            else self.race_native_usd_price(chain, allow_network=False)
-        )
-        if price is None:
-            return None
-        return native_amount * price
-
-    def format_native_usdt(
-        self,
-        chain: str,
-        amount: Any,
-        *,
-        native_places: int = 10,
-        usdt_places: int = 4,
-        allow_network: bool = False,
-        known_usdt: Decimal | None = None,
-    ) -> str:
-        symbol = native_symbol(chain)
-        try:
-            native_amount = Decimal(str(amount))
-        except Exception:
-            return f"{amount} {symbol} (≈ غير متاح USDT)"
-        native_text = self._fmt_decimal(native_amount, native_places)
-        usdt = self.native_usdt_value(
-            chain, native_amount, allow_network=allow_network, known_usdt=known_usdt
-        )
-        usdt_text = (
-            f"≈ {self._fmt_decimal(usdt, usdt_places)} USDT"
-            if usdt is not None
-            else "≈ غير متاح USDT"
-        )
-        return f"{native_text} {symbol} ({usdt_text})"
-
-    def stage_price_display(
-        self,
-        chain: str,
-        plan: dict[str, Any],
-        *,
-        allow_network: bool = False,
-    ) -> str:
-        raw = plan.get("price")
-        value = _numeric_value(raw)
-        if value is None:
-            if plan.get("is_free"):
-                value = Decimal("0")
-            else:
-                return "❔ السعر غير معروف (USDT غير متاح)"
-        raw_text = str(raw or "").lower()
-        if "wei" in raw_text or value >= Decimal("1000000000"):
-            value = value / Decimal(10**18)
-        return self.format_native_usdt(
-            chain, value, allow_network=allow_network, native_places=10, usdt_places=4
-        )
 
     def race_native_usd_price(self, chain: str, *, allow_network: bool = False) -> Decimal | None:
         """Return a cached USD price for the race lane.
@@ -2012,16 +2020,15 @@ class Bot(OfferControllerMixin):
 
             items = list(self.rpc_pools.items())
             if items:
-                with ThreadPoolExecutor(max_workers=min(len(items), 8)) as executor:
-                    futures = [executor.submit(fee_job, item) for item in items]
-                    for future in as_completed(futures):
-                        try:
-                            chain, fields = future.result()
-                            if fields:
-                                with self.race_market_lock:
-                                    self.race_fee_cache[chain] = (time.time(), dict(fields))
-                        except Exception:
-                            pass
+                futures = [self.race_fee_executor.submit(fee_job, item) for item in items]
+                for future in as_completed(futures):
+                    try:
+                        chain, fields = future.result()
+                        if fields:
+                            with self.race_market_lock:
+                                self.race_fee_cache[chain] = (time.time(), dict(fields))
+                    except Exception:
+                        pass
 
             if cycle >= next_price:
                 # Current supported EVM networks use ETH as their native gas
@@ -2045,6 +2052,81 @@ class Bot(OfferControllerMixin):
             target=self._race_market_warmer_loop, name="race-market-warmer", daemon=True
         )
         self.race_market_thread.start()
+
+    # ---------- V4.13.1 low-priority maintenance ----------
+    def _maintenance_once(self) -> None:
+        now = time.time()
+        try:
+            history = self.store.compact_mint_history(max_age_seconds=self.history_retention_seconds)
+        except Exception as exc:
+            history = {"deleted_rows": 0, "compacted_quantity": 0}
+            log.debug("History maintenance failed: %s", exc)
+        try:
+            db_cache = self.store.cleanup_transient_cache(
+                social_max_age_seconds=max(self.cache_retention_seconds, self.social_trust_pass_ttl * 2)
+            )
+        except Exception:
+            db_cache = {"social_cache_deleted": 0}
+        try:
+            opensea_removed = self.opensea.prune_cache(max_age_seconds=self.cache_retention_seconds)
+        except Exception:
+            opensea_removed = 0
+        try:
+            price_removed = self.price_oracle.prune_cache(max_age_seconds=self.cache_retention_seconds)
+        except Exception:
+            price_removed = 0
+
+        with self.race_state_lock:
+            # Signed bundles are useful only around an opening. Never retain
+            # them for hours after a project disappeared or a stage ended.
+            bundle_cutoff = now - max(120.0, self.race_prewarm_seconds * 20.0)
+            for key, bundle in list(self.race_prepared.items()):
+                if float(bundle.get("prepared_at") or 0.0) < bundle_cutoff:
+                    self.race_prepared.pop(key, None)
+            seen_cutoff = now - max(1800.0, self.cache_retention_seconds)
+            self.race_signal_stage_seen = {
+                key: ts for key, ts in self.race_signal_stage_seen.items() if float(ts) >= seen_cutoff
+            }
+            self.race_signal_stage_cache = {
+                key: value for key, value in self.race_signal_stage_cache.items()
+                if float(value.get("resolved_at") or 0.0) >= seen_cutoff
+            }
+            fee_cutoff = now - 60.0
+            self.race_fee_cache = {
+                chain: item for chain, item in self.race_fee_cache.items() if float(item[0]) >= fee_cutoff
+            }
+
+        # Catalog/event seen maps are discovery de-duplication only. Keeping
+        # them bounded prevents long Railway uptimes from accumulating RAM.
+        catalog_cutoff = now - max(600.0, self.auto_catalog_detail_ttl * 10.0)
+        self.auto_catalog_seen = {k: ts for k, ts in self.auto_catalog_seen.items() if float(ts) >= catalog_cutoff}
+        event_cutoff = now - max(3600.0, float(self.auto_event_initial_lookback_seconds))
+        self.auto_event_seen = {k: ts for k, ts in self.auto_event_seen.items() if float(ts) >= event_cutoff}
+
+        if any((history.get("deleted_rows"), history.get("compacted_quantity"), db_cache.get("social_cache_deleted"), opensea_removed, price_removed)):
+            log.info(
+                "Maintenance cleanup | history_rows=%s | compacted_qty=%s | social_cache=%s | opensea_cache=%s | price_cache=%s",
+                history.get("deleted_rows", 0), history.get("compacted_quantity", 0),
+                db_cache.get("social_cache_deleted", 0), opensea_removed, price_removed,
+            )
+
+    def _maintenance_loop(self) -> None:
+        # Run once on startup so an upgraded long-lived DB is cleaned promptly.
+        self._maintenance_once()
+        while not STOP:
+            deadline = time.time() + self.maintenance_interval_seconds
+            while not STOP and time.time() < deadline:
+                time.sleep(min(1.0, max(0.05, deadline - time.time())))
+            if not STOP:
+                self._maintenance_once()
+
+    def start_maintenance(self) -> None:
+        if self.maintenance_thread and self.maintenance_thread.is_alive():
+            return
+        self.maintenance_thread = threading.Thread(
+            target=self._maintenance_loop, name="low-priority-maintenance", daemon=True
+        )
+        self.maintenance_thread.start()
 
     # ---------- drop parsing / watch ----------
     def load_env_watches_to_store(self) -> None:
@@ -2114,10 +2196,36 @@ class Bot(OfferControllerMixin):
             f"• {p['label']}: {format_ts(p.get('start'), self.display_tz)}"
             f" → {format_ts(p.get('end'), self.display_tz)}"
             f" | {'عام' if p.get('is_public') else 'تأهيل'}"
-            f" | السعر={self.stage_price_display(candidate.chain, p, allow_network=False)}"
+            f" | السعر={p.get('price','غير معروف')}"
             + (f" | الحد/المحفظة={p.get('wallet_limit')}" if p.get('wallet_limit') else "")
             for p in plans
         ]
+
+        # V4.13.1 Safe Protection fast path: many OpenSea drop/catalog payloads
+        # already carry the collection X/website. A positive identity found in
+        # metadata is equivalent to the later collection lookup, so accept it
+        # immediately and save one REST round-trip. Missing fields are never
+        # treated as rejection here because compact list payloads may omit them.
+        if drop is not None and candidate.auto_discovered and not candidate.qualification_tracked:
+            twitter_username, twitter_url, website_url = extract_collection_social_identity(drop)
+            if twitter_url or website_url:
+                checked = time.time()
+                candidate.social_trust_status = "passed"
+                candidate.social_trust_checked_at = checked
+                candidate.social_trust_retry_at = 0.0
+                candidate.social_twitter_username = twitter_username
+                candidate.social_twitter_url = twitter_url
+                candidate.social_website_url = website_url
+                candidate.social_trust_detail = "X or website found in discovery metadata"
+                try:
+                    self.store.upsert_social_trust(
+                        project_key=self.project_key_for_candidate(candidate), slug=candidate.slug,
+                        chain=candidate.chain, contract_address=candidate.contract_address, status="passed",
+                        twitter_username=twitter_username, twitter_url=twitter_url, website_url=website_url,
+                        checked_at=checked, detail=candidate.social_trust_detail,
+                    )
+                except Exception:
+                    pass
 
     def persist_candidate_planning(self, candidate: Candidate) -> None:
         stages_json = json.dumps(candidate.stage_plans, ensure_ascii=False)
@@ -2162,7 +2270,7 @@ class Bot(OfferControllerMixin):
                 return True
         return False
 
-    def summarize_stages(self, drop: dict[str, Any], chain: str) -> tuple[list[str], float | None, float | None, int | None, bool]:
+    def summarize_stages(self, drop: dict[str, Any]) -> tuple[list[str], float | None, float | None, int | None, bool]:
         now = time.time()
         lines: list[str] = []
         public_start = None
@@ -2191,7 +2299,7 @@ class Bot(OfferControllerMixin):
                 if next_start is None or effective < next_start:
                     next_start = effective
             lines.append(
-                f"• {label}: {format_ts(start, self.display_tz)} | السعر={self.stage_price_display(chain, {'price': price, 'is_free': stage_is_explicitly_free(stage), 'is_paid': stage_has_paid_price(stage)}, allow_network=False)}"
+                f"• {label}: {format_ts(start, self.display_tz)} | السعر={price}"
                 + (f" | الحد/المحفظة={limit}" if limit else "")
             )
         return lines, public_start, next_start, wallet_limit, has_paid_stage
@@ -2217,7 +2325,7 @@ class Bot(OfferControllerMixin):
         if not plans:
             return False, f"لم تُرجع OpenSea أي مراحل Mint للمشروع {slug}.", None
 
-        lines, public_start, next_start, _wallet_limit, has_paid_stage = self.summarize_stages(drop, chain)
+        lines, public_start, next_start, _wallet_limit, has_paid_stage = self.summarize_stages(drop)
         key = f"{chain}:{slug}"
         candidate = self.candidates.get(key)
         now = time.time()
@@ -2700,7 +2808,7 @@ class Bot(OfferControllerMixin):
                     result = check_eligibility(self.opensea, slug, wallet, wallet.quantity)
                     icon = "✅" if result.eligible is True else "❌" if result.eligible is False else "⏳"
                     qty = f" | الكمية المتاحة={result.quantity_used}" if result.quantity_used else ""
-                    price = f" | السعر={self.format_native_usdt(chain, result.mint_value_native, allow_network=True)}" if result.mint_value_native is not None else ""
+                    price = f" | السعر={result.mint_value_native} {native_symbol(chain)}" if result.mint_value_native is not None else ""
                     lines.append(f"{icon} {wallet.name}: {eligibility_label(result.status)}{qty}{price}")
                 lines.extend(["", f"🔗 رابط المنت (للنسخ):\n{self.mint_url(slug=slug, chain=chain, source=raw)}"])
                 return "\n".join(lines)[:3900]
@@ -2720,7 +2828,7 @@ class Bot(OfferControllerMixin):
             result = check_seadrop_eligibility(pool, wallet, contract, wallet.quantity)
             icon = "✅" if result.eligible is True else "❌" if result.eligible is False else "⏳"
             qty = f" | الكمية المتاحة={result.quantity_used}" if result.quantity_used else ""
-            price = f" | القيمة={self.format_native_usdt(chain, result.mint_value_native, allow_network=True)}" if result.mint_value_native is not None else ""
+            price = f" | القيمة={result.mint_value_native} {native_symbol(chain)}" if result.mint_value_native is not None else ""
             lines.append(f"{icon} {wallet.name}: {eligibility_label(result.status)}{qty}{price}")
         lines.extend(["", f"🔗 رابط المنت (للنسخ):\n{self.mint_url(slug=slug, chain=chain, source=raw, contract_address=contract)}"])
         return "\n".join(lines)[:3900]
@@ -2852,12 +2960,143 @@ class Bot(OfferControllerMixin):
             work.append((state, qty))
         return work
 
+    def _remember_low_balance(
+        self, state: WalletState, result: Any | None = None, detail: str | None = None
+    ) -> None:
+        """Remember only the minimum data needed to detect a later gas top-up."""
+        text = str(detail or getattr(result, "detail", "") or "")
+        have: int | None = None
+        need: int | None = None
+        patterns = (
+            r"\bhave\s+(\d+)\s+want\s+(\d+)",
+            r"wallet balance\s+(\d+)\s+wei\s*<[^0-9]+(\d+)\s+wei",
+            r"wallet balance\s+(\d+)\s+wei\s*<.*?requirement\s+(\d+)\s+wei",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                try:
+                    have, need = int(match.group(1)), int(match.group(2))
+                except Exception:
+                    have, need = None, None
+                break
+        if need is None and result is not None:
+            total_native = getattr(result, "total_max_native", None)
+            try:
+                if total_native is not None:
+                    need = int(Decimal(str(total_native)) * Decimal(10**18))
+            except Exception:
+                pass
+        if have is not None:
+            state.last_balance_wei = have
+        if need is not None and need > 0:
+            state.required_balance_wei = need
+        state.balance_recheck_at = time.time() + self.low_balance_recheck_seconds
+
+    @staticmethod
+    def _clear_low_balance_state(state: WalletState) -> None:
+        state.last_balance_wei = None
+        state.required_balance_wei = None
+        state.balance_recheck_at = 0.0
+
+    def _low_balance_recheck_loop(self) -> None:
+        """Wake stalled mint states as soon as native gas is topped up.
+
+        Reads are deduplicated by (chain,wallet), so ten blocked projects for the
+        same wallet still cost one balance RPC per recheck cycle. Nothing from
+        this thread is used by a healthy wallet's Race hot path.
+        """
+        log.info("Low-balance auto-resume ready | recheck=%.2fs | isolated=True", self.low_balance_recheck_seconds)
+        while not STOP:
+            if self.paused:
+                time.sleep(max(0.10, self.low_balance_recheck_seconds))
+                continue
+            now = time.time()
+            groups: dict[tuple[str, str], list[tuple[Candidate, WalletState]]] = {}
+            with self.candidates_lock:
+                snapshot = list(self.candidates.values())
+            for candidate in snapshot:
+                if candidate.done or candidate.chain not in self.rpc_pools:
+                    continue
+                for state in candidate.wallets.values():
+                    if state.submitted or state.final or state.status != "insufficient_balance":
+                        continue
+                    if state.balance_recheck_at and state.balance_recheck_at > now:
+                        continue
+                    groups.setdefault((candidate.chain, state.wallet.address.lower()), []).append((candidate, state))
+
+            if not groups:
+                time.sleep(max(0.10, self.low_balance_recheck_seconds))
+                continue
+
+            def read_balance(key: tuple[str, str]) -> tuple[tuple[str, str], int | None]:
+                chain, address = key
+                try:
+                    balance = int(self.rpc_pools[chain].primary.eth.get_balance(Web3.to_checksum_address(address)))
+                    return key, balance
+                except Exception:
+                    return key, None
+
+            futures = [self.balance_recheck_executor.submit(read_balance, key) for key in groups]
+            for future in as_completed(futures):
+                key, balance = future.result()
+                if balance is None:
+                    for _candidate, state in groups.get(key, []):
+                        state.balance_recheck_at = time.time() + self.low_balance_recheck_seconds
+                    continue
+                for candidate, state in groups.get(key, []):
+                    previous = state.last_balance_wei
+                    state.last_balance_wei = balance
+                    state.balance_recheck_at = time.time() + self.low_balance_recheck_seconds
+                    required = state.required_balance_wei
+                    # Normally we know the exact requirement from the failed
+                    # provider response/result. If a provider omitted it, a real
+                    # balance increase is still enough reason to rebuild once;
+                    # the fresh transaction/provider check remains authoritative.
+                    funded = (required is not None and balance >= required) or (
+                        previous is not None and balance > previous
+                    )
+                    if not funded:
+                        continue
+                    state.next_attempt = time.time()
+                    state.last_notified_status = ""
+                    state.status = "waiting"
+                    candidate.last_seen_auto = max(candidate.last_seen_auto, time.time())
+                    log.info(
+                        "Gas top-up detected | %s | %s | wallet=%s | balance=%s | required=%s",
+                        candidate.slug, candidate.chain, state.wallet.name, balance, required or "unknown",
+                    )
+                    # Throw away any prewarm signature made before the balance
+                    # recovery; the next launch rebuilds/rechecks nonce + fees.
+                    plan = self.current_plan_for_candidate(candidate) if candidate.stage_plans else None
+                    if plan:
+                        race_key = self._race_key(candidate, str(plan.get("key") or ""))
+                        with self.race_state_lock:
+                            self.race_prepared.pop(race_key, None)
+                    if (
+                        plan and plan.get("is_public") and candidate.contract_address and self.race_enabled
+                        and (not self.social_trust_required(candidate, plan) or candidate.social_trust_status == "passed")
+                    ):
+                        self._submit_scheduled_race(candidate, plan)
+            time.sleep(0.05)
+
+    def start_low_balance_recheck(self) -> None:
+        if self.low_balance_thread and self.low_balance_thread.is_alive():
+            return
+        self.low_balance_thread = threading.Thread(
+            target=self._low_balance_recheck_loop, name="low-balance-auto-resume", daemon=True
+        )
+        self.low_balance_thread.start()
+
     def notify_insufficient_balance(self, candidate: Candidate, state: WalletState, result: Any | None = None, detail: str | None = None) -> None:
         """Always alert when a mint cannot proceed because native funds are insufficient.
 
         This notification intentionally bypasses the routine monitoring/stage
         notification toggle. It is a transaction-safety alert, not dashboard noise.
         """
+        state.status = "insufficient_balance"
+        state.last_detail = str(detail or getattr(result, "detail", "") or "") or state.last_detail
+        self._remember_low_balance(state, result=result, detail=detail)
         alert_key = f"insufficient_balance:{state.stage_key or candidate.current_stage_key or 'mint'}"
         if state.last_notified_status == alert_key:
             return
@@ -2876,16 +3115,16 @@ class Bot(OfferControllerMixin):
             f"👛 المحفظة: {state.wallet.name} {short_address(state.wallet.address)}",
         ]
         if mint_value is not None:
-            lines.append(f"💰 قيمة المنت: {self.format_native_usdt(candidate.chain, mint_value, allow_network=False)}")
+            lines.append(f"💰 قيمة المنت: {mint_value} {symbol}")
         if gas_value is not None:
-            gas_line = "⛽ أقصى تقدير للغاز: " + self.format_native_usdt(
-                candidate.chain,
-                gas_value,
-                allow_network=False,
-                known_usdt=Decimal(str(gas_usd)) if gas_usd is not None else None,
-            )
+            gas_line = f"⛽ أقصى تقدير للغاز: {gas_value} {symbol}"
+            if gas_usd is not None:
+                gas_line += f" ≈ ${gas_usd:.4f}"
             lines.append(gas_line)
-        lines.append(f"⚠️ أضف رصيد {symbol} كافيًا لهذه المحفظة ثم سيعيد البوت المحاولة تلقائيًا إذا كانت المرحلة ما زالت مفتوحة.")
+        lines.append(
+            f"⚠️ أضف رصيد {symbol} لهذه المحفظة؛ يراقب البوت الرصيد تلقائيًا كل "
+            f"{self.low_balance_recheck_seconds:g}s تقريبًا، وأي تعبئة توقظ محاولة جديدة إذا كانت المرحلة ما زالت مفتوحة."
+        )
         if detail:
             lines.append(f"📝 السبب: {str(detail)[:350]}")
         lines.extend(["", self.mint_link_block(candidate)])
@@ -2902,6 +3141,7 @@ class Bot(OfferControllerMixin):
             state.last_detail = result.detail
             if result.ok:
                 submitted += 1
+                self._clear_low_balance_state(state)
                 state.submitted = True
                 state.final = False
                 state.pending_quantity = int(result.quantity_used or state.quantity or 1)
@@ -2926,19 +3166,8 @@ class Bot(OfferControllerMixin):
                     f"🌐 الشبكة: {chain_label(candidate.chain)}\n"
                     f"👛 المحفظة: {state.wallet.name} {short_address(state.wallet.address)}\n"
                     f"🔢 الكمية: {state.pending_quantity}\n"
-                    f"💰 القيمة: {self.format_native_usdt(candidate.chain, result.mint_value_native, allow_network=False)}\n"
-                    + (
-                        "⛽ أقصى تقدير: "
-                        + self.format_native_usdt(
-                            candidate.chain,
-                            result.gas_cost_native,
-                            allow_network=False,
-                            known_usdt=Decimal(str(result.gas_cost_usd)) if result.gas_cost_usd is not None else None,
-                        )
-                        + "\n"
-                        if result.gas_cost_native is not None
-                        else (f"⛽ أقصى تقدير: ≈ {result.gas_cost_usd:.4f} USDT\n" if result.gas_cost_usd is not None else "")
-                    )
+                    f"💰 القيمة: {result.mint_value_native} {native_symbol(candidate.chain)}\n"
+                    + (f"⛽ أقصى تقدير: ${result.gas_cost_usd:.4f}\n" if result.gas_cost_usd is not None else "")
                     + "\n" + self.mint_link_block(candidate)
                     + "\n\n🔎 المعاملة:\n" + explorer_tx_url(candidate.chain, result.tx_hash or "")
                 )
@@ -2992,6 +3221,7 @@ class Bot(OfferControllerMixin):
             static_gas_limit=self.race_static_gas_limit,
             skip_balance_check=False,
             clamp_fees_to_gas_budget=True,
+            allow_missing_usd_for_free=not paid,
         )
 
     def _prewarm_candidate_race(self, candidate: Candidate, plan: dict[str, Any]) -> None:
@@ -3046,7 +3276,10 @@ class Bot(OfferControllerMixin):
             with self.race_state_lock:
                 self.race_preparing.discard(key)
 
-    def _launch_candidate_race(self, candidate: Candidate, plan: dict[str, Any], *, live: bool = False, public_override: dict[str, Any] | None = None) -> None:
+    def _launch_candidate_race(
+        self, candidate: Candidate, plan: dict[str, Any], *, live: bool = False,
+        public_hint: dict[str, Any] | None = None,
+    ) -> None:
         launch_perf = time.perf_counter()
         if self.paused or not self.race_enabled or not candidate.contract_address:
             return
@@ -3067,11 +3300,13 @@ class Bot(OfferControllerMixin):
                 with self.race_state_lock:
                     bundle = self.race_prepared.pop(key, None)
             if bundle is None:
-                # V4.13 Ultra Race: reuse the public config already resolved by
-                # the fast signal instead of performing a duplicate RPC read.
-                public = public_override if public_override is not None else read_seadrop_public_fast(
-                    self.rpc_pools[candidate.chain].primary, candidate.contract_address
-                )
+                # A live Stream/SeaDrop signal already read this exact public
+                # config immediately before calling us. Reuse it to avoid a
+                # duplicate RPC round-trip in the hottest path. Scheduler/other
+                # callers still perform the normal fresh read when no hint exists.
+                public = dict(public_hint) if public_hint and public_hint.get("configured") else None
+                if public is None:
+                    public = read_seadrop_public_fast(self.rpc_pools[candidate.chain].primary, candidate.contract_address)
                 if not public or not public.get("configured"):
                     return
                 # A Stream event means the stage is already live; use one shared
@@ -3101,16 +3336,31 @@ class Bot(OfferControllerMixin):
                     fee_fields_override=self.race_fee_fields(candidate.chain, allow_network=False),
                     public_override=public,
                     allow_before_start=not live,
-                    # Free live launches use the already-configured conservative
-                    # Race gas limit, eliminating estimateGas from the hot path.
-                    # Paid live launches keep the existing estimate/confirmation path.
-                    static_gas_limit=(self.race_static_gas_limit if (not live or not paid) else None),
+                    static_gas_limit=None if live else self.race_static_gas_limit,
                     skip_balance_check=live,
                     clamp_fees_to_gas_budget=True,
+                    allow_missing_usd_for_free=not paid,
                 )
             if not bundle:
                 log.info("RACE skipped | %s | %s | no bundle", candidate.slug, candidate.chain)
                 return
+
+            # V4.13.1: scheduled bundles may have been signed several seconds
+            # before opening. Re-sign locally from the already-warmed fee cache
+            # when the fee cap moved upward. This performs no RPC/HTTP request,
+            # so the launch path stays fast while avoiding stale maxFee rejects.
+            if bundle.get("entries"):
+                warmed_fees = self.race_fee_fields(candidate.chain, allow_network=False)
+                if warmed_fees:
+                    try:
+                        bundle = refresh_seadrop_race_bundle_fees(
+                            bundle, warmed_fees,
+                            native_usd_price=self.race_native_usd_price(candidate.chain, allow_network=False),
+                            w3=self.rpc_pools[candidate.chain].primary,
+                        )
+                    except Exception as exc:
+                        log.debug("Race local fee refresh skipped %s: %s", candidate.slug, exc)
+
             # Final zero-cost guards immediately before broadcast. Pause must
             # stop Race just like the normal path, and social protection remains
             # a RAM check when already resolved.
@@ -3277,7 +3527,7 @@ class Bot(OfferControllerMixin):
                 if not self.social_protection_allows(candidate, plan):
                     log.debug("Fast free mint waiting for social trust | %s | %s", candidate.slug, chain)
                     return True
-                self._launch_candidate_race(candidate, plan, live=True, public_override=public)
+                self._launch_candidate_race(candidate, plan, live=True, public_hint=public)
                 log.info(
                     "Fast signal handled | source=%s | %s | %s | %.3fs",
                     source, candidate.slug, chain, time.perf_counter() - signal_perf,
@@ -4055,6 +4305,18 @@ class Bot(OfferControllerMixin):
             has_pending_receipt = any(s.submitted and not s.confirmed and not s.final for s in candidate.wallets.values())
             if has_pending_receipt:
                 continue
+            # A free mint that failed only because native gas was missing must
+            # stay alive while its Public stage is still open. The isolated
+            # balance watcher can then wake it immediately after a top-up even
+            # if no new OpenSea Stream event arrives.
+            has_low_balance = any(
+                s.status == "insufficient_balance" and not s.final and not s.submitted
+                for s in candidate.wallets.values()
+            )
+            if has_low_balance:
+                active = self.current_plan_for_candidate(candidate, now) if candidate.stage_plans else None
+                if active is not None:
+                    continue
             if candidate.watch_kind == "auto_stage":
                 # Multi-stage candidates are persistent until their final known
                 # stage ends; process_stage_schedule archives them.
@@ -4130,7 +4392,6 @@ class Bot(OfferControllerMixin):
         stage_key = str(plan.get("key") or "")
         if not force and stage_key in candidate.checked_stage_keys and now - candidate.last_qualification_check < self.qualification_recheck_seconds:
             return ""
-        was_checked = stage_key in candidate.checked_stage_keys
         candidate.last_qualification_check = now
         candidate.checked_stage_keys.add(stage_key)
         self.set_current_stage(candidate, plan)
@@ -4140,7 +4401,7 @@ class Bot(OfferControllerMixin):
         target_total = self.stage_target_total(candidate, plan)
         active_addresses = {w.address.lower() for w in self.store.list_wallets(enabled_only=True)}
         states = [s for s in candidate.wallets.values() if s.wallet.address.lower() in active_addresses]
-        is_recheck = was_checked and not force
+        is_recheck = stage_key in candidate.checked_stage_keys and not force
         if is_recheck:
             transient = {"unknown", "rate_limited", "preflight_error", "opensea_error", "seadrop_not_configured"}
             states = [s for s in states if s.eligibility in transient]
@@ -4150,7 +4411,6 @@ class Bot(OfferControllerMixin):
             f"🎟 فحص مرحلة — {candidate.slug}",
             f"المرحلة: {plan.get('label')} | {'عام' if plan.get('is_public') else 'تأهيل'}",
             f"الموعد: {format_ts(plan.get('start'), self.display_tz)} → {format_ts(plan.get('end'), self.display_tz)}",
-            f"السعر: {self.stage_price_display(candidate.chain, plan, allow_network=False)}",
             f"الحد المعلن/المحفظة: {plan.get('wallet_limit') or 'غير محدد'} | الهدف التلقائي: {target_total or 0}",
         ]
 
@@ -4199,7 +4459,7 @@ class Bot(OfferControllerMixin):
                         state.eligibility = status
                         state.mint_value_native = result.mint_value_native
                         icon = "✅" if result.eligible is True else "❌" if result.eligible is False else "⏳"
-                        value_text = "" if result.mint_value_native is None else f" | القيمة={self.format_native_usdt(candidate.chain, result.mint_value_native, allow_network=False)}"
+                        value_text = "" if result.mint_value_native is None else f" | القيمة={result.mint_value_native} {native_symbol(candidate.chain)}"
                         lines.append(
                             f"{icon} {state.wallet.name}: {eligibility_label(status)}"
                             f" | مكتسب={confirmed_total} | إضافي مطلوب={additional}"
@@ -4284,7 +4544,7 @@ class Bot(OfferControllerMixin):
         ]
         for idx, plan in enumerate(plans[:10], 1):
             kind = "🌍 Public" if plan.get("is_public") else "🎫 تأهيل"
-            price = ("🆓 " if plan.get("is_free") else "💳 " if plan.get("is_paid") else "") + self.stage_price_display(candidate.chain, plan, allow_network=False)
+            price = "🆓 مجاني" if plan.get("is_free") else ("💳 مدفوع" if plan.get("is_paid") else "❔ السعر غير معروف")
             lines.append(
                 f"{idx}. {kind} — {plan.get('label') or 'Mint'}\n"
                 f"   ⏰ {format_ts(plan.get('start'), self.display_tz)}\n"
@@ -4328,7 +4588,7 @@ class Bot(OfferControllerMixin):
         candidate.stage_open_notified_keys.add(stage_key)
         target = self.stage_target_total(candidate, plan)
         kind = "🌍 Public" if plan.get("is_public") else "🎫 مرحلة تأهيل"
-        price = ("🆓 " if plan.get("is_free") else "💳 " if plan.get("is_paid") else "") + self.stage_price_display(candidate.chain, plan, allow_network=False)
+        price = "🆓 مجاني" if plan.get("is_free") else ("💳 مدفوع" if plan.get("is_paid") else "❔ السعر غير معروف")
         action = (
             "سيتم التنفيذ تلقائيًا للمحافظ المؤهلة." if plan.get("is_free")
             else "سيتم فحص الأهلية بصمت وحفظ النتائج في قسم التأهيل."
@@ -4419,6 +4679,9 @@ class Bot(OfferControllerMixin):
                         state.final = False
                         state.confirmed = False
                         state.tx_hash = None
+                        state.status = "waiting"
+                        state.last_notified_status = ""
+                        self._clear_low_balance_state(state)
                         state.stage_key = candidate.current_stage_key
                         state.stage_label = candidate.current_stage_label
                         state.next_attempt = now
@@ -4433,6 +4696,8 @@ class Bot(OfferControllerMixin):
                         if state.wallet.address.lower() not in active_addresses or state.submitted:
                             continue
                         state.final = False
+                        state.status = "waiting"
+                        self._clear_low_balance_state(state)
                         state.eligibility = "public_open"
                         state.target_total = target_total
                         state.stage_key = candidate.current_stage_key
@@ -4477,37 +4742,74 @@ class Bot(OfferControllerMixin):
                     self.store.archive_qualification_project(self.project_key_for_candidate(candidate), reason)
                 candidate.done = True
 
-    def finalize_taken_project_if_ready(self, candidate: Candidate) -> None:
-        """Remove a completed final free Public from monitoring immediately."""
+    def maybe_complete_final_public(self, candidate: Candidate) -> bool:
+        """Archive a watched/qualification project once its final Public is resolved.
+
+        A successful final-Public mint should immediately leave Monitoring and
+        remain visible through the 24-hour mint history. We deliberately do not
+        archive while any active wallet is still recoverable (low balance, gas
+        budget, pending receipt, etc.), so a later top-up can still wake it.
+        """
+        if candidate.done or not candidate.stage_plans:
+            return bool(candidate.done)
+        final_plan = final_public_plan(candidate.stage_plans)
+        if not final_plan:
+            return False
         now = time.time()
-        current = self.current_plan_for_candidate(candidate, now)
-        if not current or not current.get("is_public") or current.get("is_paid"):
-            return
-        public_plans = [p for p in candidate.stage_plans if p.get("is_public")]
-        if not public_plans or str(current.get("key") or "") != str(public_plans[-1].get("key") or ""):
-            return
-        active = {w.address.lower() for w in self.store.list_wallets(enabled_only=True)}
-        target = self.stage_target_total(candidate, current)
-        states = [s for s in candidate.wallets.values() if s.wallet.address.lower() in active]
+        start = final_plan.get("start")
+        if start is not None and now < float(start):
+            return False
+        active_addresses = {
+            w.address.lower() for w in self.store.list_wallets(enabled_only=True)
+            if w.supports_chain(candidate.chain)
+        }
+        states = [s for a, s in candidate.wallets.items() if a.lower() in active_addresses]
         if not states:
-            return
+            return False
+        target_total = self.stage_target_total(candidate, final_plan)
         any_confirmed = False
         for state in states:
+            if state.submitted and not state.confirmed:
+                return False
             confirmed = self.confirmed_total_for_wallet(candidate, state.wallet.address)
-            any_confirmed = any_confirmed or confirmed > 0
-            if confirmed >= target:
+            state.confirmed_total = confirmed
+            if confirmed >= target_total > 0:
+                any_confirmed = True
                 continue
-            if state.submitted or not state.final:
-                return
+            detail_l = str(state.last_detail or "").lower()
+            terminal_onchain = state.status == "precondition_failed" and any(
+                marker in detail_l for marker in (
+                    "wallet already reached", "no on-chain supply remains", "sold out"
+                )
+            )
+            if terminal_onchain:
+                continue
+            # In particular, insufficient_balance/gas budget/error states stay
+            # alive so balance/gas recovery can trigger another attempt.
+            return False
         if not any_confirmed:
-            return
-        reason = "تم أخذ المرحلة Public الأخيرة للمحافظ النشطة"
-        if self.store.get_watch(candidate.slug):
-            self.store.remove_watch(candidate.slug, reason=reason)
+            # Sold-out-only projects may be archived by normal stage-end logic,
+            # but this immediate path is specifically for a final Public we took.
+            return False
+        reason = "تم تنفيذ/حسم المرحلة Public النهائية للمحافظ النشطة"
+        try:
+            if self.store.get_watch(candidate.slug):
+                self.store.remove_watch(candidate.slug, reason=reason)
+        except Exception:
+            pass
         if candidate.qualification_tracked:
-            self.store.archive_qualification_project(self.project_key_for_candidate(candidate), reason)
+            try:
+                self.store.archive_qualification_project(self.project_key_for_candidate(candidate), reason)
+            except Exception:
+                pass
         candidate.done = True
-        log.info("FINAL PUBLIC COMPLETE | %s | %s | moved to today's mints", candidate.slug, candidate.chain)
+        project_prefix = self.project_key_for_candidate(candidate) + ":"
+        with self.race_state_lock:
+            for key in list(self.race_prepared):
+                if key.startswith(project_prefix):
+                    self.race_prepared.pop(key, None)
+        log.info("FINAL PUBLIC COMPLETE | %s | %s | archived=True", candidate.slug, candidate.chain)
+        return True
 
     def prepare_state_after_receipt(self, candidate: Candidate, state: WalletState) -> None:
         state.submitted = False
@@ -4565,9 +4867,9 @@ class Bot(OfferControllerMixin):
                 state.eligibility = result.status
                 state.mint_value_native = result.mint_value_native
                 icon = "✅" if result.eligible is True else "❌" if result.eligible is False else "⏳"
-                price = "" if result.mint_value_native is None else f" | سعر المنت={self.format_native_usdt(candidate.chain, result.mint_value_native, allow_network=True)}"
+                price = "" if result.mint_value_native is None else f" | سعر المنت={result.mint_value_native} {native_symbol(candidate.chain)}"
                 qty = "" if not result.quantity_used else f" | الكمية المتاحة={result.quantity_used}"
-                bal = "" if balance is None else f" | الرصيد={self.format_native_usdt(candidate.chain, balance, native_places=6, allow_network=True)}"
+                bal = "" if balance is None else f" | الرصيد={balance:.6f}"
                 lines.append(
                     f"{icon} {state.wallet.name} {short_address(state.wallet.address)}: "
                     f"{eligibility_label(result.status)}{qty}{price}{bal}"
@@ -4610,8 +4912,8 @@ class Bot(OfferControllerMixin):
             "rate_limited": "⏳ OpenSea قيّدت الطلب مؤقتًا",
             "insufficient_balance": "💸 رصيد المحفظة غير كافٍ",
             "gas_too_high": "⛽ الغاز أعلى من الحد المضبوط",
-            "gas_usd_too_high": "💸 رسوم الشبكة أعلى من ميزانية الغاز بالـUSDT — سأنتظر انخفاضها",
-            "gas_price_unavailable": "⏳ تعذر حساب قيمة الغاز بالـUSDT مؤقتًا — لن أصرف بدون تحقق",
+            "gas_usd_too_high": "💸 رسوم الشبكة أعلى من ميزانية الغاز بالدولار — سأنتظر انخفاضها",
+            "gas_price_unavailable": "⏳ تعذر حساب سعر الغاز بالدولار مؤقتًا — لن أصرف بدون تحقق",
             "mint_price_too_high": "💰 سعر المنت أعلى من الحد المضبوط",
             "total_spend_too_high": "🛡 التكلفة الإجمالية أعلى من الحد المضبوط",
             "paid_not_allowed": "🔒 المنت المدفوع ممنوع حسب إعدادات البوت",
@@ -4760,11 +5062,7 @@ class Bot(OfferControllerMixin):
                 max_mint_price_native=candidate.max_mint_price_native, max_total_native=self.max_total_native,
                 allowed_targets=self.allowed_targets, paid_wallet_allowed=paid_selected,
                 max_gas_usd=self.max_gas_usd_for_chain(candidate.chain, candidate),
-                native_usd_price=(
-                    self.race_native_usd_price(candidate.chain, allow_network=False)
-                    if plan and plan.get("is_public") and not plan.get("is_paid")
-                    else self.native_usd_price_for_chain(candidate.chain)
-                ),
+                native_usd_price=self.native_usd_price_for_chain(candidate.chain),
             )
             if (candidate.mint_backend == "seadrop" or direct_public_seadrop) and candidate.contract_address:
                 return state, mint_seadrop_public(nft_contract=candidate.contract_address, **common)
@@ -4777,6 +5075,7 @@ class Bot(OfferControllerMixin):
                 state.status = result.status
                 state.last_detail = result.detail
                 if result.ok:
+                    self._clear_low_balance_state(state)
                     state.submitted = True
                     state.final = False
                     if result.quantity_used:
@@ -4811,14 +5110,9 @@ class Bot(OfferControllerMixin):
                         f"🌐 الشبكة: {chain_label(candidate.chain)}\n"
                         f"👛 المحفظة: {state.wallet.name} {short_address(state.wallet.address)}\n"
                         f"🔢 الكمية: {state.pending_quantity}\n"
-                        f"💰 قيمة المنت: {self.format_native_usdt(candidate.chain, result.mint_value_native, allow_network=False)}\n"
-                        "⛽ أقصى تقدير للغاز: "
-                        + self.format_native_usdt(
-                            candidate.chain,
-                            result.gas_cost_native,
-                            allow_network=False,
-                            known_usdt=Decimal(str(result.gas_cost_usd)) if result.gas_cost_usd is not None else None,
-                        )
+                        f"💰 قيمة المنت: {result.mint_value_native} {native_symbol(candidate.chain)}\n"
+                        f"⛽ أقصى تقدير للغاز: {result.gas_cost_native} {native_symbol(candidate.chain)}"
+                        + (f" ≈ ${result.gas_cost_usd:.4f}" if result.gas_cost_usd is not None else "")
                         + "\n\n"
                         + self.mint_link_block(candidate)
                         + "\n\n🔎 المعاملة:\n" + str(url)
@@ -4912,7 +5206,7 @@ class Bot(OfferControllerMixin):
                     + "\n\n🔎 المعاملة:\n" + explorer_tx_url(candidate.chain, state.tx_hash)
                 )
                 self.prepare_state_after_receipt(candidate, state)
-                self.finalize_taken_project_if_ready(candidate)
+                self.maybe_complete_final_public(candidate)
             else:
                 failed_hash = state.tx_hash
                 self.store.record_mint(
@@ -4997,10 +5291,10 @@ class Bot(OfferControllerMixin):
         ink = self.max_gas_usd_for_chain("ink")
         rh = self.max_gas_usd_for_chain("robinhood")
         return [
-            [(f"⛽ عام {self.max_gas_usd} USDT", "gas_set:global")],
-            [(f"Ξ Ethereum {eth} USDT", "gas_set:ethereum"), ("↩️ عام", "gas_inherit:ethereum")],
-            [(f"🟣 Ink {ink} USDT", "gas_set:ink"), ("↩️ عام", "gas_inherit:ink")],
-            [(f"🟢 Robinhood {rh} USDT", "gas_set:robinhood"), ("↩️ عام", "gas_inherit:robinhood")],
+            [(f"⛽ عام ${self.max_gas_usd}", "gas_set:global")],
+            [(f"Ξ Ethereum ${eth}", "gas_set:ethereum"), ("↩️ عام", "gas_inherit:ethereum")],
+            [(f"🟣 Ink ${ink}", "gas_set:ink"), ("↩️ عام", "gas_inherit:ink")],
+            [(f"🟢 Robinhood ${rh}", "gas_set:robinhood"), ("↩️ عام", "gas_inherit:robinhood")],
             [("🔥 استثناء منت من حد الغاز", "gas_project_add")],
             [("📋 استثناءات الغاز", "gas_project_list")],
             [(f"💰 Offers: Top + {self.offer_top_increment_usdt} USDT", "offer_settings")],
@@ -5013,7 +5307,7 @@ class Bot(OfferControllerMixin):
         token = self.candidate_token(candidate)
         return [
             [("🔥 بدون حد لهذا المنت", f"gpi:{token}")],
-            [("⛽ حد خاص بالـUSDT", f"gpc:{token}")],
+            [("⛽ حد خاص بالدولار", f"gpc:{token}")],
             [("🛡 استخدام حد الشبكة", f"gpr:{token}")],
             [("↩️ الإعدادات", "settings")],
         ]
@@ -5041,7 +5335,7 @@ class Bot(OfferControllerMixin):
         total = len(self.store.list_wallets(enabled_only=False))
         self.telegram.send(
             chat_id,
-            "🤖 OpenSea Mint Guardian V4.13.0\n\n"
+            "🤖 OpenSea Mint Guardian V4.13.1\n\n"
             "🆓 الاكتشاف المجاني: Stream لحظي + SeaDrop مباشر + REST احتياطي\n"
             f"⚡ الاستعداد للـPublic: آخر {self.public_preopen_window_seconds:g} ثوانٍ\n"
             f"📦 سياسة الكمية: حد المنت ≤100 يؤخذ كما هو، وإذا كان >100/غير محدود فالهدف {self.auto_stage_high_limit_quantity}\n"
@@ -5070,17 +5364,59 @@ class Bot(OfferControllerMixin):
                 f"  {status} | الكمية={wallet.quantity}\n"
                 f"  {short_address(wallet.address)}"
             )
-        lines.append("\nاضغط «💰 عرض الرصيد» لرؤية رصيد كل محفظة على كل شبكة بالعملة الأصلية ومعادل USDT، أو اضغط اسم المحفظة لإدارتها.")
+        lines.append("\nاضغط على اسم أي محفظة لإدارتها.")
         return "\n".join(lines)[:3900]
 
     def wallet_list_buttons(self) -> list[list[tuple[str, str]]]:
-        rows: list[list[tuple[str, str]]] = []
+        rows: list[list[tuple[str, str]]] = [[("💰 عرض الأرصدة الآن", "wallet_balances")]]
         for wallet in self.all_stored_wallets()[:30]:
             icon = "🟢" if wallet.enabled else "🔴"
             rows.append([(f"{icon} {wallet.name}", f"wv:{wallet.id}")])
-        rows.append([("💰 عرض الرصيد", "wallet_balances")])
         rows.append([("➕ إضافة محفظة", "add_wallet"), ("↩️ القائمة الرئيسية", "menu")])
         return rows
+
+    def wallet_balances_text(self) -> str:
+        """Manual-only live balance view; never called from Race/discovery loops."""
+        wallets = self.all_stored_wallets()
+        if not wallets:
+            return "👛 لا توجد محافظ مضافة بعد."
+        prices: dict[str, Decimal | None] = {}
+        for chain in self.enabled_chains:
+            symbol = native_symbol(chain)
+            if symbol not in prices:
+                try:
+                    prices[symbol] = self.price_oracle.get_usd(symbol)
+                except Exception:
+                    prices[symbol] = self.price_oracle.peek_usd(symbol)
+        lines = ["💰 الأرصدة الحالية للمحافظ", "", "🔄 القراءة مباشرة عند الضغط — لا تُستخدم كاشًا لمنع الـMint."]
+        for wallet in wallets:
+            lines.append(f"\n{'🟢' if wallet.enabled else '🔴'} {wallet.name} {short_address(wallet.address)}")
+            supported = {normalize_chain(x) for x in wallet.chains} if wallet.chains else set()
+            shown = False
+            for chain in self.enabled_chains:
+                if supported and normalize_chain(chain) not in supported:
+                    continue
+                pool = self.rpc_pools.get(chain)
+                if not pool:
+                    continue
+                shown = True
+                try:
+                    balance = pool.balance_native(wallet.address)
+                    symbol = native_symbol(chain)
+                    usd = prices.get(symbol)
+                    equivalent = f" ≈ ${balance * usd:.4f} USDT" if usd is not None else ""
+                    lines.append(f"• {chain_label(chain)}: {balance:.8f} {symbol}{equivalent}")
+                except Exception as exc:
+                    lines.append(f"• {chain_label(chain)}: تعذر قراءة الرصيد ({str(exc)[:80]})")
+            if not shown:
+                lines.append("• لا توجد شبكة مفعلة لهذه المحفظة")
+        return "\n".join(lines)[:3900]
+
+    def wallet_balances_buttons(self) -> list[list[tuple[str, str]]]:
+        return [
+            [("🔄 تحديث الأرصدة", "wallet_balances")],
+            [("↩️ المحافظ", "wallets"), ("🏠 الرئيسية", "menu")],
+        ]
 
     def wallet_detail_text(self, wallet_id: int) -> str:
         wallet = self.store.get_wallet_by_id(wallet_id)
@@ -5102,7 +5438,7 @@ class Bot(OfferControllerMixin):
                 continue
             try:
                 balance = pool.balance_native(wallet.address)
-                lines.append(f"• {chain_label(chain)}: {self.format_native_usdt(chain, balance, native_places=8, allow_network=True)}")
+                lines.append(f"• {chain_label(chain)}: {balance:.8f} {native_symbol(chain)}")
             except Exception:
                 lines.append(f"• {chain_label(chain)}: تعذر قراءة الرصيد")
         return "\n".join(lines)[:3900]
@@ -5114,100 +5450,11 @@ class Bot(OfferControllerMixin):
         toggle = "⏸ إيقاف المحفظة" if wallet.enabled else "▶️ تشغيل المحفظة"
         return [
             [(toggle, f"wt:{wallet.id}")],
-            [("💰 عرض الرصيد", f"wallet_balance:{wallet.id}")],
+            [("🔄 تحديث الرصيد", f"wbr:{wallet.id}")],
             [("✏️ تغيير الاسم", f"wr:{wallet.id}"), ("🔢 تغيير الكمية", f"wq:{wallet.id}")],
             [("🗑 حذف المحفظة", f"wd:{wallet.id}")],
             [("↩️ المحافظ", "wallets"), ("🏠 الرئيسية", "menu")],
         ]
-
-    def wallet_balances_snapshot_text(self, wallet_id: int | None = None) -> str:
-        wallets = (
-            [self.store.get_wallet_by_id(wallet_id)]
-            if wallet_id is not None
-            else self.all_stored_wallets()
-        )
-        wallets = [w for w in wallets if w is not None]
-        if not wallets:
-            return "👛 لا توجد محافظ متاحة لعرض الرصيد."
-
-        # One price lookup per native symbol, not per wallet.
-        prices: dict[str, Decimal | None] = {}
-        for chain in self.enabled_chains:
-            symbol = native_symbol(chain)
-            if symbol in prices:
-                continue
-            try:
-                prices[symbol] = self.native_usd_price_for_chain(chain)
-            except Exception:
-                prices[symbol] = self.price_oracle.peek_usd(symbol, max_age_seconds=3600)
-
-        jobs: list[tuple[Any, str]] = []
-        for wallet in wallets:
-            allowed = {normalize_chain(x) for x in wallet.chains} if wallet.chains else set()
-            for chain in self.enabled_chains:
-                if allowed and normalize_chain(chain) not in allowed:
-                    continue
-                if chain in self.rpc_pools:
-                    jobs.append((wallet, chain))
-
-        results: dict[tuple[int, str], tuple[Decimal | None, str | None]] = {}
-        def read_one(item: tuple[Any, str]):
-            wallet, chain = item
-            try:
-                return wallet.id, chain, self.rpc_pools[chain].balance_native(wallet.address), None
-            except Exception as exc:
-                return wallet.id, chain, None, str(exc)[:120]
-
-        if jobs:
-            with ThreadPoolExecutor(max_workers=min(max(1, len(jobs)), 12)) as executor:
-                futures = [executor.submit(read_one, item) for item in jobs]
-                for future in as_completed(futures):
-                    wid, chain, balance, error = future.result()
-                    results[(int(wid), chain)] = (balance, error)
-
-        lines = ["💰 أرصدة المحافظ", "💵 USDT = القيمة التقريبية لرصيد عملة الشبكة", ""]
-        for wallet in wallets:
-            status = "🟢" if wallet.enabled else "🔴"
-            lines.extend([f"{status} 👛 {wallet.name}", f"{short_address(wallet.address)}"])
-            shown = 0
-            for chain in self.enabled_chains:
-                key = (int(wallet.id), chain)
-                if key not in results:
-                    continue
-                shown += 1
-                balance, error = results[key]
-                if balance is None:
-                    lines.append(f"• {chain_label(chain)}: ⚠️ تعذر قراءة الرصيد")
-                    continue
-                symbol = native_symbol(chain)
-                price = prices.get(symbol)
-                usdt = (balance * price) if price is not None else (Decimal("0") if balance == 0 else None)
-                native_text = f"{self._fmt_decimal(balance, 8)} {symbol}"
-                usdt_text = (
-                    f"≈ {self._fmt_decimal(usdt, 4)} USDT"
-                    if usdt is not None
-                    else "≈ غير متاح USDT"
-                )
-                lines.append(f"• {chain_label(chain)}: {native_text} ({usdt_text})")
-            if shown == 0:
-                lines.append("• لا توجد شبكة مفعلة لهذه المحفظة")
-            lines.append("")
-        return "\n".join(lines)[:3900]
-
-    def _wallet_balances_worker(self, chat_id: str, message_id: int = 0, wallet_id: int | None = None) -> None:
-        try:
-            text = self.wallet_balances_snapshot_text(wallet_id)
-        except Exception as exc:
-            text = f"⚠️ تعذر جلب الأرصدة: {str(exc)[:700]}"
-        buttons = (
-            [[("🔄 تحديث الرصيد", f"wallet_balance:{wallet_id}")], [("↩️ المحفظة", f"wv:{wallet_id}"), ("🏠 الرئيسية", "menu")]]
-            if wallet_id is not None
-            else [[("🔄 تحديث الأرصدة", "wallet_balances")], [("↩️ المحافظ", "wallets"), ("🏠 الرئيسية", "menu")]]
-        )
-        if message_id:
-            self.telegram.edit(chat_id, message_id, text, buttons)
-        else:
-            self.telegram.send(chat_id, text, buttons)
 
     def chains_text(self) -> str:
         lines = ["🌐 حالة الشبكات"]
@@ -5269,7 +5516,7 @@ class Bot(OfferControllerMixin):
             f"📦 سياسة الكمية: حد ≤{self.auto_stage_high_limit_threshold} كهدف؛ أعلى/غير محدود = {self.auto_stage_high_limit_quantity}\n"
             f"💳 Public المدفوع: موافقة + محافظ + كمية لكل محفظة\n"
             f"🛡 حماية Free Mint: {'مفعلة — يشترط X أو Website للمنت التلقائي بدون تأهيل' if self.free_social_protection_enabled else 'متوقفة — يأخذ جميع Free Mints كما في V4.10.1'}\n"
-            f"⛽ الحد العام: {self.max_gas_usd} USDT | Ethereum={self.max_gas_usd_for_chain('ethereum')} USDT | Ink={self.max_gas_usd_for_chain('ink')} USDT | Robinhood={self.max_gas_usd_for_chain('robinhood')} USDT\n"
+            f"⛽ الحد العام: ${self.max_gas_usd} | Ethereum=${self.max_gas_usd_for_chain('ethereum')} | Ink=${self.max_gas_usd_for_chain('ink')} | Robinhood=${self.max_gas_usd_for_chain('robinhood')}\n"
             f"💸 تنبيه نقص رصيد الغاز: مفعّل دائمًا | إعادة المحاولة كل {self.low_balance_retry_seconds:g}s\n"
             f"🔕 إشعارات المراقبة/التأهيل التلقائية: {'مفعلة' if self.routine_stage_notifications else 'متوقفة'}\n"
             f"🧠 Gas strategy: {self.gas_strategy} | Buffer={self.gas_limit_buffer}\n"
@@ -5286,18 +5533,9 @@ class Bot(OfferControllerMixin):
             ts = format_ts(float(row["created_at"]), self.display_tz)
             label = status_labels.get(str(row["status"]), str(row["status"]))
             url = self.row_mint_url(row)
-            chain = str(row.get("chain") or "")
-            value_line = ""
-            if row.get("mint_value_native") not in (None, ""):
-                value_line = "💰 القيمة: " + self.format_native_usdt(chain, row.get("mint_value_native"), allow_network=False)
-            gas_line = ""
-            if row.get("gas_max_native") not in (None, ""):
-                gas_line = "⛽ أقصى غاز: " + self.format_native_usdt(chain, row.get("gas_max_native"), allow_network=False)
             lines.extend([
                 f"{label} — {row['slug']}",
-                f"🌐 {chain_label(chain)} | 👛 {row['wallet_name']}",
-                *([value_line] if value_line else []),
-                *([gas_line] if gas_line else []),
+                f"🌐 {chain_label(str(row.get('chain') or ''))} | 👛 {row['wallet_name']}",
                 f"🕒 {ts}",
                 f"🔗 {url}" + (f"\n🔎 TX: {row['tx_hash']}" if row.get("tx_hash") else ""),
                 "",
@@ -5318,7 +5556,6 @@ class Bot(OfferControllerMixin):
             lines.extend([
                 f"✅ {row.get('slug')}",
                 f"🌐 الشبكة: {chain_label(str(row.get('chain') or ''))}",
-                f"💰 السعر: {self.format_native_usdt(str(row.get('chain') or ''), Decimal('0'), allow_network=False)}",
                 f"🔢 الكمية الإجمالية: {int(row.get('total_quantity') or 0)}",
                 f"👛 المحافظ: {int(row.get('wallet_count') or 0)} — {wallet_text or 'غير معروف'}",
                 f"🕒 آخر تأكيد: {format_ts(float(row.get('last_confirmed_at') or 0), self.display_tz)}",
@@ -5373,7 +5610,6 @@ class Bot(OfferControllerMixin):
                 lines.extend([
                     f"  {mode} — {plan.get('label')}",
                     f"  ⏰ {format_ts(plan.get('start'), self.display_tz)}",
-                    f"  💰 السعر: {self.stage_price_display(str(row['chain']), plan, allow_network=True)}",
                     f"  👛 المؤهلة: {eligible_text}",
                 ])
             lines.append("")
@@ -5545,7 +5781,8 @@ class Bot(OfferControllerMixin):
         return (
             f"💳 {candidate.slug}\n"
             f"🌐 {chain_label(candidate.chain)}\n"
-            f"💰 السعر: {native_text} ({usdt_text})\n"
+            f"💰 السعر: {native_text}\n"
+            f"💵 التقريبي: {usdt_text}\n"
             f"⏰ الفتح: {open_text}\n"
             f"📌 الحالة: {decision}\n"
             f"🔗 {self.candidate_mint_url(candidate)}"
@@ -5596,7 +5833,8 @@ class Bot(OfferControllerMixin):
             f"المشروع: {candidate.slug}\n"
             f"الشبكة: {chain_label(candidate.chain)}\n"
             f"وقت الفتح: {open_text}\n"
-            f"السعر: {native_price} ({usdt_price})\n"
+            f"السعر: {native_price}\n"
+            f"القيمة التقريبية: {usdt_price}\n"
             f"أقصى كمية اختيارية/محفظة لهذه المرحلة: {self.paid_quantity_cap(candidate)}\n"
             f"سياسة الغاز: {self.project_gas_policy_text(candidate)}\n\n"
             "اختر المحافظ، ثم اضغط زر الكمية بجانب كل محفظة وأدخل الكمية المطلوبة.\n"
@@ -5675,7 +5913,7 @@ class Bot(OfferControllerMixin):
         data = event.get("data", "")
         self.telegram.answer_callback(event.get("callback_id", ""))
 
-        # V4.12.2 Offer callbacks are fully isolated in OfferControllerMixin.
+        # V4.12.0 Offer callbacks are fully isolated in OfferControllerMixin.
         # Delegate only explicit Offer callback prefixes/actions; Race callbacks
         # and all previous Mint/Race behavior continues below unchanged.
         if self.handle_offer_callback(event):
@@ -5705,30 +5943,15 @@ class Bot(OfferControllerMixin):
             return
 
         if data == "wallet_balances":
-            self.edit_or_send(event, "⏳ جارٍ قراءة أرصدة جميع المحافظ والشبكات…", [[("↩️ المحافظ", "wallets")]])
-            self.wallet_balance_executor.submit(
-                self._wallet_balances_worker,
-                chat_id,
-                int(event.get("message_id", 0) or 0),
-                None,
-            )
+            self.edit_or_send(event, self.wallet_balances_text(), self.wallet_balances_buttons())
             return
 
-        if data.startswith("wallet_balance:"):
+        if data.startswith("wbr:"):
             try:
                 wallet_id = int(data.split(":", 1)[1])
             except ValueError:
                 return
-            if not self.store.get_wallet_by_id(wallet_id):
-                self.telegram.send(chat_id, "⚠️ لم يتم العثور على المحفظة.")
-                return
-            self.edit_or_send(event, "⏳ جارٍ قراءة رصيد المحفظة على الشبكات المفعلة…", [[("↩️ المحفظة", f"wv:{wallet_id}")]])
-            self.wallet_balance_executor.submit(
-                self._wallet_balances_worker,
-                chat_id,
-                int(event.get("message_id", 0) or 0),
-                wallet_id,
-            )
+            self.edit_or_send(event, self.wallet_detail_text(wallet_id), self.wallet_detail_buttons(wallet_id))
             return
 
         if data.startswith("wv:"):
@@ -5930,7 +6153,7 @@ class Bot(OfferControllerMixin):
             self.telegram.send(
                 chat_id,
                 f"⛽ حد غاز خاص — {candidate.slug}\n\n"
-                "أرسل الحد بالـUSDT مثل 0.15 أو 0.50.\n"
+                "أرسل الحد بالدولار مثل 0.15 أو 0.50.\n"
                 "هذا الحد سيطبق على هذا المنت فقط ويُحفظ بعد Restart/Redeploy.\n\nأرسل /cancel للإلغاء.",
             )
             return
@@ -5943,7 +6166,7 @@ class Bot(OfferControllerMixin):
             self.store.delete_setting(f"gas_usd_{chain}")
             self.edit_or_send(
                 event,
-                f"✅ {chain_label(chain)} عاد لاستخدام الحد العام: {self.max_gas_usd} USDT\n\n" + self.settings_text(),
+                f"✅ {chain_label(chain)} عاد لاستخدام الحد العام: ${self.max_gas_usd}\n\n" + self.settings_text(),
                 self.settings_buttons(),
             )
             return
@@ -5957,8 +6180,8 @@ class Bot(OfferControllerMixin):
             current = self.max_gas_usd if target == "global" else self.max_gas_usd_for_chain(normalize_chain(target))
             self.telegram.send(
                 chat_id,
-                f"⛽ تعديل حد الغاز — {target}\n\nالقيمة الحالية: {current} USDT\n"
-                "أرسل الحد الجديد بالـUSDT مثل 0.08 أو 0.25.\n"
+                f"⛽ تعديل حد الغاز — {target}\n\nالقيمة الحالية: ${current}\n"
+                "أرسل الحد الجديد بالدولار مثل 0.08 أو 0.25.\n"
                 "القيمة 0 تعني بدون حد، لذلك استخدمها فقط إذا كنت تقبل أي رسوم.\n\nأرسل /cancel للإلغاء.",
             )
             return
@@ -6326,14 +6549,14 @@ class Bot(OfferControllerMixin):
                 self.pending_gas_setting.pop(chat_id, None)
                 self.telegram.send(chat_id, "انتهت مهلة تعديل حد الغاز.", self.settings_buttons())
                 return
-            raw = text.upper().replace("USDT", "").replace("$", "").strip()
+            raw = text.replace("$", "").strip()
             try:
                 value = Decimal(raw)
             except (InvalidOperation, ValueError):
                 self.telegram.send(chat_id, "⚠️ أرسل رقمًا صحيحًا مثل 0.08 أو 0.25، أو /cancel.")
                 return
             if value < 0 or value > Decimal("1000"):
-                self.telegram.send(chat_id, "⚠️ الحد يجب أن يكون بين 0 و1000 USDT.")
+                self.telegram.send(chat_id, "⚠️ الحد يجب أن يكون بين 0 و1000 دولار.")
                 return
             target = str(pending_gas.get("target") or "global")
             if target == "project":
@@ -6346,13 +6569,13 @@ class Bot(OfferControllerMixin):
                 self.pending_gas_setting.pop(chat_id, None)
                 self.telegram.send(
                     chat_id,
-                    f"✅ تم حفظ حد غاز خاص لـ {candidate.slug}: {value} USDT\n\n" + self.mint_link_block(candidate),
+                    f"✅ تم حفظ حد غاز خاص لـ {candidate.slug}: ${value}\n\n" + self.mint_link_block(candidate),
                     self.gas_project_policy_buttons(candidate),
                 )
                 return
             self.save_gas_cap(target, value)
             self.pending_gas_setting.pop(chat_id, None)
-            self.telegram.send(chat_id, f"✅ تم حفظ حد الغاز لـ {target}: {value} USDT", self.settings_buttons())
+            self.telegram.send(chat_id, f"✅ تم حفظ حد الغاز لـ {target}: ${value}", self.settings_buttons())
             return
 
         pending_gas_project = self.pending_gas_project.get(chat_id)
@@ -6373,7 +6596,7 @@ class Bot(OfferControllerMixin):
                 f"الحالي: {self.project_gas_policy_text(candidate)}\n\n"
                 "اختر السياسة المطلوبة لهذا المنت فقط:\n"
                 "• بدون حد: للفرص التي تريدها حتى مع رسوم مرتفعة.\n"
-                "• حد خاص: رقم بالـUSDT لهذا المنت.\n"
+                "• حد خاص: رقم بالدولار لهذا المنت.\n"
                 "• حد الشبكة: العودة للإعداد العام.\n\n"
                 + self.mint_link_block(candidate),
                 self.gas_project_policy_buttons(candidate),
@@ -6696,41 +6919,10 @@ class Bot(OfferControllerMixin):
         for chat_id in self.telegram.allowed_chat_ids:
             self.telegram.send(chat_id, text)
 
-    def _maintenance_loop(self) -> None:
-        """Low-priority cleanup isolated from Main Loop and Race Lane."""
-        while not STOP:
-            try:
-                stats = self.store.purge_runtime_history(older_than_hours=self.history_retention_hours)
-                now = time.time()
-                with self.race_signal_lock:
-                    self.race_signal_stage_cache = {
-                        k: v for k, v in self.race_signal_stage_cache.items()
-                        if now - float(v.get("seen_at") or v.get("updated_at") or now) < 3600
-                    }
-                    self.race_signal_pending = {
-                        k: v for k, v in self.race_signal_pending.items()
-                        if now - float(v.get("queued_at") or now) < 120
-                    }
-                with self.race_market_lock:
-                    self.race_fee_cache = {k:v for k,v in self.race_fee_cache.items() if now-float(v[0]) < 300}
-                if any(stats.values()):
-                    log.info("Maintenance cleanup | %s", stats)
-            except Exception as exc:
-                log.debug("Maintenance cleanup failed: %s", exc)
-            deadline=time.time()+self.cache_cleanup_seconds
-            while not STOP and time.time()<deadline:
-                time.sleep(min(5.0,max(0.05,deadline-time.time())))
-
-    def start_maintenance_worker(self) -> None:
-        if self.maintenance_thread and self.maintenance_thread.is_alive():
-            return
-        self.maintenance_thread=threading.Thread(target=self._maintenance_loop,name="low-priority-maintenance",daemon=True)
-        self.maintenance_thread.start()
-
     # ---------- main loop ----------
     def run(self) -> None:
         start_health_server()
-        log.info("Mint Guardian V4.13.0 Ultra Race starting")
+        log.info("Mint Guardian V4.13.1 starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
@@ -6741,7 +6933,8 @@ class Bot(OfferControllerMixin):
         # Start market snapshots before discovery. It runs independently and
         # keeps price/fee data hot for the race lane.
         self.start_race_market_warmer()
-        self.start_maintenance_worker()
+        self.start_low_balance_recheck()
+        self.start_maintenance()
         self.start_race_scheduler()
         self.start_seadrop_log_discovery()
         self.start_auto_free_discovery()
@@ -6763,8 +6956,8 @@ class Bot(OfferControllerMixin):
             self.seadrop_wss_enabled, self.race_fee_refresh_seconds, self.race_gas_strategy,
         )
         log.info(
-            "ULTRA RACE ready | prewarm=%.2fs | public-reuse=True | free-live-static-gas=True | duplicate-stage-RPC=0",
-            self.race_prewarm_seconds,
+            "ULTRA RACE V4.13.1 ready | prewarm=%.2fs | fee-refresh=%.2fs | low-balance-recheck=%.2fs | live-fee-retry=True | history=24h",
+            self.race_prewarm_seconds, self.race_fee_refresh_seconds, self.low_balance_recheck_seconds,
         )
         log.info(
             "Race signal coalescer ready | single-flight=True | stream-quiet=%.2fs | seadrop-quiet=%.2fs | unknown-quiet=%.2fs",
@@ -6778,7 +6971,7 @@ class Bot(OfferControllerMixin):
         )
         log.info("Collection Offers ready | isolated-executor=True | main-loop-polling=False | Race-hooks=0")
         self.notify_all(
-            "🟢 OpenSea Mint Guardian V4.13.0 يعمل الآن على Railway.\n"
+            "🟢 OpenSea Mint Guardian V4.13.1 يعمل الآن على Railway.\n"
             f"الاكتشاف التلقائي: {'مفعّل كل ' + format(self.auto_free_scan_seconds, 'g') + ' ثانية' if self.auto_free_enabled else 'متوقف'}.\n"
             f"OpenSea Stream: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} | REST Mint Events: {'مفعّل' if self.auto_event_fallback_enabled else 'متوقف'}.\n"
             f"التأهيل/المراقبة: تعمل بصمت وتظهر تفاصيلها عند فتح الأقسام.\n"

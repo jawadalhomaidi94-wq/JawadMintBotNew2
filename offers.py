@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""OpenSea Collection Offer subsystem for Mint Guardian V4.12.2.
+"""OpenSea Collection Offer subsystem for Mint Guardian V4.12.0.
 
 This module is intentionally isolated from the mint Race Lane.  Nothing here is
 called from the main candidate loop, Stream handler, SeaDrop WSS worker, or Race
@@ -395,7 +395,7 @@ class CollectionOfferService:
                 if gas_cost_usd is None:
                     return ApprovalResult(False, "gas_price_unavailable", detail="USD gas cap enabled but native/USD price unavailable", gas_cost_native=gas_cost_native)
                 if gas_cost_usd > max_gas_usd:
-                    return ApprovalResult(False, "gas_usd_too_high", detail=f"Approval gas {gas_cost_usd:.6f} USDT > cap {max_gas_usd} USDT", gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd)
+                    return ApprovalResult(False, "gas_usd_too_high", detail=f"Approval gas ${gas_cost_usd:.6f} > cap ${max_gas_usd}", gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd)
             balance_native = int(pool.primary.eth.get_balance(owner))
             if balance_native < gas_cost_wei:
                 return ApprovalResult(False, "insufficient_native_gas", detail="Native balance is insufficient for Approval gas", gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd)
@@ -594,9 +594,9 @@ class CollectionOfferService:
             )
             check = self.funding_check(chain, wallet, commitment_wei)
             if not check.balance_ok:
-                return OfferCreateResult(False, "insufficient_weth", total_weth=total_weth, detail=f"WETH balance {check.weth_balance} (≈ {check.weth_balance * eth_usd} USDT) < fee-inclusive requirement {commitment_weth} WETH (≈ {commitment_weth * eth_usd} USDT)")
+                return OfferCreateResult(False, "insufficient_weth", total_weth=total_weth, detail=f"WETH balance {check.weth_balance} < fee-inclusive requirement {commitment_weth}")
             if not check.approval_ok:
-                return OfferCreateResult(False, "approval_required", total_weth=total_weth, detail=f"WETH allowance {check.allowance} (≈ {check.allowance * eth_usd} USDT) < fee-inclusive requirement {commitment_weth} WETH (≈ {commitment_weth * eth_usd} USDT)")
+                return OfferCreateResult(False, "approval_required", total_weth=total_weth, detail=f"WETH allowance {check.allowance} < fee-inclusive requirement {commitment_weth}")
 
             components, criteria, _build = self.build_order_components(
                 chain=chain,
@@ -804,7 +804,7 @@ class OfferControllerMixin:
             scoped_token=os.getenv("OPENSEA_SCOPED_TOKEN", "").strip(),
         )
         log.info(
-            "Offer subsystem V4.12.2 ready | api-workers=%s | sign-workers=%s | top_increment=%s USDT | duration=%sh | loop-hooks=0",
+            "Offer subsystem V4.12.0 ready | api-workers=%s | sign-workers=%s | top_increment=%s USDT | duration=%sh | loop-hooks=0",
             workers, sign_workers, self.offer_top_increment_usdt, self.offer_duration_hours,
         )
 
@@ -1071,7 +1071,7 @@ class OfferControllerMixin:
 
             eth_usd = self.offer_service.eth_usd()
             if eth_usd is None or eth_usd <= 0:
-                self.telegram.send(chat_id, "⚠️ تعذر جلب ETH/USDT، ولن يتم حساب أو توقيع Offer بدون سعر تحويل حديث.")
+                self.telegram.send(chat_id, "⚠️ تعذر جلب ETH/USD، ولن يتم حساب أو توقيع Offer بدون سعر تحويل حديث.")
                 return
             checks: list[tuple[Any, int, int, Decimal, Decimal, Decimal, OfferFundingCheck]] = []
             for wallet_id, qty_raw in selected.items():
@@ -1095,7 +1095,7 @@ class OfferControllerMixin:
                 f"🌐 الشبكة: {self._offer_chain_label(session['chain'])}",
                 f"💵 العرض لكل NFT: {_fmt_decimal(unit_usdt, 4)} USDT",
                 f"Ξ القيمة الفعلية لكل NFT: ≈ {_fmt_decimal(unit_usdt / eth_usd, 8)} WETH",
-                f"📈 1 ETH/WETH: ≈ {_fmt_decimal(eth_usd, 2)} USDT",
+                f"📈 ETH/WETH: ≈ ${_fmt_decimal(eth_usd, 2)}",
                 f"⏳ المدة: {session.get('duration_hours', self.offer_duration_hours)} ساعة",
                 "",
             ]
@@ -1113,8 +1113,8 @@ class OfferControllerMixin:
                     f"Ξ قيمة Offer: ≈ {_fmt_decimal(bid_weth, 8)} WETH",
                     f"🧾 الرسوم المطلوبة: ≈ {_fmt_decimal(fee_weth, 8)} WETH (≈ {_fmt_decimal(fee_usdt, 4)} USDT)",
                     f"🛡 إجمالي WETH المطلوب/Approval: ≈ {_fmt_decimal(required_weth, 8)} WETH (≈ {_fmt_decimal(commitment_usdt, 4)} USDT)",
-                    f"{b} WETH: {_fmt_decimal(check.weth_balance, 8)} (≈ {_fmt_decimal(check.weth_balance * eth_usd, 4)} USDT)",
-                    f"{a} Approval: {_fmt_decimal(check.allowance, 8)} WETH (≈ {_fmt_decimal(check.allowance * eth_usd, 4)} USDT)",
+                    f"{b} WETH: {_fmt_decimal(check.weth_balance, 8)}",
+                    f"{a} Approval: {_fmt_decimal(check.allowance, 8)} WETH",
                     "",
                 ])
                 if not check.balance_ok or not check.approval_ok:
@@ -1148,7 +1148,7 @@ class OfferControllerMixin:
             unit = Decimal(str(session["unit_usdt"]))
             eth_usd = self.offer_service.eth_usd()
             if eth_usd is None:
-                self.telegram.send(chat_id, "⚠️ تعذر جلب سعر ETH/USDT.")
+                self.telegram.send(chat_id, "⚠️ تعذر جلب سعر ETH/USD.")
                 return
             _bid_wei, _fee_wei, required_wei, _bid_weth, _fee_weth, required_weth = self.offer_service.offer_commitment(
                 slug=session["slug"], chain=session["chain"], unit_usdt=unit, quantity=qty, eth_usd=eth_usd
@@ -1156,12 +1156,7 @@ class OfferControllerMixin:
             wallet = self._offer_wallet_config(stored)
             check = self.offer_service.funding_check(session["chain"], wallet, required_wei)
             if not check.balance_ok:
-                self.telegram.send(
-                    chat_id,
-                    "⚠️ WETH غير كافٍ. "
-                    f"الموجود {_fmt_decimal(check.weth_balance, 8)} WETH (≈ {_fmt_decimal(check.weth_balance * eth_usd, 4)} USDT)، "
-                    f"المطلوب {_fmt_decimal(required_weth, 8)} WETH (≈ {_fmt_decimal(required_weth * eth_usd, 4)} USDT)."
-                )
+                self.telegram.send(chat_id, f"⚠️ WETH غير كافٍ. الموجود {_fmt_decimal(check.weth_balance, 8)}، المطلوب {_fmt_decimal(required_weth, 8)} WETH.")
                 return
             if check.approval_ok:
                 self.telegram.send(chat_id, "✅ الـApproval موجود بالفعل.", [[("🔎 إعادة المراجعة", f"ofr:{sid}")]])
@@ -1182,14 +1177,8 @@ class OfferControllerMixin:
                     chat_id,
                     "🔓 تم إرسال معاملة WETH Approval\n\n"
                     f"👛 {stored.name}\n"
-                    f"Ξ المبلغ الموافق عليه: {_fmt_decimal(required_weth, 8)} WETH (≈ {_fmt_decimal(required_weth * eth_usd, 4)} USDT)\n"
-                    + (
-                        f"⛽ أقصى تقدير: {_fmt_decimal(result.gas_cost_native, 8)} {native_symbol(session['chain'])}"
-                        + (f" (≈ {_fmt_decimal(result.gas_cost_usd, 4)} USDT)" if result.gas_cost_usd is not None else "")
-                        + "\n"
-                        if result.gas_cost_native is not None
-                        else (f"⛽ أقصى تقدير: ≈ {_fmt_decimal(result.gas_cost_usd, 4)} USDT\n" if result.gas_cost_usd is not None else "")
-                    )
+                    f"Ξ المبلغ الموافق عليه: {_fmt_decimal(required_weth, 8)} WETH\n"
+                    + (f"⛽ أقصى تقدير: ${result.gas_cost_usd:.4f}\n" if result.gas_cost_usd is not None else "")
                     + f"🔎 {url}\n\n"
                     "بعد تأكيد المعاملة على الشبكة اضغط إعادة المراجعة.",
                     [[("🔎 إعادة المراجعة", f"ofr:{sid}"), ("❌ إلغاء", f"ofclose:{sid}")]],
@@ -1238,7 +1227,7 @@ class OfferControllerMixin:
         unit_usdt = Decimal(str(session["unit_usdt"]))
         eth_usd = self.offer_service.eth_usd()
         if eth_usd is None or eth_usd <= 0:
-            self.telegram.send(chat_id, "⚠️ سعر ETH/USDT غير متاح؛ لم يتم التوقيع.")
+            self.telegram.send(chat_id, "⚠️ سعر ETH/USD غير متاح؛ لم يتم التوقيع.")
             return
 
         # Final all-wallet funding guard before any destructive "raise" action.
@@ -1259,15 +1248,11 @@ class OfferControllerMixin:
             )
             if not funding.balance_ok:
                 final_preflight_errors.append(
-                    f"{stored_check.name}: WETH غير كافٍ — "
-                    f"{_fmt_decimal(funding.weth_balance, 8)} WETH (≈ {_fmt_decimal(funding.weth_balance * eth_usd, 4)} USDT) "
-                    f"< {_fmt_decimal(required_weth, 8)} WETH (≈ {_fmt_decimal(required_weth * eth_usd, 4)} USDT)"
+                    f"{stored_check.name}: WETH غير كافٍ ({_fmt_decimal(funding.weth_balance, 8)} < {_fmt_decimal(required_weth, 8)})"
                 )
             elif not funding.approval_ok:
                 final_preflight_errors.append(
-                    f"{stored_check.name}: Approval غير كافٍ — "
-                    f"{_fmt_decimal(funding.allowance, 8)} WETH (≈ {_fmt_decimal(funding.allowance * eth_usd, 4)} USDT) "
-                    f"< {_fmt_decimal(required_weth, 8)} WETH (≈ {_fmt_decimal(required_weth * eth_usd, 4)} USDT)"
+                    f"{stored_check.name}: Approval غير كافٍ ({_fmt_decimal(funding.allowance, 8)} < {_fmt_decimal(required_weth, 8)})"
                 )
         if final_preflight_errors:
             self.telegram.send(
@@ -1333,7 +1318,7 @@ class OfferControllerMixin:
                     quantity=qty, total_weth=str(result.total_weth or "0"),
                     start_time=_start_time, end_time=_end_time,
                     status="active", protocol_data_json=json.dumps(result.protocol_data or {}, ensure_ascii=False),
-                    response_json=json.dumps(response, ensure_ascii=False)[:50000], detail="created by V4.12.2 offer subsystem",
+                    response_json=json.dumps(response, ensure_ascii=False)[:50000], detail="created by V4.12.0 offer subsystem",
                 )
                 successes.append((stored, qty, result, offer_id))
             else:
@@ -1344,7 +1329,7 @@ class OfferControllerMixin:
             lines.extend([
                 f"✅ {stored.name} ×{qty}",
                 f"💵 {_fmt_decimal(unit_usdt, 4)} USDT/NFT",
-                f"Ξ الإجمالي ≈ {_fmt_decimal(result.total_weth, 8)} WETH (≈ {_fmt_decimal(unit_usdt * Decimal(qty), 4)} USDT)",
+                f"Ξ الإجمالي ≈ {_fmt_decimal(result.total_weth, 8)} WETH",
                 f"🧾 {result.order_hash}",
                 "",
             ])
@@ -1431,9 +1416,8 @@ class OfferControllerMixin:
             f"👛 المحفظة: {row.get('wallet_name')}\n"
             f"💵 السعر: {(_fmt_decimal(_as_decimal(unit), 4) + ' USDT/NFT') if unit else 'غير محفوظ'}\n"
             f"🔢 الكمية: {qty}\n"
-            f"Ξ WETH الإجمالي: {total or 'غير محفوظ'}"
-            + (f" (≈ {_fmt_decimal(_as_decimal(unit) * Decimal(qty), 4)} USDT)\n" if unit else "\n")
-            + f"📌 الحالة: {row.get('status')}\n"
+            f"Ξ WETH الإجمالي: {total or 'غير محفوظ'}\n"
+            f"📌 الحالة: {row.get('status')}\n"
             f"🧾 Order Hash:\n{row.get('order_hash')}"
         )[:3900]
 
