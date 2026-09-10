@@ -195,3 +195,27 @@ VERSION
 - Collection Offers still require explicit user confirmation.
 - Free Safe Protection policy is unchanged.
 - Gas/native/total-spend guards remain enforced according to the configured policy.
+
+## V4.14.0 Multi-User
+The Railway `TELEGRAM_BOT_TOKEN` + `TELEGRAM_ALLOWED_CHAT_IDS` remain the Admin control plane. Open **👥 إدارة المستخدمين** to create a tenant using username, numeric Telegram ID, the tenant's Telegram Bot Token and wallet limit. The tenant bot is restricted to that exact Telegram ID.
+
+Each tenant receives its own SQLite database (`tenant_<id>.db`) and therefore its own wallets, watches, qualification state, history, offers and persisted settings. Admin remains unlimited. User wallet limits are enforced server-side.
+
+Global OpenSea/SeaDrop discovery stays on the Admin engine and is mirrored in RAM to tenants. Tenant engines reuse Admin's verified RPC pools, price oracle and fee cache. This is intentional: adding users does not create one OpenSea catalog scanner or fee warmer per user. Manual watch/eligibility actions remain private to the user who requested them.
+
+Per-user settings include gas limits, Free Mint Shield, notifications and independent execution pause. Suspending a user removes only that tenant from execution; it does not pause Admin or other tenants.
+
+## V4.14.1 Direct Tenant Fan-Out
+
+Live Stream/SeaDrop signals no longer depend on the tenant 20ms mirror loop. Admin resolves the on-chain public configuration once and immediately pushes that resolved event into each eligible tenant Race lane. The tenant uses the same public configuration as a `public_hint`, while applying its own permissions, pause state, Safe Protection setting, gas limits and wallets.
+
+Optional environment controls:
+
+```env
+DIRECT_TENANT_FANOUT=true
+TENANT_ADMIN_HEADSTART_SECONDS=0.002
+```
+
+`TENANT_ADMIN_HEADSTART_SECONDS` is not a discovery polling delay. The event is enqueued immediately; the small default head-start only keeps Admin's wallet lane ahead of tenant broadcast work. Set it to `0` if strict simultaneous scheduling is preferred.
+
+The old shared-candidate synchronization is intentionally retained as a safety/backfill mechanism so metadata/state can recover even if a tenant starts after the original live signal.

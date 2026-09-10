@@ -1,11 +1,17 @@
-# V4.13.1 Release Validation
+# V4.14.1 Release Validation
 
-Validation performed in the build environment:
+- Python compile: PASS for all Python modules.
+- Direct fan-out source path: PASS — Admin `_fast_live_contract_signal` calls `TenantSupervisor.fanout_resolved_signal` immediately after one SeaDrop public read.
+- Non-blocking fan-out: PASS — each tenant receives work through its existing `race_signal_executor`.
+- No duplicate tenant discovery RPC on direct path: PASS — tenant receives `public` and launches with `public_hint`.
+- 20ms loop dependency removed: PASS — live tenant execution no longer waits for `sync_shared_candidates`; that loop remains recovery/backfill only.
+- Admin priority: PASS by design — Admin is discovery owner and tenant workers use a configurable 2ms default head-start guard while event enqueue remains immediate.
+- Tenant permission prefilter + server-side recheck: PASS.
+- Tenant suspended/disabled check: PASS.
+- Per-tenant Safe Protection: PASS by code path — `social_protection_allows` is executed by each tenant using its own SQLite setting.
+- Per-tenant pause/gas/wallet state: preserved.
+- Qualification permission routing: preserved.
+- Shared RPC/fee/price caches: preserved.
+- ZIP integrity: validated during packaging.
 
-- `python -m py_compile *.py`: PASS.
-- SQLite 24-hour history compaction test: PASS; old confirmed row was removed from visible history while cumulative confirmed quantity remained unchanged.
-- Additive migration test from a V4.12-created SQLite database: PASS; existing settings remained readable and the new `mint_totals` table was created without removing `offer_history`.
-- `offers.py`: byte-for-byte unchanged from the V4.12.0 package used as the base for this build.
-- `health.py`, `requirements.txt`, `railway.json`: unchanged from the base package.
-- Critical unchanged functions checked by AST include Stream queueing/coalescing helpers, Safe Protection decision function, qualification checker, SeaDrop read, standard mint functions, and SeaDrop eligibility checker.
-- No live funded blockchain transaction was sent during build validation. Runtime provider behavior must be verified on Railway with the deployment's actual RPC/API credentials.
+No funded live blockchain transaction was sent as part of release validation.

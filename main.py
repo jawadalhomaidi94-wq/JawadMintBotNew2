@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import hashlib
 import logging
@@ -1027,12 +1028,12 @@ class Candidate:
 
 
 class TelegramController(threading.Thread):
-    def __init__(self, bot: "Bot"):
+    def __init__(self, bot: "Bot", token: str | None = None, allowed_chat_ids: set[str] | None = None):
         super().__init__(name="telegram-controller", daemon=True)
         self.bot = bot
-        self.token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        self.allowed_chat_ids = set(csv_values(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS")))
-        self.allow_any = env_bool("TELEGRAM_ALLOW_ANY_CHAT", False)
+        self.token = (token if token is not None else os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()
+        self.allowed_chat_ids = set(allowed_chat_ids) if allowed_chat_ids is not None else set(csv_values(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS")))
+        self.allow_any = False if allowed_chat_ids is not None else env_bool("TELEGRAM_ALLOW_ANY_CHAT", False)
         self.offset = 0
         self.session = requests.Session()
 
@@ -1176,7 +1177,19 @@ class TelegramController(threading.Thread):
 
 
 class Bot(OfferControllerMixin):
-    def __init__(self):
+    def __init__(self, *, tenant_runtime=None, telegram_token: str | None = None, telegram_chat_id: str | None = None, db_path_override: str | None = None, discovery_source=None, user_registry=None, tenant_supervisor=None):
+        self.tenant_runtime = tenant_runtime
+        self.is_admin = bool(getattr(tenant_runtime, "is_admin", True))
+        self.user_registry = user_registry
+        self.tenant_supervisor = tenant_supervisor
+        self.discovery_source = discovery_source
+        self.shared_discovery_mode = discovery_source is not None
+        self.tenant_disabled = False
+        # V4.14.1: resolved Admin Stream/SeaDrop events are pushed directly into
+        # tenant Race lanes.  The old 20ms shared-candidate mirror remains only
+        # as a recovery/backfill path, never as the live-launch dependency.
+        self.direct_tenant_fanout = env_bool("DIRECT_TENANT_FANOUT", True)
+        self.tenant_admin_headstart_seconds = max(0.0, min(0.010, env_float("TENANT_ADMIN_HEADSTART_SECONDS", 0.002)))
         self.opensea = OpenSeaClient(os.getenv("OPENSEA_API_KEY", "").strip(), timeout=env_float("HTTP_TIMEOUT", 7.0))
         self.display_tz = ZoneInfo(os.getenv("DISPLAY_TIMEZONE", "Asia/Aden"))
         self.quantity_default = max(1, min(env_int("QUANTITY", 1), 100))
@@ -1191,7 +1204,7 @@ class Bot(OfferControllerMixin):
 
         volume = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
         data_dir = Path(volume or os.getenv("DATA_DIR", "./data"))
-        db_path = os.getenv("BOT_DB_PATH", "").strip() or str(data_dir / "mint_guardian.db")
+        db_path = db_path_override or os.getenv("BOT_DB_PATH", "").strip() or str(data_dir / "mint_guardian.db")
         self.store = SecureStore(db_path, os.getenv("WALLET_ENCRYPTION_KEY", "").strip())
 
         self.allow_paid_default = env_bool("ALLOW_PAID_MINTS", True)
@@ -1337,6 +1350,7 @@ class Bot(OfferControllerMixin):
         # V4.9: qualification/monitoring are quiet dashboards by default.
         # Routine stage messages are shown only when the user opens the section;
         # transaction submitted/confirmed/reverted notifications remain active.
+        self.notifications_enabled = (self.store.get_setting("notifications_enabled", "1") == "1")
         self.routine_stage_notifications = (self.store.get_setting("routine_stage_notifications", "0") == "1")
         self.stage_summary_notifications = self.routine_stage_notifications
         self.stage_open_notifications = self.routine_stage_notifications
@@ -1357,7 +1371,7 @@ class Bot(OfferControllerMixin):
         self.maintenance_interval_seconds = max(60.0, env_float("MAINTENANCE_INTERVAL_SECONDS", 300.0))
         self.cache_retention_seconds = max(600.0, env_float("CACHE_RETENTION_SECONDS", 3600.0))
 
-        self.paused = env_bool("START_PAUSED", False)
+        self.paused = (self.store.get_setting("execution_paused", "1" if env_bool("START_PAUSED", False) else "0") == "1")
 
         self.wallets: list[WalletConfig] = []
         self.rpc_pools: dict[str, RpcPool] = {}
@@ -1432,15 +1446,209 @@ class Bot(OfferControllerMixin):
         self.pending_paid_quantity: dict[str, dict[str, Any]] = {}
         self.pending_gas_setting: dict[str, dict[str, Any]] = {}
         self.pending_gas_project: dict[str, dict[str, Any]] = {}
-        self.telegram = TelegramController(self)
+        self.pending_user_admin: dict[str, dict[str, Any]] = {}
+        _allowed = {str(telegram_chat_id)} if telegram_chat_id else None
+        self.telegram = TelegramController(self, token=telegram_token, allowed_chat_ids=_allowed)
 
-        self.load_rpc_pools()
-        self.import_env_wallets()
+        if self.shared_discovery_mode:
+            # V4.14: all tenants reuse Admin's verified RPC pools and hot market caches.
+            # This prevents N users from multiplying Alchemy/public-RPC probes or fee warmers.
+            self.rpc_pools = self.discovery_source.rpc_pools
+            self.price_oracle = self.discovery_source.price_oracle
+            self.race_market_lock = self.discovery_source.race_market_lock
+            self.race_fee_cache = self.discovery_source.race_fee_cache
+        else:
+            self.load_rpc_pools()
+        if self.is_admin:
+            self.import_env_wallets()
         self.reload_wallets()
         # V4.12.0: Offers have their own executor/state and are user-triggered.
         # This initialization adds no polling/thread into the Mint/Race path.
         self.init_offer_subsystem()
-        self.load_env_watches_to_store()
+        if not self.shared_discovery_mode:
+            self.load_env_watches_to_store()
+
+    def can(self, permission: str) -> bool:
+        rt = self.tenant_runtime
+        return True if rt is None else bool(rt.can(permission))
+
+    def tenant_name(self) -> str:
+        rt = self.tenant_runtime
+        return "Admin" if rt is None else str(rt.name)
+
+    def tenant_user_id(self) -> int:
+        rt=self.tenant_runtime
+        return 0 if rt is None or rt.is_admin else int(rt.user_id)
+
+    def release_wallet_claim(self,address:str) -> None:
+        if self.user_registry is not None:
+            try:self.user_registry.release_wallet(address,self.tenant_user_id())
+            except Exception:pass
+
+    def enforce_wallet_limit(self) -> tuple[bool, str]:
+        rt = self.tenant_runtime
+        if rt is None or rt.is_admin or rt.wallet_limit is None:
+            return True, ""
+        total = len(self.store.list_wallets(enabled_only=False))
+        if total >= int(rt.wallet_limit):
+            return False, f"وصلت إلى الحد الأقصى للمحافظ ({rt.wallet_limit}). تواصل مع Admin لزيادة الحد."
+        return True, ""
+
+    def sync_shared_candidates(self) -> None:
+        """Mirror global discovery metadata into a tenant without sharing wallet state.
+
+        This is intentionally RAM-only: discovery/social/stage work is done by Admin once,
+        while each tenant owns independent WalletState, settings, DB, notifications and Race.
+        """
+        src = self.discovery_source
+        if src is None:
+            return
+        with src.candidates_lock:
+            source_items = list(src.candidates.items())
+        now=time.time()
+        with self.candidates_lock:
+            for key, sc in source_items:
+                # Only fan out global auto-discovery. User manual watches remain private.
+                if not sc.auto_discovered:
+                    continue
+                if sc.qualification_tracked:
+                    if not self.can("qualification.mint"): continue
+                elif not self.can("free_mints.auto"):
+                    continue
+                lc=self.candidates.get(key)
+                if lc is None:
+                    lc=copy.copy(sc)
+                    lc.wallets={}
+                    lc.checked_stage_keys=set(sc.checked_stage_keys)
+                    lc.stage_open_notified_keys=set()
+                    lc.paid_wallet_addresses=set()
+                    lc.paid_wallet_quantities={}
+                    lc.paid_selection_confirmed=False
+                    lc.paid_selection_notified=False
+                    # Never inherit Admin's tenant-specific price/gas policy.
+                    lc.allow_paid=self.allow_paid_default
+                    lc.max_mint_price_native=self.max_mint_price_default
+                    lc.gas_override_usd=None
+                    lc.ignore_gas_cap=False
+                    lc.discovery_source="shared-global"
+                    lc.race_inflight=False; lc.race_prepared=False; lc.race_last_attempt=0.0
+                    self.candidates[key]=lc
+                else:
+                    for attr in ("source","public_start","next_stage_start","stage_lines","wallet_limit","has_paid_stage",
+                                 "remaining_supply","mint_backend","contract_address","stage_end","watch_kind","stage_plans",
+                                 "current_stage_key","current_stage_label","current_stage_start","current_stage_end","current_stage_public",
+                                 "current_stage_free","current_stage_paid","current_stage_limit","final_public_start","final_stage_end",
+                                 "qualification_tracked","social_trust_status","social_trust_checked_at","social_twitter_username",
+                                 "social_twitter_url","social_website_url","social_trust_detail","social_trust_retry_at","last_seen_auto"):
+                        setattr(lc,attr,copy.deepcopy(getattr(sc,attr)))
+            # Keep local manual watches; shared candidates naturally expire via normal cleanup.
+        self.sync_wallets_into_candidates()
+
+    def _upsert_shared_candidate_direct(self, source_candidate: Candidate) -> Candidate | None:
+        """Copy one already-resolved global candidate into this tenant in RAM only.
+
+        No OpenSea/SeaDrop/RPC discovery call happens here. Wallet state, gas policy,
+        pause state, history and settings stay tenant-local.
+        """
+        if not source_candidate.auto_discovered:
+            return None
+        if source_candidate.qualification_tracked:
+            if not self.can("qualification.mint"):
+                return None
+        elif not self.can("free_mints.auto"):
+            return None
+        key = self.project_key_for_candidate(source_candidate)
+        with self.candidates_lock:
+            lc = self.candidates.get(key)
+            if lc is None:
+                lc = copy.copy(source_candidate)
+                lc.wallets = {}
+                lc.checked_stage_keys = set(source_candidate.checked_stage_keys)
+                lc.stage_open_notified_keys = set()
+                lc.paid_wallet_addresses = set()
+                lc.paid_wallet_quantities = {}
+                lc.paid_selection_confirmed = False
+                lc.paid_selection_notified = False
+                lc.allow_paid = self.allow_paid_default
+                lc.max_mint_price_native = self.max_mint_price_default
+                lc.gas_override_usd = None
+                lc.ignore_gas_cap = False
+                lc.discovery_source = "shared-direct"
+                lc.race_inflight = False
+                lc.race_prepared = False
+                lc.race_last_attempt = 0.0
+                self.candidates[key] = lc
+            else:
+                for attr in (
+                    "slug","source","public_start","next_stage_start","stage_lines","wallet_limit","has_paid_stage",
+                    "remaining_supply","mint_backend","contract_address","stage_end","watch_kind","stage_plans",
+                    "current_stage_key","current_stage_label","current_stage_start","current_stage_end","current_stage_public",
+                    "current_stage_free","current_stage_paid","current_stage_limit","final_public_start","final_stage_end",
+                    "qualification_tracked","social_trust_status","social_trust_checked_at","social_twitter_username",
+                    "social_twitter_url","social_website_url","social_trust_detail","social_trust_retry_at","last_seen_auto",
+                ):
+                    setattr(lc, attr, copy.deepcopy(getattr(source_candidate, attr)))
+                lc.discovery_source = "shared-direct"
+        self.sync_wallets_into_candidates()
+        return lc
+
+    def receive_direct_resolved_signal(
+        self,
+        source_candidate: Candidate,
+        plan: dict[str, Any],
+        public: dict[str, Any],
+        source: str,
+        emitted_perf: float,
+        admin_headstart_seconds: float = 0.0,
+    ) -> None:
+        """Tenant hot-path for an Admin-resolved Stream/SeaDrop signal.
+
+        The event is already resolved on-chain by Admin, so this method performs
+        zero discovery RPC reads before scheduling the tenant Race.
+        """
+        if STOP or self.tenant_disabled or (self.tenant_runtime is not None and not self.tenant_runtime.active) or not self.race_enabled:
+            return
+        candidate = self._upsert_shared_candidate_direct(source_candidate)
+        if candidate is None:
+            return
+        now = time.time()
+        start = float(plan.get("start") or 0)
+        end = float(plan.get("end") or 0)
+        active = (not start or now >= start) and (not end or now < end)
+        self._record_resolved_signal_stage(candidate.chain, candidate.contract_address, plan, source="shared-direct")
+
+        if active:
+            if plan.get("is_paid"):
+                # Paid mint policy remains explicit and tenant-local.
+                if not self.can("paid_mints.use"):
+                    return
+                candidate.paid_detected = True
+                self.maybe_offer_paid_public(candidate)
+                return
+            if self.paused:
+                return
+            if not self.social_protection_allows(candidate, plan):
+                return
+            # Event delivery is immediate. A tiny configurable Admin head-start
+            # is applied only inside the tenant worker, not by a 20ms polling loop.
+            remaining = float(admin_headstart_seconds) - (time.perf_counter() - emitted_perf)
+            if remaining > 0:
+                time.sleep(remaining)
+            self._launch_candidate_race(candidate, copy.deepcopy(plan), live=True, public_hint=copy.deepcopy(public))
+            log.info(
+                "Direct tenant signal handled | user=%s | source=%s | %s | %s | handoff=%.3fms",
+                self.tenant_name(), source, candidate.slug, candidate.chain,
+                (time.perf_counter() - emitted_perf) * 1000.0,
+            )
+            return
+
+        if start and start > now:
+            candidate.watch_kind = "auto_stage"
+            # The scheduler/prewarmer can now act immediately; persistence is a
+            # recovery concern and is deliberately kept outside this hot call.
+            for state in candidate.wallets.values():
+                if not state.submitted and not state.final:
+                    state.next_attempt = min(state.next_attempt or now, now)
 
     # ---------- persistence / wallets ----------
     def import_env_wallets(self) -> None:
@@ -1853,6 +2061,11 @@ class Bot(OfferControllerMixin):
         return True, clean
 
     def add_wallet_key(self, name: str, private_key: str) -> tuple[bool, str]:
+        if not self.can("wallets.create"):
+            return False, "ليس لديك صلاحية إضافة المحافظ."
+        allowed, reason = self.enforce_wallet_limit()
+        if not allowed:
+            return False, reason
         ok_name, clean_or_error = self.validate_wallet_name(name)
         if not ok_name:
             return False, clean_or_error
@@ -1862,6 +2075,10 @@ class Bot(OfferControllerMixin):
             address = Web3.to_checksum_address(account.address)
         except Exception:
             return False, "المفتاح الخاص غير صالح لمحفظة EVM."
+        if self.user_registry is not None:
+            claimed, owner = self.user_registry.claim_wallet(address, self.tenant_user_id())
+            if not claimed:
+                return False, "هذه المحفظة مرتبطة مسبقًا بمستخدم آخر ولا يمكن مشاركتها بين حسابين."
         existing = self.store.get_wallet_by_address(address)
         if existing:
             return False, f"هذه المحفظة مضافة مسبقًا باسم «{existing.name}»: {short_address(address)}"
@@ -1871,6 +2088,7 @@ class Bot(OfferControllerMixin):
                 quantity=self.quantity_default, chains=tuple(self.enabled_chains),
             )
         except ValueError as exc:
+            self.release_wallet_claim(address)
             return False, str(exc)
         self.reload_wallets()
         return True, (
@@ -3513,6 +3731,17 @@ class Bot(OfferControllerMixin):
             plan = self._fast_plan_from_public(public, contract)
             self._record_resolved_signal_stage(chain, contract, plan, source=source)
             candidate = self._ensure_fast_candidate(chain, contract, slug, public, source)
+            # V4.14.1 direct event fan-out: enqueue the already-resolved signal
+            # into every active tenant Race lane immediately. Tenants reuse this
+            # public config and therefore do not repeat the SeaDrop discovery RPC.
+            if self.is_admin and self.direct_tenant_fanout and self.tenant_supervisor:
+                try:
+                    self.tenant_supervisor.fanout_resolved_signal(
+                        candidate, plan, public, source, time.perf_counter(),
+                        self.tenant_admin_headstart_seconds,
+                    )
+                except Exception as fanout_exc:
+                    log.debug("Direct tenant fanout failed %s %s: %s", chain, contract, fanout_exc)
             start = float(plan.get("start") or 0)
             end = float(plan.get("end") or 0)
             active = (not start or now >= start) and (not end or now < end)
@@ -5243,7 +5472,8 @@ class Bot(OfferControllerMixin):
     def set_execution_paused(self, paused: bool) -> None:
         """Pause/resume every signing+broadcast path, including Race Lane."""
         self.paused = bool(paused)
-        log.info("Execution pause state | paused=%s", self.paused)
+        self.store.set_setting("execution_paused", "1" if self.paused else "0")
+        log.info("Execution pause state | tenant=%s | paused=%s", self.tenant_name(), self.paused)
         if self.paused:
             # Prepared transactions are intentionally discarded so Resume never
             # broadcasts a stale nonce/fee snapshot built before the pause.
@@ -5252,15 +5482,32 @@ class Bot(OfferControllerMixin):
                 self.race_queued.clear()
 
     def menu_buttons(self) -> list[list[tuple[str, str]]]:
-        return [
-            [("➕ إضافة محفظة", "add_wallet"), ("👛 المحافظ", "wallets")],
-            [("🎟 التأهيل", "qualification_menu"), ("👀 المراقبة", "monitoring_menu")],
-            [("🆓 المجانية المأخوذة", "free_mints"), ("💳 المنتات المدفوعة", "paid_watches")],
-            [("📨 عروضي الحالية", "offers_mine"), ("🧪 فحص الأهلية", "eligibility_all")],
-            [("📜 سجل العمليات", "history"), ("🌐 الشبكات", "chains")],
-            [("⚙️ الإعدادات", "settings")],
-            [("⏸ إيقاف التنفيذ" if not self.paused else "▶️ استئناف التنفيذ", "toggle_pause")],
-        ]
+        rows=[]
+        if self.can("wallets.view"):
+            row=[]
+            if self.can("wallets.create"): row.append(("➕ إضافة محفظة", "add_wallet"))
+            row.append(("👛 المحافظ", "wallets")); rows.append(row)
+        if self.can("qualification.view") or self.can("monitoring.view"):
+            row=[]
+            if self.can("qualification.view"): row.append(("🎟 التأهيل", "qualification_menu"))
+            if self.can("monitoring.view"): row.append(("👀 المراقبة", "monitoring_menu"))
+            rows.append(row)
+        row=[]
+        if self.can("free_mints.view"): row.append(("🆓 المجانية المأخوذة", "free_mints"))
+        if self.can("paid_mints.use"): row.append(("💳 المنتات المدفوعة", "paid_watches"))
+        if row: rows.append(row)
+        row=[]
+        if self.can("offers.view"): row.append(("📨 عروضي الحالية", "offers_mine"))
+        if self.can("qualification.view"): row.append(("🧪 فحص الأهلية", "eligibility_all"))
+        if row: rows.append(row)
+        row=[]
+        if self.can("history.view"): row.append(("📜 سجل العمليات", "history"))
+        if self.can("chains.view"): row.append(("🌐 الشبكات", "chains"))
+        if row: rows.append(row)
+        if self.can("settings.view"): rows.append([("⚙️ الإعدادات", "settings")])
+        if self.is_admin and self.user_registry is not None: rows.append([("👥 إدارة المستخدمين", "users_manage")])
+        if self.can("bot.pause"): rows.append([("⏸ إيقاف البوت الخاص بي" if not self.paused else "▶️ تشغيل البوت الخاص بي", "toggle_pause")])
+        return rows
 
     def qualification_menu_buttons(self) -> list[list[tuple[str, str]]]:
         return [
@@ -5299,6 +5546,7 @@ class Bot(OfferControllerMixin):
             [("📋 استثناءات الغاز", "gas_project_list")],
             [(f"💰 Offers: Top + {self.offer_top_increment_usdt} USDT", "offer_settings")],
             [("🛡 حماية Free Mint: مفعلة" if self.free_social_protection_enabled else "⚠️ حماية Free Mint: متوقفة", "free_social_toggle")],
+            [("🔔 الإشعارات: مفعلة" if self.notifications_enabled else "🔕 الإشعارات: متوقفة", "notifications_toggle")],
             [("🔕 إيقاف إشعارات المراحل" if self.routine_stage_notifications else "🔔 تفعيل إشعارات المراحل", "stage_notify_toggle")],
             [("↩️ القائمة الرئيسية", "menu")],
         ]
@@ -5335,7 +5583,7 @@ class Bot(OfferControllerMixin):
         total = len(self.store.list_wallets(enabled_only=False))
         self.telegram.send(
             chat_id,
-            "🤖 OpenSea Mint Guardian V4.13.1\n\n"
+            "🤖 OpenSea Mint Guardian V4.14.0 Multi-User\n\n"
             "🆓 الاكتشاف المجاني: Stream لحظي + SeaDrop مباشر + REST احتياطي\n"
             f"⚡ الاستعداد للـPublic: آخر {self.public_preopen_window_seconds:g} ثوانٍ\n"
             f"📦 سياسة الكمية: حد المنت ≤100 يؤخذ كما هو، وإذا كان >100/غير محدود فالهدف {self.auto_stage_high_limit_quantity}\n"
@@ -5908,10 +6156,99 @@ class Bot(OfferControllerMixin):
         self.pending_link_action.pop(chat_id, None)
         self.offer_clear_pending_inputs(chat_id)
 
+    def users_text(self) -> str:
+        if not self.is_admin or self.user_registry is None: return "⛔ Admin only"
+        users=self.user_registry.list(False)
+        if not users: return "👥 لا يوجد مستخدمون بعد."
+        lines=["👥 إدارة المستخدمين",""]
+        for u in users:
+            running=bool(self.tenant_supervisor and u.id in self.tenant_supervisor.bots and not getattr(self.tenant_supervisor.bots[u.id],"tenant_disabled",False))
+            lines.append(f"#{u.id} • {u.username} • Telegram {u.telegram_id} • {'🟢' if u.active and running else '⏸'} • محافظ {u.wallet_limit} • صلاحيات {len(u.permissions)}")
+        return "\n".join(lines)[:3900]
+
+    def users_buttons(self):
+        rows=[[('➕ إضافة مستخدم','user_add')]]
+        if self.user_registry:
+            for u in self.user_registry.list(False)[:30]: rows.append([(f"{'🟢' if u.active else '⏸'} {u.username}",f'user:{u.id}')])
+        rows.append([('↩️ القائمة الرئيسية','menu')]); return rows
+
+    def user_detail_text(self,uid:int)->str:
+        u=self.user_registry.get(uid) if self.user_registry else None
+        if not u:return '⚠️ المستخدم غير موجود.'
+        return (f"👤 {u.username}\nID: {u.id}\nTelegram ID: {u.telegram_id}\nالحالة: {'نشط' if u.active else 'موقوف'}\n"
+                f"حد المحافظ: {u.wallet_limit}\nالصلاحيات: {', '.join(sorted(u.permissions))}")[:3900]
+
+    def user_detail_buttons(self,uid:int):
+        u=self.user_registry.get(uid); active=bool(u and u.active)
+        return [[('⏸ إيقاف' if active else '▶️ تشغيل',f'user_toggle:{uid}')],[('👛 تعديل حد المحافظ',f'user_limit:{uid}')],
+                [('🔐 الصلاحيات',f'user_perms:{uid}')],[('🗑 حذف المستخدم',f'user_delete:{uid}')],[('↩️ المستخدمون','users_manage')]]
+
     def handle_callback(self, event: dict[str, Any]) -> None:
         chat_id = event["chat_id"]
         data = event.get("data", "")
         self.telegram.answer_callback(event.get("callback_id", ""))
+
+        if data == "users_manage":
+            if not self.is_admin or self.user_registry is None: return
+            self.edit_or_send(event,self.users_text(),self.users_buttons()); return
+        if data == "user_add":
+            if not self.is_admin:return
+            self._clear_pending(chat_id); self.pending_user_admin[chat_id]={"step":"name","expiry":time.time()+600}
+            self.telegram.send(chat_id,"➕ إضافة مستخدم\n\nأرسل اسم المستخدم."); return
+        if data.startswith("user:") and self.is_admin:
+            uid=int(data.split(':',1)[1]); self.edit_or_send(event,self.user_detail_text(uid),self.user_detail_buttons(uid)); return
+        if data.startswith("user_toggle:") and self.is_admin:
+            uid=int(data.split(':',1)[1]); u=self.user_registry.get(uid)
+            if u and self.tenant_supervisor:
+                self.tenant_supervisor.stop_user(uid) if u.active else self.tenant_supervisor.resume_user(uid)
+            self.edit_or_send(event,self.user_detail_text(uid),self.user_detail_buttons(uid)); return
+        if data.startswith("user_limit:") and self.is_admin:
+            uid=int(data.split(':',1)[1]); self.pending_user_admin[chat_id]={"step":"limit_edit","uid":uid,"expiry":time.time()+300}
+            self.telegram.send(chat_id,"أرسل الحد الجديد لعدد المحافظ (0 يمنع إضافة محافظ)."); return
+        if data.startswith("user_perms:") and self.is_admin:
+            uid=int(data.split(':',1)[1]); u=self.user_registry.get(uid); from multi_user import DEFAULT_PERMISSIONS
+            rows=[]
+            for perm in sorted(DEFAULT_PERMISSIONS): rows.append([(("✅ " if u and perm in u.permissions else "⬜ ")+perm,f'perm:{uid}:{perm}')])
+            rows.append([('↩️ المستخدم',f'user:{uid}')]); self.edit_or_send(event,"🔐 اضغط لتفعيل/إلغاء الصلاحية.",rows); return
+        if data.startswith("perm:") and self.is_admin:
+            _,uid_s,perm=data.split(':',2); uid=int(uid_s); u=self.user_registry.get(uid)
+            if u:
+                ps=set(u.permissions); ps.remove(perm) if perm in ps else ps.add(perm); self.user_registry.set_permissions(uid,ps)
+                if self.tenant_supervisor:self.tenant_supervisor.refresh_user(uid)
+            u=self.user_registry.get(uid); from multi_user import DEFAULT_PERMISSIONS
+            rows=[[(("✅ " if perm2 in u.permissions else "⬜ ")+perm2,f'perm:{uid}:{perm2}')] for perm2 in sorted(DEFAULT_PERMISSIONS)]
+            rows.append([('↩️ المستخدم',f'user:{uid}')]); self.edit_or_send(event,"🔐 تم تحديث الصلاحيات.",rows); return
+        if data.startswith("user_delete:") and self.is_admin:
+            uid=int(data.split(':',1)[1]);
+            if self.tenant_supervisor:self.tenant_supervisor.stop_user(uid)
+            self.user_registry.delete(uid); self.edit_or_send(event,self.users_text(),self.users_buttons()); return
+
+        # V4.14 tenant permission guard. Hidden buttons are not a security boundary;
+        # every callback is authorized again server-side.
+        _cb_permissions = {
+            "add_wallet":"wallets.create","wallets":"wallets.view","qualification_menu":"qualification.view",
+            "qualification_today":"qualification.view","qualification_old":"qualification.view","qualification_add":"qualification.watch",
+            "monitoring_menu":"monitoring.view","monitoring_active":"monitoring.view","monitoring_old":"monitoring.view",
+            "monitoring_add":"monitoring.create","watches":"monitoring.create","free_mints":"free_mints.view",
+            "chains":"chains.view","history":"history.view","settings":"settings.view","eligibility_all":"qualification.view",
+            "toggle_pause":"bot.pause","free_social_toggle":"settings.update","stage_notify_toggle":"settings.update","notifications_toggle":"settings.update",
+            "gas_project_add":"settings.update","gas_project_list":"settings.view","offers_mine":"offers.view",
+        }
+        _required = _cb_permissions.get(data)
+        if _required and not self.can(_required):
+            self.telegram.send(chat_id, "⛔ ليس لديك صلاحية لهذه العملية.", self.menu_buttons()); return
+        if data.startswith(("wd:","wdc:")) and not self.can("wallets.delete"):
+            self.telegram.send(chat_id,"⛔ ليس لديك صلاحية حذف المحافظ.",self.menu_buttons()); return
+        if data.startswith(("wr:","wq:")) and not self.can("wallets.edit"):
+            self.telegram.send(chat_id,"⛔ ليس لديك صلاحية تعديل المحافظ.",self.menu_buttons()); return
+        if data.startswith(("wv:","wt:")) and not self.can("wallets.view"):
+            self.telegram.send(chat_id,"⛔ ليس لديك صلاحية المحافظ.",self.menu_buttons()); return
+        if data.startswith(("pwa:","pwc:","pwm:","pwn:","pwo:","pqq:","ppo:","ppn:","pac:")) and not self.can("paid_mints.use"):
+            self.telegram.send(chat_id,"⛔ ليس لديك صلاحية المنتات المدفوعة.",self.menu_buttons()); return
+        if (data.startswith("gas_") or data.startswith("gpi:") or data.startswith("gpr:") or data.startswith("gpc:")) and not self.can("settings.update"):
+            self.telegram.send(chat_id,"⛔ ليس لديك صلاحية تعديل الإعدادات.",self.menu_buttons()); return
+        if data.startswith(("offer_","ofr:","off:")) and not self.can("offers.create"):
+            self.telegram.send(chat_id,"⛔ ليس لديك صلاحية العروض.",self.menu_buttons()); return
 
         # V4.12.0 Offer callbacks are fully isolated in OfferControllerMixin.
         # Delegate only explicit Offer callback prefixes/actions; Race callbacks
@@ -6036,6 +6373,7 @@ class Bot(OfferControllerMixin):
                 return
             wallet = self.store.get_wallet_by_id(wallet_id)
             if wallet and self.store.delete_wallet_by_id(wallet_id):
+                self.release_wallet_claim(wallet.address)
                 self.reload_wallets()
                 self.telegram.send(chat_id, f"🗑 تم حذف المحفظة «{wallet.name}».", self.wallet_list_buttons())
             else:
@@ -6227,6 +6565,11 @@ class Bot(OfferControllerMixin):
                         self.race_launch_executor.submit(self._launch_candidate_race, candidate, plan, live=True)
             self.edit_or_send(event, self.settings_text(), self.settings_buttons())
             return
+
+        if data == "notifications_toggle":
+            self.notifications_enabled = not self.notifications_enabled
+            self.store.set_setting("notifications_enabled", "1" if self.notifications_enabled else "0")
+            self.edit_or_send(event,self.settings_text(),self.settings_buttons()); return
 
         if data == "stage_notify_toggle":
             self.routine_stage_notifications = not self.routine_stage_notifications
@@ -6494,6 +6837,34 @@ class Bot(OfferControllerMixin):
 
     def handle_message(self, event: dict[str, Any]) -> None:
         chat_id = event["chat_id"]
+        text = str(event.get("text", "")).strip()
+        pu=self.pending_user_admin.get(chat_id)
+        if pu and self.is_admin and self.user_registry is not None:
+            if text == "/cancel" or time.time()>float(pu.get("expiry",0)):
+                self.pending_user_admin.pop(chat_id,None); self.telegram.send(chat_id,"تم إلغاء إدارة المستخدم.",self.menu_buttons()); return
+            step=pu.get("step")
+            if step=="name": pu.update(step="telegram",name=text); self.telegram.send(chat_id,"أرسل Telegram ID الخاص بالمستخدم (رقمي)."); return
+            if step=="telegram":
+                if not text.lstrip('-').isdigit(): self.telegram.send(chat_id,"⚠️ Telegram ID يجب أن يكون رقمًا."); return
+                pu.update(step="token",telegram_id=text); self.telegram.send(chat_id,"أرسل Bot Token الخاص بالمستخدم. سيتم تخزينه مشفرًا ولن يظهر في السجل."); return
+            if step=="token":
+                if ':' not in text: self.telegram.send(chat_id,"⚠️ Bot Token غير صحيح."); return
+                pu.update(step="limit",bot_token=text); self.telegram.delete_message(chat_id,int(event.get("message_id",0))); self.telegram.send(chat_id,"أرسل الحد الأقصى لعدد المحافظ."); return
+            if step=="limit":
+                try: limit=int(text)
+                except: self.telegram.send(chat_id,"⚠️ أرسل رقمًا صحيحًا."); return
+                try:
+                    uid=self.user_registry.add(pu['name'],pu['telegram_id'],pu['bot_token'],limit)
+                    self.pending_user_admin.pop(chat_id,None)
+                    if self.tenant_supervisor:self.tenant_supervisor.start_user(uid)
+                    self.telegram.send(chat_id,f"✅ تم إنشاء المستخدم وتشغيل البوت الخاص به.\n\n{self.user_detail_text(uid)}",self.user_detail_buttons(uid))
+                except Exception as exc:self.telegram.send(chat_id,f"⚠️ تعذر إنشاء المستخدم: {exc}")
+                return
+            if step=="limit_edit":
+                try: limit=int(text); self.user_registry.set_limit(int(pu['uid']),limit); self.pending_user_admin.pop(chat_id,None);
+                except Exception: self.telegram.send(chat_id,"⚠️ أرسل رقمًا صحيحًا 0 أو أكبر."); return
+                if self.tenant_supervisor:self.tenant_supervisor.refresh_user(int(pu['uid']))
+                self.telegram.send(chat_id,"✅ تم تحديث حد المحافظ.",self.user_detail_buttons(int(pu['uid']))); return
         text = event.get("text", "").strip()
 
         if text.lower() == "/cancel":
@@ -6747,6 +7118,12 @@ class Bot(OfferControllerMixin):
 
         parts = text.split()
         command = parts[0].lower().split("@", 1)[0] if parts else ""
+        _cmd_perm={"/wallets":"wallets.view","/qualification":"qualification.view","/status":"monitoring.view","/free":"free_mints.view",
+                   "/paid":"paid_mints.use","/history":"history.view","/chains":"chains.view","/pause":"bot.pause","/panic":"bot.pause",
+                   "/resume":"bot.pause","/eligibility":"qualification.view","/watch":"monitoring.create","/deletewallet":"wallets.delete"}
+        _rp=_cmd_perm.get(command)
+        if _rp and not self.can(_rp):
+            self.telegram.send(chat_id,"⛔ ليس لديك صلاحية لهذا الأمر.",self.menu_buttons()); return
         if command in {"/start", "/help", "/menu"} or text in {"القائمة", "الرئيسية"}:
             self.send_menu(chat_id)
             return
@@ -6803,6 +7180,7 @@ class Bot(OfferControllerMixin):
                 return
             wallet = self.store.get_wallet_by_address(Web3.to_checksum_address(address))
             deleted = self.store.delete_wallet(Web3.to_checksum_address(address))
+            if deleted: self.release_wallet_claim(Web3.to_checksum_address(address))
             self.reload_wallets()
             self.telegram.send(
                 chat_id,
@@ -6914,6 +7292,8 @@ class Bot(OfferControllerMixin):
         return (6, float(candidate.next_stage_start or 9e18))
 
     def notify_all(self, text: str) -> None:
+        if not self.notifications_enabled or not self.can("notifications.receive"):
+            return
         if not self.telegram.enabled:
             return
         for chat_id in self.telegram.allowed_chat_ids:
@@ -6921,8 +7301,9 @@ class Bot(OfferControllerMixin):
 
     # ---------- main loop ----------
     def run(self) -> None:
-        start_health_server()
-        log.info("Mint Guardian V4.13.1 starting")
+        if self.is_admin:
+            start_health_server()
+        log.info("Mint Guardian V4.14.1 Direct Fan-Out starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
@@ -6932,12 +7313,14 @@ class Bot(OfferControllerMixin):
         self.bootstrap_watches()
         # Start market snapshots before discovery. It runs independently and
         # keeps price/fee data hot for the race lane.
-        self.start_race_market_warmer()
+        if not self.shared_discovery_mode:
+            self.start_race_market_warmer()
         self.start_low_balance_recheck()
         self.start_maintenance()
         self.start_race_scheduler()
-        self.start_seadrop_log_discovery()
-        self.start_auto_free_discovery()
+        if not self.shared_discovery_mode:
+            self.start_seadrop_log_discovery()
+            self.start_auto_free_discovery()
         log.info(
             "Discovery priority ready | stream-fast=%s | upcoming=%.1fs | mint-events=%.1fs | catalog-backfill=%.1fs | REST concurrency=%s",
             self.auto_stream_fast_path, self.auto_upcoming_scan_seconds, self.auto_event_scan_seconds,
@@ -6956,8 +7339,12 @@ class Bot(OfferControllerMixin):
             self.seadrop_wss_enabled, self.race_fee_refresh_seconds, self.race_gas_strategy,
         )
         log.info(
-            "ULTRA RACE V4.13.1 ready | prewarm=%.2fs | fee-refresh=%.2fs | low-balance-recheck=%.2fs | live-fee-retry=True | history=24h",
+            "ULTRA RACE V4.14.1 ready | prewarm=%.2fs | fee-refresh=%.2fs | low-balance-recheck=%.2fs | live-fee-retry=True | history=24h",
             self.race_prewarm_seconds, self.race_fee_refresh_seconds, self.low_balance_recheck_seconds,
+        )
+        log.info(
+            "DIRECT TENANT FAN-OUT ready | enabled=%s | polling-dependency=0 | admin-headstart=%.1fms | resolved-public-reuse=True",
+            self.direct_tenant_fanout, self.tenant_admin_headstart_seconds * 1000.0,
         )
         log.info(
             "Race signal coalescer ready | single-flight=True | stream-quiet=%.2fs | seadrop-quiet=%.2fs | unknown-quiet=%.2fs",
@@ -6971,7 +7358,7 @@ class Bot(OfferControllerMixin):
         )
         log.info("Collection Offers ready | isolated-executor=True | main-loop-polling=False | Race-hooks=0")
         self.notify_all(
-            "🟢 OpenSea Mint Guardian V4.13.1 يعمل الآن على Railway.\n"
+            "🟢 OpenSea Mint Guardian V4.14.1 Direct Fan-Out يعمل الآن على Railway.\n"
             f"الاكتشاف التلقائي: {'مفعّل كل ' + format(self.auto_free_scan_seconds, 'g') + ' ثانية' if self.auto_free_enabled else 'متوقف'}.\n"
             f"OpenSea Stream: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} | REST Mint Events: {'مفعّل' if self.auto_event_fallback_enabled else 'متوقف'}.\n"
             f"التأهيل/المراقبة: تعمل بصمت وتظهر تفاصيلها عند فتح الأقسام.\n"
@@ -6982,12 +7369,17 @@ class Bot(OfferControllerMixin):
             "تمت استعادة المراقبات وخطط المدفوع والمحافظ النشطة بنجاح."
         )
         while not STOP:
+            if self.tenant_disabled:
+                time.sleep(0.10); continue
+            if self.shared_discovery_mode:
+                self.sync_shared_candidates()
             self.drain_auto_discovery()
             self.cleanup_auto_candidates()
             with self.candidates_lock:
                 ordered = sorted(list(self.candidates.items()), key=lambda kv: self.candidate_loop_priority(kv[1]))
             for key, candidate in ordered:
-                self.refresh_candidate(candidate)
+                if not (self.shared_discovery_mode and str(candidate.discovery_source).startswith("shared-")):
+                    self.refresh_candidate(candidate)
                 self.process_stage_schedule(candidate)
                 self.try_candidate(candidate)
                 self.check_receipts(candidate)
@@ -7005,7 +7397,19 @@ class Bot(OfferControllerMixin):
 
 if __name__ == "__main__":
     try:
-        Bot().run()
+        from multi_user import UserRegistry, TenantRuntime, TenantSupervisor
+        volume=os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip(); data_dir=Path(volume or os.getenv("DATA_DIR","./data")); data_dir.mkdir(parents=True,exist_ok=True)
+        key=os.getenv("WALLET_ENCRYPTION_KEY","").strip()
+        registry=UserRegistry(str(data_dir/"users.db"),key)
+        admin_rt=TenantRuntime(None,is_admin=True)
+        admin=Bot(tenant_runtime=admin_rt,user_registry=registry)
+        for _w in admin.store.list_wallets(enabled_only=False):
+            registry.claim_wallet(_w.address,0)
+        supervisor=TenantSupervisor(admin,registry,Bot,data_dir); admin.tenant_supervisor=supervisor
+        def _start_tenants_after_admin():
+            time.sleep(2.0); supervisor.start_all()
+        threading.Thread(target=_start_tenants_after_admin,name="tenant-bootstrap",daemon=True).start()
+        admin.run()
     except Exception as exc:
         log.exception("Fatal error: %s", exc)
         sys.exit(1)
