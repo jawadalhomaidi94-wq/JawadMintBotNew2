@@ -233,6 +233,10 @@ Collection Offers ready | isolated-executor=True | main-loop-polling=False | Rac
 - The Offer itself requires the final `✅ تأكيد تقديم العرض` action.
 
 
-## V4.12.2 — USDT display and Wallet balances
+## V4.13.0 — USDT display and Wallet balances
 
 Telegram now displays native-token amounts together with an approximate USDT equivalent across qualification, paid/free mint, gas/fee, eligibility, history, and Offer financial messages. The Wallets section includes a manual `💰 عرض الرصيد` action that reads balances on enabled networks and shows the native balance plus its approximate USDT value. Balance reads are isolated from the mint Main Loop and Race Lane.
+
+
+## Ultra Race V4.13.0
+Known stages prewarm earlier. Fast live signals reuse their already-read SeaDrop public configuration, and free live Race uses the configured static race gas limit so estimateGas is not in front of broadcast. The existing protection/qualification decisions are unchanged.

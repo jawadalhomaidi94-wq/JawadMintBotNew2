@@ -1255,7 +1255,7 @@ class Bot(OfferControllerMixin):
         # timestamp. Live Stream/SeaDrop signals bypass discovery queues and
         # enter a separate executor immediately.
         self.race_enabled = env_bool("RACE_LANE_ENABLED", True)
-        self.race_prewarm_seconds = max(0.30, env_float("RACE_PREWARM_SECONDS", 2.5))
+        self.race_prewarm_seconds = max(0.30, env_float("RACE_PREWARM_SECONDS", 6.0))
         self.race_scheduler_tick = max(0.002, env_float("RACE_SCHEDULER_TICK", 0.005))
         self.race_retry_seconds = max(0.02, env_float("RACE_RETRY_SECONDS", 0.04))
         self.race_launch_window_seconds = max(1.0, env_float("RACE_LAUNCH_WINDOW_SECONDS", 8.0))
@@ -3046,7 +3046,7 @@ class Bot(OfferControllerMixin):
             with self.race_state_lock:
                 self.race_preparing.discard(key)
 
-    def _launch_candidate_race(self, candidate: Candidate, plan: dict[str, Any], *, live: bool = False) -> None:
+    def _launch_candidate_race(self, candidate: Candidate, plan: dict[str, Any], *, live: bool = False, public_override: dict[str, Any] | None = None) -> None:
         launch_perf = time.perf_counter()
         if self.paused or not self.race_enabled or not candidate.contract_address:
             return
@@ -3067,7 +3067,11 @@ class Bot(OfferControllerMixin):
                 with self.race_state_lock:
                     bundle = self.race_prepared.pop(key, None)
             if bundle is None:
-                public = read_seadrop_public_fast(self.rpc_pools[candidate.chain].primary, candidate.contract_address)
+                # V4.13 Ultra Race: reuse the public config already resolved by
+                # the fast signal instead of performing a duplicate RPC read.
+                public = public_override if public_override is not None else read_seadrop_public_fast(
+                    self.rpc_pools[candidate.chain].primary, candidate.contract_address
+                )
                 if not public or not public.get("configured"):
                     return
                 # A Stream event means the stage is already live; use one shared
@@ -3097,7 +3101,10 @@ class Bot(OfferControllerMixin):
                     fee_fields_override=self.race_fee_fields(candidate.chain, allow_network=False),
                     public_override=public,
                     allow_before_start=not live,
-                    static_gas_limit=None if live else self.race_static_gas_limit,
+                    # Free live launches use the already-configured conservative
+                    # Race gas limit, eliminating estimateGas from the hot path.
+                    # Paid live launches keep the existing estimate/confirmation path.
+                    static_gas_limit=(self.race_static_gas_limit if (not live or not paid) else None),
                     skip_balance_check=live,
                     clamp_fees_to_gas_budget=True,
                 )
@@ -3270,7 +3277,7 @@ class Bot(OfferControllerMixin):
                 if not self.social_protection_allows(candidate, plan):
                     log.debug("Fast free mint waiting for social trust | %s | %s", candidate.slug, chain)
                     return True
-                self._launch_candidate_race(candidate, plan, live=True)
+                self._launch_candidate_race(candidate, plan, live=True, public_override=public)
                 log.info(
                     "Fast signal handled | source=%s | %s | %s | %.3fs",
                     source, candidate.slug, chain, time.perf_counter() - signal_perf,
@@ -5034,7 +5041,7 @@ class Bot(OfferControllerMixin):
         total = len(self.store.list_wallets(enabled_only=False))
         self.telegram.send(
             chat_id,
-            "🤖 OpenSea Mint Guardian V4.12.2\n\n"
+            "🤖 OpenSea Mint Guardian V4.13.0\n\n"
             "🆓 الاكتشاف المجاني: Stream لحظي + SeaDrop مباشر + REST احتياطي\n"
             f"⚡ الاستعداد للـPublic: آخر {self.public_preopen_window_seconds:g} ثوانٍ\n"
             f"📦 سياسة الكمية: حد المنت ≤100 يؤخذ كما هو، وإذا كان >100/غير محدود فالهدف {self.auto_stage_high_limit_quantity}\n"
@@ -6723,7 +6730,7 @@ class Bot(OfferControllerMixin):
     # ---------- main loop ----------
     def run(self) -> None:
         start_health_server()
-        log.info("Mint Guardian V4.12.2 starting")
+        log.info("Mint Guardian V4.13.0 Ultra Race starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
@@ -6756,6 +6763,10 @@ class Bot(OfferControllerMixin):
             self.seadrop_wss_enabled, self.race_fee_refresh_seconds, self.race_gas_strategy,
         )
         log.info(
+            "ULTRA RACE ready | prewarm=%.2fs | public-reuse=True | free-live-static-gas=True | duplicate-stage-RPC=0",
+            self.race_prewarm_seconds,
+        )
+        log.info(
             "Race signal coalescer ready | single-flight=True | stream-quiet=%.2fs | seadrop-quiet=%.2fs | unknown-quiet=%.2fs",
             self.race_signal_stream_quiet_seconds, self.race_signal_seadrop_quiet_seconds,
             self.race_signal_unknown_quiet_seconds,
@@ -6767,7 +6778,7 @@ class Bot(OfferControllerMixin):
         )
         log.info("Collection Offers ready | isolated-executor=True | main-loop-polling=False | Race-hooks=0")
         self.notify_all(
-            "🟢 OpenSea Mint Guardian V4.12.2 يعمل الآن على Railway.\n"
+            "🟢 OpenSea Mint Guardian V4.13.0 يعمل الآن على Railway.\n"
             f"الاكتشاف التلقائي: {'مفعّل كل ' + format(self.auto_free_scan_seconds, 'g') + ' ثانية' if self.auto_free_enabled else 'متوقف'}.\n"
             f"OpenSea Stream: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} | REST Mint Events: {'مفعّل' if self.auto_event_fallback_enabled else 'متوقف'}.\n"
             f"التأهيل/المراقبة: تعمل بصمت وتظهر تفاصيلها عند فتح الأقسام.\n"

@@ -1,3 +1,11 @@
+# V4.13.0 — Ultra Race
+
+- Preserves V4.12.2 behavior and safety decisions.
+- Removes a duplicate SeaDrop public-config RPC read from fast-signal launches.
+- Removes estimateGas from FREE live Race by using the existing conservative static Race gas limit.
+- Moves default prewarm lead from 2.5s to 6.0s for known monitoring/qualification stages.
+- Existing all-wallet parallel broadcast, nonce safety, Protected Free Mint Shield, qualification logic, 24h cleanup and Offers isolation remain unchanged.
+
 # V4.12.2
 
 - Added USDT equivalent display beside native-token prices/fees in qualification, paid mints, free mints, eligibility, mint transaction notifications, history, and wallet balance views.
