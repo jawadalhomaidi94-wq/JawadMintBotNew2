@@ -594,14 +594,22 @@ def _http_status(exc: requests.HTTPError) -> int | None:
 
 
 def _classify_tx_exception_status(exc: Exception | str) -> str:
-    """Map provider errors that really mean an empty/underfunded wallet.
+    """Classify common RPC send failures without changing the stable broadcaster.
 
-    Live Race intentionally skips a pre-broadcast balance read for speed, so the
-    RPC node can be the first component to report insufficient native funds.
-    Classifying that response here lets the controller alert the user instead of
-    hiding it behind a generic rpc_or_tx_error.
+    Race can skip a balance read for speed, so provider errors are also part of
+    the safety/status layer. Nonce errors are separated so the race broadcaster
+    can refresh the pending nonce, re-sign, and retry immediately.
     """
     text = str(exc or "").lower()
+    nonce_markers = (
+        "nonce too low",
+        "nonce has already been used",
+        "already used nonce",
+        "old nonce",
+        "invalid transaction nonce",
+    )
+    if any(marker in text for marker in nonce_markers):
+        return "nonce_too_low"
     insufficient_markers = (
         "insufficient funds",
         "insufficient balance",
@@ -613,6 +621,49 @@ def _classify_tx_exception_status(exc: Exception | str) -> str:
         "not enough funds",
     )
     return "insufficient_balance" if any(marker in text for marker in insufficient_markers) else "rpc_or_tx_error"
+
+
+_RACE_NONCE_GUARD = threading.RLock()
+_RACE_NONCE_LOCKS: dict[tuple[int, str], threading.Lock] = {}
+_RACE_LOCAL_NEXT_NONCE: dict[tuple[int, str], int] = {}
+
+
+def _race_nonce_lock(chain_id: int, address: str) -> threading.Lock:
+    key = (int(chain_id), address.lower())
+    with _RACE_NONCE_GUARD:
+        lock = _RACE_NONCE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _RACE_NONCE_LOCKS[key] = lock
+        return lock
+
+
+def _race_choose_nonce(rpc_pool: "RpcPool", address: str) -> int:
+    """Choose a nonce safe against another concurrent mint from this process.
+
+    The provider's pending nonce is authoritative after restarts/external sends;
+    the local floor closes the tiny propagation window between two successful
+    broadcasts from the same wallet on the same chain.
+    """
+    address = Web3.to_checksum_address(address)
+    network_pending = int(rpc_pool.primary.eth.get_transaction_count(address, "pending"))
+    key = (int(rpc_pool.chain_id), address.lower())
+    with _RACE_NONCE_GUARD:
+        local_next = _RACE_LOCAL_NEXT_NONCE.get(key, network_pending)
+        return max(network_pending, int(local_next))
+
+
+def _race_local_nonce_floor(rpc_pool: "RpcPool", address: str) -> int | None:
+    key = (int(rpc_pool.chain_id), address.lower())
+    with _RACE_NONCE_GUARD:
+        value = _RACE_LOCAL_NEXT_NONCE.get(key)
+        return None if value is None else int(value)
+
+
+def _race_mark_nonce_submitted(rpc_pool: "RpcPool", address: str, nonce: int) -> None:
+    key = (int(rpc_pool.chain_id), address.lower())
+    with _RACE_NONCE_GUARD:
+        _RACE_LOCAL_NEXT_NONCE[key] = max(int(_RACE_LOCAL_NEXT_NONCE.get(key, 0)), int(nonce) + 1)
 
 
 def _safe_rpc_url_for_log(url: str) -> str:
@@ -1699,6 +1750,7 @@ def prepare_seadrop_race_transactions(
         "public": public,
         "fee_recipient": fee_recipient,
         "fees": fees,
+        "nft_contract": Web3.to_checksum_address(nft_contract),
         "prepared_at": time.time(),
         "static_gas": static_gas_limit is not None,
     }
@@ -1710,43 +1762,112 @@ def broadcast_seadrop_race_transactions(
     bundle: dict[str, Any],
     max_parallel_wallets: int = 10,
 ) -> dict[str, MintResult]:
-    """Broadcast a pre-signed SeaDrop race bundle concurrently."""
+    """Broadcast a pre-signed SeaDrop race bundle concurrently.
+
+    V4.11.2 keeps the proven RpcPool broadcaster from V4.11.1, but serializes
+    broadcasts only per wallet+chain long enough to guarantee a fresh nonce.
+    Different wallets still broadcast fully in parallel. If the provider still
+    reports ``nonce too low``, the entry is re-signed once with a freshly read
+    pending nonce and re-broadcast immediately.
+    """
     results: dict[str, MintResult] = dict(bundle.get("results") or {})
     entries = list(bundle.get("entries") or [])
     if not entries:
         return results
 
+    public = dict(bundle.get("public") or {})
+    fee_recipient = bundle.get("fee_recipient") or public.get("fee_recipient")
+    nft_contract = bundle.get("nft_contract")
+    price_each = int(public.get("mint_price_wei") or 0)
+
+    def resign(entry: dict[str, Any], nonce: int):
+        wallet: WalletConfig = entry["wallet"]
+        if not nft_contract or not fee_recipient:
+            raise RuntimeError("Race bundle missing SeaDrop contract metadata for nonce refresh.")
+        base_tx = _seadrop_base_tx(
+            rpc_pool.primary,
+            payer=wallet.address,
+            nft_contract=nft_contract,
+            fee_recipient=fee_recipient,
+            quantity=int(entry["quantity"]),
+            mint_price_wei=price_each,
+            chain_id=rpc_pool.chain_id,
+            nonce=int(nonce),
+        )
+        tx = {**base_tx, "gas": int(entry["gas_limit"]), **dict(entry.get("fee_fields") or {})}
+        account = Account.from_key(wallet.private_key)
+        signed = account.sign_transaction(tx)
+        return getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
+
     def send(entry: dict[str, Any]) -> tuple[str, MintResult]:
         wallet: WalletConfig = entry["wallet"]
         addr_l = wallet.address.lower()
-        try:
-            tx_hash, rpc_url = rpc_pool.broadcast_raw_transaction(entry["raw"])
-            return addr_l, MintResult(
-                True,
-                "submitted",
-                tx_hash=tx_hash,
-                mint_value_native=entry["mint_value_native"],
-                gas_cost_native=entry["gas_cost_native"],
-                gas_cost_usd=entry["gas_cost_usd"],
-                total_max_native=entry["total_max_native"],
-                detail="V4.9 race-lane pre-signed SeaDrop transaction.",
-                rpc=rpc_url,
-                target=SEADROP_ADDRESS,
-                quantity_used=int(entry["quantity"]),
-            )
-        except Exception as exc:
-            return addr_l, MintResult(
-                False,
-                _classify_tx_exception_status(exc),
-                mint_value_native=entry["mint_value_native"],
-                gas_cost_native=entry["gas_cost_native"],
-                gas_cost_usd=entry["gas_cost_usd"],
-                total_max_native=entry["total_max_native"],
-                detail=str(exc),
-                target=SEADROP_ADDRESS,
-                quantity_used=int(entry["quantity"]),
-            )
+        lock = _race_nonce_lock(rpc_pool.chain_id, wallet.address)
+        with lock:
+            chosen_nonce = int(entry.get("nonce") or 0)
+            raw = entry["raw"]
+            try:
+                # Zero-RPC fast path: when this process has already submitted a
+                # transaction for the same wallet+chain after prewarm, its local
+                # nonce floor proves this signature is stale. Re-sign immediately.
+                # If there is no local evidence, broadcast the original V4.11.1
+                # raw transaction without adding a nonce RPC round-trip.
+                local_floor = _race_local_nonce_floor(rpc_pool, wallet.address)
+                if local_floor is not None and local_floor > chosen_nonce:
+                    chosen_nonce = int(local_floor)
+                    raw = resign(entry, chosen_nonce)
+                    log.info(
+                        "Race nonce refreshed | chain=%s | wallet=%s | old=%s | new=%s",
+                        rpc_pool.chain, wallet.address[:6] + "…" + wallet.address[-4:],
+                        entry.get("nonce"), chosen_nonce,
+                    )
 
+                try:
+                    tx_hash, rpc_url = rpc_pool.broadcast_raw_transaction(raw)
+                except Exception as first_exc:
+                    status = _classify_tx_exception_status(first_exc)
+                    if status != "nonce_too_low":
+                        raise
+                    # A different transaction may have landed between the first
+                    # nonce read and broadcast. Refresh and retry once immediately.
+                    retry_nonce = max(_race_choose_nonce(rpc_pool, wallet.address), chosen_nonce + 1)
+                    raw = resign(entry, retry_nonce)
+                    chosen_nonce = retry_nonce
+                    log.info(
+                        "Race nonce retry | chain=%s | wallet=%s | nonce=%s",
+                        rpc_pool.chain, wallet.address[:6] + "…" + wallet.address[-4:], chosen_nonce,
+                    )
+                    tx_hash, rpc_url = rpc_pool.broadcast_raw_transaction(raw)
+
+                _race_mark_nonce_submitted(rpc_pool, wallet.address, chosen_nonce)
+                return addr_l, MintResult(
+                    True,
+                    "submitted",
+                    tx_hash=tx_hash,
+                    mint_value_native=entry["mint_value_native"],
+                    gas_cost_native=entry["gas_cost_native"],
+                    gas_cost_usd=entry["gas_cost_usd"],
+                    total_max_native=entry["total_max_native"],
+                    detail=f"V4.11.2 nonce-safe race-lane SeaDrop transaction (nonce={chosen_nonce}).",
+                    rpc=rpc_url,
+                    target=SEADROP_ADDRESS,
+                    quantity_used=int(entry["quantity"]),
+                )
+            except Exception as exc:
+                return addr_l, MintResult(
+                    False,
+                    _classify_tx_exception_status(exc),
+                    mint_value_native=entry["mint_value_native"],
+                    gas_cost_native=entry["gas_cost_native"],
+                    gas_cost_usd=entry["gas_cost_usd"],
+                    total_max_native=entry["total_max_native"],
+                    detail=str(exc),
+                    target=SEADROP_ADDRESS,
+                    quantity_used=int(entry["quantity"]),
+                )
+
+    # Nonce locks serialize only transactions from the *same* wallet. Separate
+    # wallets remain parallel, preserving the multi-wallet race behavior.
     with ThreadPoolExecutor(max_workers=max(1, min(int(max_parallel_wallets), len(entries)))) as executor:
         futures = [executor.submit(send, entry) for entry in entries]
         for future in as_completed(futures):

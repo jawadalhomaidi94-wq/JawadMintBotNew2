@@ -1494,22 +1494,41 @@ class Bot:
             )
 
             # A sudden Public free mint may have been waiting only on this gate.
-            # Launch immediately after PASS instead of waiting for a catalog tick.
+            # PASS must wake the mint path even when OpenSea stage metadata and
+            # the on-chain SeaDrop signal arrived in the opposite order.
             if status == "passed" and self.free_social_protection_enabled:
                 now = time.time()
+                self.sync_wallets_into_candidates()
                 for state in candidate.wallets.values():
                     if not state.submitted and not state.final:
                         state.next_attempt = min(state.next_attempt or now, now)
+
+                launched_from_plan = False
                 plan = self.current_plan_for_candidate(candidate, now) if candidate.stage_plans else None
                 if (
                     plan and plan.get("is_public") and not plan.get("is_paid")
-                    and candidate.contract_address and self.race_enabled
+                    and candidate.contract_address and self.race_enabled and not self.paused
                 ):
                     race_key = self._race_key(candidate, str(plan.get("key") or ""))
                     with self.race_state_lock:
                         has_prepared = race_key in self.race_prepared
                     self.race_launch_executor.submit(
                         self._launch_candidate_race, candidate, plan, live=not has_prepared
+                    )
+                    launched_from_plan = True
+
+                # Critical V4.11.2 fallback: a social PASS is also a fresh fast
+                # contract signal. If stage_plans were not populated yet, read
+                # SeaDrop on-chain immediately and launch the active free Public
+                # instead of waiting for the next catalog/stream event.
+                if candidate.contract_address and self.race_enabled and not launched_from_plan:
+                    signal_slug = slug if slug and not slug.startswith("contract-") else candidate.slug
+                    self.submit_fast_contract_signal(
+                        candidate.chain, candidate.contract_address, signal_slug, "social-pass"
+                    )
+                    log.info(
+                        "Social PASS fast wake | %s | %s | contract=%s",
+                        candidate.slug, candidate.chain, short_address(candidate.contract_address),
                     )
         except Exception as exc:
             checked = time.time()
@@ -2982,7 +3001,10 @@ class Bot:
         dedupe = f"{chain}:{contract.lower()}"
         now = time.time()
         with self.race_state_lock:
-            if now - self.race_signal_seen.get(dedupe, 0.0) < 0.20:
+            # A social PASS is not a duplicate discovery event: it is the event
+            # that unlocks broadcast. Never discard it merely because the first
+            # SeaDrop/Stream signal happened <200ms earlier.
+            if source != "social-pass" and now - self.race_signal_seen.get(dedupe, 0.0) < 0.20:
                 return
             self.race_signal_seen[dedupe] = now
         try:
@@ -4512,6 +4534,7 @@ class Bot:
     def set_execution_paused(self, paused: bool) -> None:
         """Pause/resume every signing+broadcast path, including Race Lane."""
         self.paused = bool(paused)
+        log.info("Execution pause state | paused=%s", self.paused)
         if self.paused:
             # Prepared transactions are intentionally discarded so Resume never
             # broadcasts a stale nonce/fee snapshot built before the pause.
@@ -4600,7 +4623,7 @@ class Bot:
         total = len(self.store.list_wallets(enabled_only=False))
         self.telegram.send(
             chat_id,
-            "🤖 OpenSea Mint Guardian V4.11.1\n\n"
+            "🤖 OpenSea Mint Guardian V4.11.2\n\n"
             "🆓 الاكتشاف المجاني: Stream لحظي + SeaDrop مباشر + REST احتياطي\n"
             f"⚡ الاستعداد للـPublic: آخر {self.public_preopen_window_seconds:g} ثوانٍ\n"
             f"📦 سياسة الكمية: حد المنت ≤100 يؤخذ كما هو، وإذا كان >100/غير محدود فالهدف {self.auto_stage_high_limit_quantity}\n"
@@ -6116,7 +6139,7 @@ class Bot:
     # ---------- main loop ----------
     def run(self) -> None:
         start_health_server()
-        log.info("Mint Guardian V4.11.1 starting")
+        log.info("Mint Guardian V4.11.2 starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
@@ -6141,7 +6164,7 @@ class Bot:
             self.public_fast_retry_seconds, self.auto_stage_high_limit_quantity,
         )
         log.info(
-            "RACE LANE V4.11.1 STABLE ready | enabled=%s | prewarm=%.2fs | scheduler=%.3fs | retry=%.3fs | staticGas=%s | signal/prep/launch=%s/%s/%s | SeaDrop-WSS=%s | fee-cache=%.2fs | race-gas=%s",
+            "RACE LANE V4.11.2 STABLE ready | enabled=%s | prewarm=%.2fs | scheduler=%.3fs | retry=%.3fs | staticGas=%s | signal/prep/launch=%s/%s/%s | SeaDrop-WSS=%s | fee-cache=%.2fs | race-gas=%s",
             self.race_enabled, self.race_prewarm_seconds, self.race_scheduler_tick,
             self.race_retry_seconds, self.race_static_gas_limit,
             self.race_stream_workers, self.race_prep_workers, self.race_launch_workers,
@@ -6153,7 +6176,7 @@ class Bot:
             self.social_trust_pass_ttl, self.social_trust_reject_ttl,
         )
         self.notify_all(
-            "🟢 OpenSea Mint Guardian V4.11.1 يعمل الآن على Railway.\n"
+            "🟢 OpenSea Mint Guardian V4.11.2 يعمل الآن على Railway.\n"
             f"الاكتشاف التلقائي: {'مفعّل كل ' + format(self.auto_free_scan_seconds, 'g') + ' ثانية' if self.auto_free_enabled else 'متوقف'}.\n"
             f"OpenSea Stream: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} | REST Mint Events: {'مفعّل' if self.auto_event_fallback_enabled else 'متوقف'}.\n"
             f"التأهيل/المراقبة: تعمل بصمت وتظهر تفاصيلها عند فتح الأقسام.\n"
