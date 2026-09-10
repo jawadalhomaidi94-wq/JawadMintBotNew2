@@ -155,6 +155,22 @@ class SecureStore:
                     value TEXT NOT NULL,
                     updated_at REAL NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS social_trust_cache (
+                    project_key TEXT PRIMARY KEY,
+                    slug TEXT NOT NULL,
+                    chain TEXT NOT NULL,
+                    contract_address TEXT,
+                    status TEXT NOT NULL,
+                    twitter_username TEXT,
+                    twitter_url TEXT,
+                    website_url TEXT,
+                    checked_at REAL NOT NULL,
+                    detail TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_social_trust_slug
+                    ON social_trust_cache(slug COLLATE NOCASE, checked_at DESC);
                 """
             )
 
@@ -498,6 +514,34 @@ class SecureStore:
         with self.lock, self.conn:
             cur = self.conn.execute("DELETE FROM bot_settings WHERE key=?", (str(key),))
             return cur.rowcount > 0
+
+    def get_social_trust(self, project_key: str) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM social_trust_cache WHERE project_key=?", (str(project_key),)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_social_trust(
+        self, *, project_key: str, slug: str, chain: str, contract_address: str | None,
+        status: str, twitter_username: str | None = None, twitter_url: str | None = None,
+        website_url: str | None = None, checked_at: float | None = None, detail: str | None = None,
+    ) -> None:
+        checked = float(checked_at if checked_at is not None else time.time())
+        with self.lock, self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO social_trust_cache(
+                    project_key,slug,chain,contract_address,status,twitter_username,twitter_url,website_url,checked_at,detail
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(project_key) DO UPDATE SET
+                    slug=excluded.slug,chain=excluded.chain,contract_address=excluded.contract_address,
+                    status=excluded.status,twitter_username=excluded.twitter_username,twitter_url=excluded.twitter_url,
+                    website_url=excluded.website_url,checked_at=excluded.checked_at,detail=excluded.detail
+                """,
+                (str(project_key), str(slug), str(chain), contract_address, str(status), twitter_username,
+                 twitter_url, website_url, checked, detail),
+            )
 
     def set_watch_gas_policy(
         self, slug: str, *, gas_override_usd: str | None = None, ignore_gas_cap: bool = False

@@ -606,6 +606,101 @@ def collection_contract_candidates(payload: Any) -> list[tuple[str | None, str]]
     return found
 
 
+def _clean_social_url(value: Any, *, allow_handle: bool = False) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if allow_handle and re.fullmatch(r"@?[A-Za-z0-9_]{1,30}", text):
+        return f"https://x.com/{text.lstrip('@')}"
+    if text.startswith("//"):
+        text = "https:" + text
+    if not re.match(r"^https?://", text, re.I):
+        if "." in text and " " not in text:
+            text = "https://" + text.lstrip("/")
+        else:
+            return None
+    try:
+        parsed = urlparse(text)
+    except Exception:
+        return None
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return None
+    return text
+
+
+def extract_collection_social_identity(payload: Any) -> tuple[str | None, str | None, str | None]:
+    """Return (twitter_username, twitter_url, website_url) from OpenSea collection metadata.
+
+    The V4.11 shield only verifies that OpenSea exposes at least one project
+    identity link. It deliberately does not inspect follower counts/account age;
+    those require a future X API integration.
+    """
+    if not isinstance(payload, dict):
+        return None, None, None
+    roots: list[dict[str, Any]] = [payload]
+    for key in ("collection", "data", "result"):
+        child = payload.get(key)
+        if isinstance(child, dict):
+            roots.append(child)
+
+    twitter_username: str | None = None
+    twitter_url: str | None = None
+    website_url: str | None = None
+
+    for root in roots:
+        if twitter_username is None:
+            raw_user = root.get("twitter_username") or root.get("twitterUsername") or root.get("x_username") or root.get("xUsername")
+            if isinstance(raw_user, str) and raw_user.strip():
+                twitter_username = raw_user.strip().lstrip("@")
+                twitter_url = _clean_social_url(twitter_username, allow_handle=True)
+        if twitter_url is None:
+            for key in ("twitter_url", "twitterUrl", "x_url", "xUrl", "twitter", "x"):
+                url = _clean_social_url(root.get(key), allow_handle=True)
+                if url:
+                    twitter_url = url
+                    if twitter_username is None:
+                        try:
+                            host = urlparse(url).netloc.lower()
+                            if host.endswith("x.com") or host.endswith("twitter.com"):
+                                path = urlparse(url).path.strip("/").split("/", 1)[0]
+                                if path:
+                                    twitter_username = path
+                        except Exception:
+                            pass
+                    break
+        if website_url is None:
+            for key in ("external_url", "externalUrl", "external_link", "externalLink", "website_url", "websiteUrl", "website", "homepage"):
+                url = _clean_social_url(root.get(key))
+                if not url:
+                    continue
+                try:
+                    host = urlparse(url).netloc.lower().split(":", 1)[0]
+                except Exception:
+                    host = ""
+                # The OpenSea collection page itself is not an external project website.
+                if host == "opensea.io" or host.endswith(".opensea.io"):
+                    continue
+                website_url = url
+                break
+        links = root.get("links")
+        if isinstance(links, dict):
+            if twitter_url is None:
+                for key in ("twitter", "x"):
+                    url = _clean_social_url(links.get(key), allow_handle=True)
+                    if url:
+                        twitter_url = url
+                        break
+            if website_url is None:
+                for key in ("website", "external_url", "homepage"):
+                    url = _clean_social_url(links.get(key))
+                    if url:
+                        website_url = url
+                        break
+    return twitter_username, twitter_url, website_url
+
+
 def event_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return find_list(payload, "asset_events", "events", "results", "items")
 
@@ -801,6 +896,14 @@ class Candidate:
     race_inflight: bool = False
     race_last_attempt: float = 0.0
     race_prepared: bool = False
+    # V4.11 protected-free social identity gate. This state is project-level,
+    # never wallet-level, so one metadata lookup protects every active wallet.
+    social_trust_status: str = "unknown"  # unknown | pending | passed | rejected | error
+    social_trust_checked_at: float = 0.0
+    social_twitter_username: str | None = None
+    social_twitter_url: str | None = None
+    social_website_url: str | None = None
+    social_trust_detail: str = ""
 
     def submitted_count(self) -> int:
         return sum(1 for s in self.wallets.values() if s.submitted)
@@ -1076,7 +1179,7 @@ class Bot:
         self.public_preopen_window_seconds = max(1.0, env_float("PUBLIC_PREOPEN_WINDOW_SECONDS", 5.0))
         self.public_fast_retry_seconds = max(0.02, env_float("PUBLIC_FAST_RETRY_SECONDS", 0.05))
 
-        # V4.10.1 STABLE RACE LANE. Scheduled Public mints are pre-built/signed shortly
+        # V4.11 STABLE RACE LANE. Scheduled Public mints are pre-built/signed shortly
         # before opening and broadcast by a dedicated scheduler at the opening
         # timestamp. Live Stream/SeaDrop signals bypass discovery queues and
         # enter a separate executor immediately.
@@ -1111,6 +1214,17 @@ class Bot:
         self.stage_summary_notifications = self.routine_stage_notifications
         self.stage_open_notifications = self.routine_stage_notifications
         self.silent_rate_limit_telegram = True
+
+        # V4.11 Protected Free Mint Shield. SQLite is authoritative so the
+        # Telegram toggle survives Railway restart/redeploy. It is ON by default.
+        self.free_social_protection_enabled = (self.store.get_setting("free_social_protection_enabled", "1") == "1")
+        self.social_trust_pass_ttl = max(300.0, env_float("SOCIAL_TRUST_PASS_TTL_SECONDS", 86400.0))
+        self.social_trust_reject_ttl = max(60.0, env_float("SOCIAL_TRUST_REJECT_TTL_SECONDS", 120.0))
+        self.social_trust_error_retry = max(2.0, env_float("SOCIAL_TRUST_ERROR_RETRY_SECONDS", 5.0))
+        self.social_trust_workers = max(1, min(env_int("SOCIAL_TRUST_WORKERS", 2), 6))
+        self.social_trust_lock = threading.RLock()
+        self.social_trust_inflight: set[str] = set()
+
         self.paused = env_bool("START_PAUSED", False)
 
         self.wallets: list[WalletConfig] = []
@@ -1122,7 +1236,7 @@ class Bot:
         # checks could starve /start and inline-button callbacks.
         self.command_worker_thread: threading.Thread | None = None
 
-        # V4.10.1 stable independent hot-path state. None of these workers consumes the
+        # V4.11 stable independent hot-path state. None of these workers consumes the
         # catalog/discovery queue used by the slower metadata lane.
         self.candidates_lock = threading.RLock()
         self.race_state_lock = threading.RLock()
@@ -1139,6 +1253,11 @@ class Bot:
             max_workers=self.race_launch_workers, thread_name_prefix="race-launch"
         )
         self.race_executor = self.race_signal_executor
+        # Social metadata never shares a Race executor; a slow OpenSea lookup
+        # therefore cannot occupy a signal/prewarm/launch worker.
+        self.social_trust_executor = ThreadPoolExecutor(
+            max_workers=self.social_trust_workers, thread_name_prefix="social-trust"
+        )
         self.race_prepared: dict[str, dict[str, Any]] = {}
         self.race_preparing: set[str] = set()
         self.race_active: set[str] = set()
@@ -1232,6 +1351,187 @@ class Bot:
 
     def mint_link_block(self, candidate: Candidate) -> str:
         return f"🔗 رابط المنت (للنسخ):\n{self.candidate_mint_url(candidate)}"
+
+    # ---------- V4.11 protected-free social identity gate ----------
+    def social_trust_required(self, candidate: Candidate, plan: dict[str, Any] | None = None) -> bool:
+        """Whether this exact mint must pass the project-level X/website gate.
+
+        Deliberate exemptions:
+        - manual watches: the user explicitly chose the project;
+        - qualification/allowlist projects: their final Public must not be delayed;
+        - paid stages: they already require explicit user approval.
+        """
+        if not self.free_social_protection_enabled:
+            return False
+        if not candidate.auto_discovered or candidate.qualification_tracked:
+            return False
+        if plan is not None:
+            if not bool(plan.get("is_public")):
+                return False
+            if bool(plan.get("is_paid")):
+                return False
+        return True
+
+    def _social_status_ttl(self, status: str) -> float:
+        if status == "passed":
+            return self.social_trust_pass_ttl
+        if status == "rejected":
+            return self.social_trust_reject_ttl
+        if status == "error":
+            return self.social_trust_error_retry
+        return 0.0
+
+    def _apply_social_trust_record(self, candidate: Candidate, row: dict[str, Any]) -> bool:
+        status = str(row.get("status") or "unknown")
+        checked = float(row.get("checked_at") or 0.0)
+        ttl = self._social_status_ttl(status)
+        if status not in {"passed", "rejected", "error"} or checked <= 0 or (time.time() - checked) > ttl:
+            return False
+        candidate.social_trust_status = status
+        candidate.social_trust_checked_at = checked
+        candidate.social_twitter_username = str(row.get("twitter_username") or "") or None
+        candidate.social_twitter_url = str(row.get("twitter_url") or "") or None
+        candidate.social_website_url = str(row.get("website_url") or "") or None
+        candidate.social_trust_detail = str(row.get("detail") or "")
+        return True
+
+    def social_trust_text(self, candidate: Candidate) -> str:
+        if not candidate.auto_discovered or candidate.qualification_tracked:
+            return "🛡 مستثنى من حماية Free Mint"
+        if not self.free_social_protection_enabled:
+            return "🛡 الحماية متوقفة — يسمح بجميع Free Mints"
+        status = candidate.social_trust_status
+        if status == "passed":
+            bits = []
+            if candidate.social_twitter_url:
+                bits.append("𝕏")
+            if candidate.social_website_url:
+                bits.append("🌐")
+            return "🟢 محمي: " + " + ".join(bits or ["هوية مشروع"])
+        if status == "rejected":
+            return "🔴 مرفوض: لا X ولا Website"
+        if status == "pending":
+            return "🟡 جارٍ فحص X / Website"
+        if status == "error":
+            return "🟠 تعذر التحقق مؤقتًا — لن يتم Mint حتى ينجح الفحص"
+        return "⚪ لم يُفحص بعد"
+
+    def _social_trust_worker(self, candidate: Candidate) -> None:
+        project_key = self.project_key_for_candidate(candidate)
+        try:
+            slug = candidate.slug
+            if (not slug or slug.startswith("contract-")) and candidate.contract_address:
+                slug = self.resolve_slug_from_contract(candidate.chain, candidate.contract_address) or slug
+            if not slug or slug.startswith("contract-"):
+                raise RuntimeError("collection slug unavailable for social verification")
+
+            collection = self.opensea.get_collection(slug)
+            twitter_username, twitter_url, website_url = extract_collection_social_identity(collection)
+            status = "passed" if (twitter_url or website_url) else "rejected"
+            detail = "X or website found" if status == "passed" else "OpenSea collection has neither X nor external website"
+            checked = time.time()
+            self.store.upsert_social_trust(
+                project_key=project_key, slug=slug, chain=candidate.chain,
+                contract_address=candidate.contract_address, status=status,
+                twitter_username=twitter_username, twitter_url=twitter_url,
+                website_url=website_url, checked_at=checked, detail=detail,
+            )
+            candidate.social_trust_status = status
+            candidate.social_trust_checked_at = checked
+            candidate.social_twitter_username = twitter_username
+            candidate.social_twitter_url = twitter_url
+            candidate.social_website_url = website_url
+            candidate.social_trust_detail = detail
+            log.info(
+                "Free social trust %s | %s | %s | X=%s | website=%s",
+                status, candidate.slug, candidate.chain, bool(twitter_url), bool(website_url),
+            )
+
+            # A sudden Public free mint may have been waiting only on this gate.
+            # Launch immediately after PASS instead of waiting for a catalog tick.
+            if status == "passed" and self.free_social_protection_enabled:
+                now = time.time()
+                for state in candidate.wallets.values():
+                    if not state.submitted and not state.final:
+                        state.next_attempt = min(state.next_attempt or now, now)
+                plan = self.current_plan_for_candidate(candidate, now) if candidate.stage_plans else None
+                if (
+                    plan and plan.get("is_public") and not plan.get("is_paid")
+                    and candidate.contract_address and self.race_enabled
+                ):
+                    race_key = self._race_key(candidate, str(plan.get("key") or ""))
+                    with self.race_state_lock:
+                        has_prepared = race_key in self.race_prepared
+                    self.race_launch_executor.submit(
+                        self._launch_candidate_race, candidate, plan, live=not has_prepared
+                    )
+        except Exception as exc:
+            checked = time.time()
+            detail = str(exc)[:800]
+            candidate.social_trust_status = "error"
+            candidate.social_trust_checked_at = checked
+            candidate.social_trust_detail = detail
+            try:
+                self.store.upsert_social_trust(
+                    project_key=project_key, slug=candidate.slug, chain=candidate.chain,
+                    contract_address=candidate.contract_address, status="error",
+                    checked_at=checked, detail=detail,
+                )
+            except Exception:
+                pass
+            log.info("Free social trust temporary error | %s | %s | %s", candidate.slug, candidate.chain, detail[:250])
+        finally:
+            with self.social_trust_lock:
+                self.social_trust_inflight.discard(project_key)
+
+    def ensure_social_trust_async(self, candidate: Candidate, *, force: bool = False) -> str:
+        """Start at most one social lookup for a project and return current status."""
+        if not self.free_social_protection_enabled or not candidate.auto_discovered or candidate.qualification_tracked:
+            return "bypassed"
+        # Do not consume REST quota on paid-only projects. Unknown-price Public
+        # stages are treated as potential free stages so their trust result can
+        # still be ready before the on-chain price resolves.
+        if candidate.stage_plans and not any(
+            p.get("is_public") and not p.get("is_paid") for p in candidate.stage_plans
+        ):
+            return "bypassed"
+        project_key = self.project_key_for_candidate(candidate)
+        now = time.time()
+
+        # Hot scheduler path: while one worker is already resolving this project,
+        # return from RAM only. Never hit SQLite every few milliseconds.
+        if not force and candidate.social_trust_status == "pending":
+            with self.social_trust_lock:
+                if project_key in self.social_trust_inflight:
+                    return "pending"
+
+        if not force and candidate.social_trust_status in {"passed", "rejected", "error"}:
+            ttl = self._social_status_ttl(candidate.social_trust_status)
+            if candidate.social_trust_checked_at and now - candidate.social_trust_checked_at <= ttl:
+                return candidate.social_trust_status
+
+        if not force:
+            try:
+                cached = self.store.get_social_trust(project_key)
+            except Exception:
+                cached = None
+            if cached and self._apply_social_trust_record(candidate, cached):
+                return candidate.social_trust_status
+
+        with self.social_trust_lock:
+            if project_key in self.social_trust_inflight:
+                candidate.social_trust_status = "pending"
+                return "pending"
+            self.social_trust_inflight.add(project_key)
+            candidate.social_trust_status = "pending"
+        self.social_trust_executor.submit(self._social_trust_worker, candidate)
+        return "pending"
+
+    def social_protection_allows(self, candidate: Candidate, plan: dict[str, Any] | None) -> bool:
+        if not self.social_trust_required(candidate, plan):
+            return True
+        status = self.ensure_social_trust_async(candidate)
+        return status == "passed"
 
     def auto_target_for_limit(self, limit: int | None, remaining: int | None = None) -> int:
         """V4.4 automatic quantity policy.
@@ -1805,6 +2105,10 @@ class Bot:
                 state.next_attempt = min(state.next_attempt or probe_at, probe_at)
 
         self.persist_candidate_planning(candidate)
+        if candidate.auto_discovered and not candidate.qualification_tracked:
+            self.ensure_social_trust_async(
+                candidate, force=(candidate.social_trust_status == "error" and not candidate.slug.startswith("contract-"))
+            )
         paid_text = "مسموح فقط بعد تأكيدك واختيار المحافظ والكميات" if allow_paid else "مجاني فقط"
         kind_text = f"{len(plans)} مرحلة" + (" — يحتوي مراحل تأهيل" if has_qualification_stages(plans) else "")
         message = (
@@ -2128,6 +2432,10 @@ class Bot:
             if not state.submitted:
                 state.next_attempt = min(state.next_attempt or probe, probe)
         self.persist_candidate_planning(candidate)
+        if candidate.auto_discovered and not candidate.qualification_tracked:
+            self.ensure_social_trust_async(
+                candidate, force=(candidate.social_trust_status == "error" and not candidate.slug.startswith("contract-"))
+            )
 
         policy = "المدفوع لا يُنفذ إلا بعد تأكيدك" if allow_paid else "مجاني فقط"
         message = (
@@ -2432,6 +2740,9 @@ class Bot:
         prep_perf = time.perf_counter()
         if not self.race_enabled or not candidate.contract_address:
             return
+        # Prewarm is intentionally allowed before the social decision: building
+        # and signing locally spends no gas. Only broadcast is trust-gated.
+        # This keeps the V4.10.1 race speed while the X/website lookup runs in parallel.
         key = self._race_key(candidate, str(plan.get("key") or ""))
         with self.race_state_lock:
             if key in self.race_preparing or key in self.race_prepared:
@@ -2469,6 +2780,8 @@ class Bot:
     def _launch_candidate_race(self, candidate: Candidate, plan: dict[str, Any], *, live: bool = False) -> None:
         launch_perf = time.perf_counter()
         if not self.race_enabled or not candidate.contract_address:
+            return
+        if not self.social_protection_allows(candidate, plan):
             return
         stage_key = str(plan.get("key") or candidate.current_stage_key or "public")
         key = self._race_key(candidate, stage_key)
@@ -2522,6 +2835,11 @@ class Bot:
             if not bundle:
                 log.info("RACE skipped | %s | %s | no bundle", candidate.slug, candidate.chain)
                 return
+            # Final zero-cost guard immediately before broadcast. This is a RAM
+            # check when trust already passed and prevents a mid-flight settings
+            # toggle from allowing an unverified automatic Free Mint.
+            if not self.social_protection_allows(candidate, plan):
+                return
             results = broadcast_seadrop_race_transactions(
                 rpc_pool=self.rpc_pools[candidate.chain],
                 bundle=bundle,
@@ -2571,6 +2889,9 @@ class Bot:
                 if plan.get("is_paid") and candidate.paid_decision != "confirmed":
                     candidate.paid_detected = True
                     self.maybe_offer_paid_public(candidate)
+                    return
+                if not self.social_protection_allows(candidate, plan):
+                    log.debug("Fast free mint waiting for social trust | %s | %s", candidate.slug, chain)
                     return
                 self._launch_candidate_race(candidate, plan, live=True)
                 log.info(
@@ -2647,6 +2968,11 @@ class Bot:
                             self.race_prep_executor.submit(self._prewarm_candidate_race, candidate, plan)
                         continue
                     if now <= min(end, launch_at + self.race_launch_window_seconds):
+                        # Do not churn launch workers while a protected automatic
+                        # Free Mint is still awaiting/rejecting project identity.
+                        # The social worker launches immediately on PASS.
+                        if not self.social_protection_allows(candidate, plan):
+                            continue
                         # Keep re-launching only while no transaction is pending;
                         # _race_wallet_work removes wallets already submitted.
                         if now - candidate.race_last_attempt >= self.race_retry_seconds:
@@ -3799,6 +4125,12 @@ class Bot:
                 self.maybe_offer_paid_public(candidate)
                 return
 
+        # Protected Free Mint Shield is project-level and runs once. Never let
+        # the fallback path bypass it while Race Lane is waiting for metadata.
+        if plan and plan.get("is_public") and not plan.get("is_paid"):
+            if not self.social_protection_allows(candidate, plan):
+                return
+
         # V4.9: do not let the normal REST/simulation path compete with the
         # dedicated race lane during the first seconds of a known SeaDrop Public
         # opening. The scheduler pre-signs and broadcasts independently. After
@@ -4092,6 +4424,7 @@ class Bot:
             [(f"🟢 Robinhood ${rh}", "gas_set:robinhood"), ("↩️ عام", "gas_inherit:robinhood")],
             [("🔥 استثناء منت من حد الغاز", "gas_project_add")],
             [("📋 استثناءات الغاز", "gas_project_list")],
+            [("🛡 حماية Free Mint: مفعلة" if self.free_social_protection_enabled else "⚠️ حماية Free Mint: متوقفة", "free_social_toggle")],
             [("🔕 إيقاف إشعارات المراحل" if self.routine_stage_notifications else "🔔 تفعيل إشعارات المراحل", "stage_notify_toggle")],
             [("↩️ القائمة الرئيسية", "menu")],
         ]
@@ -4128,7 +4461,7 @@ class Bot:
         total = len(self.store.list_wallets(enabled_only=False))
         self.telegram.send(
             chat_id,
-            "🤖 OpenSea Mint Guardian V4.10.1\n\n"
+            "🤖 OpenSea Mint Guardian V4.11\n\n"
             "🆓 الاكتشاف المجاني: Stream لحظي + SeaDrop مباشر + REST احتياطي\n"
             f"⚡ الاستعداد للـPublic: آخر {self.public_preopen_window_seconds:g} ثوانٍ\n"
             f"📦 سياسة الكمية: حد المنت ≤100 يؤخذ كما هو، وإذا كان >100/غير محدود فالهدف {self.auto_stage_high_limit_quantity}\n"
@@ -4264,6 +4597,7 @@ class Bot:
             f"🚀 Public مجاني: تنفيذ مباشر لكل المحافظ | استعداد {self.public_preopen_window_seconds:g}s | retry={self.public_fast_retry_seconds:g}s\n"
             f"📦 سياسة الكمية: حد ≤{self.auto_stage_high_limit_threshold} كهدف؛ أعلى/غير محدود = {self.auto_stage_high_limit_quantity}\n"
             f"💳 Public المدفوع: موافقة + محافظ + كمية لكل محفظة\n"
+            f"🛡 حماية Free Mint: {'مفعلة — يشترط X أو Website للمنت التلقائي بدون تأهيل' if self.free_social_protection_enabled else 'متوقفة — يأخذ جميع Free Mints كما في V4.10.1'}\n"
             f"⛽ الحد العام: ${self.max_gas_usd} | Ethereum=${self.max_gas_usd_for_chain('ethereum')} | Ink=${self.max_gas_usd_for_chain('ink')} | Robinhood=${self.max_gas_usd_for_chain('robinhood')}\n"
             f"🔕 إشعارات المراقبة/التأهيل التلقائية: {'مفعلة' if self.routine_stage_notifications else 'متوقفة'}\n"
             f"🧠 Gas strategy: {self.gas_strategy} | Buffer={self.gas_limit_buffer}\n"
@@ -4925,6 +5259,34 @@ class Bot:
 
         if data == "gas_project_list":
             self.edit_or_send(event, self.gas_project_list_text(), self.settings_buttons())
+            return
+
+        if data == "free_social_toggle":
+            self.free_social_protection_enabled = not self.free_social_protection_enabled
+            self.store.set_setting(
+                "free_social_protection_enabled", "1" if self.free_social_protection_enabled else "0"
+            )
+            now = time.time()
+            with self.candidates_lock:
+                candidates = list(self.candidates.values())
+            if self.free_social_protection_enabled:
+                for candidate in candidates:
+                    if candidate.auto_discovered and not candidate.qualification_tracked:
+                        self.ensure_social_trust_async(candidate)
+            else:
+                # Restore the exact pre-shield behavior immediately: all due
+                # automatic free projects may proceed without another metadata check.
+                for candidate in candidates:
+                    for state in candidate.wallets.values():
+                        if not state.submitted and not state.final:
+                            state.next_attempt = min(state.next_attempt or now, now)
+                    plan = self.current_plan_for_candidate(candidate, now) if candidate.stage_plans else None
+                    if (
+                        candidate.auto_discovered and plan and plan.get("is_public") and not plan.get("is_paid")
+                        and candidate.contract_address and self.race_enabled
+                    ):
+                        self.race_launch_executor.submit(self._launch_candidate_race, candidate, plan, live=True)
+            self.edit_or_send(event, self.settings_text(), self.settings_buttons())
             return
 
         if data == "stage_notify_toggle":
@@ -5614,7 +5976,7 @@ class Bot:
     # ---------- main loop ----------
     def run(self) -> None:
         start_health_server()
-        log.info("Mint Guardian V4.10.1 starting")
+        log.info("Mint Guardian V4.11 starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
@@ -5639,18 +6001,24 @@ class Bot:
             self.public_fast_retry_seconds, self.auto_stage_high_limit_quantity,
         )
         log.info(
-            "RACE LANE V4.10.1 STABLE ready | enabled=%s | prewarm=%.2fs | scheduler=%.3fs | retry=%.3fs | staticGas=%s | signal/prep/launch=%s/%s/%s | SeaDrop-WSS=%s | fee-cache=%.2fs | race-gas=%s",
+            "RACE LANE V4.11 STABLE ready | enabled=%s | prewarm=%.2fs | scheduler=%.3fs | retry=%.3fs | staticGas=%s | signal/prep/launch=%s/%s/%s | SeaDrop-WSS=%s | fee-cache=%.2fs | race-gas=%s",
             self.race_enabled, self.race_prewarm_seconds, self.race_scheduler_tick,
             self.race_retry_seconds, self.race_static_gas_limit,
             self.race_stream_workers, self.race_prep_workers, self.race_launch_workers,
             self.seadrop_wss_enabled, self.race_fee_refresh_seconds, self.race_gas_strategy,
         )
+        log.info(
+            "Protected Free Mint Shield ready | enabled=%s | rule=X-or-website | workers=%s | passTTL=%.0fs | rejectTTL=%.0fs",
+            self.free_social_protection_enabled, self.social_trust_workers,
+            self.social_trust_pass_ttl, self.social_trust_reject_ttl,
+        )
         self.notify_all(
-            "🟢 OpenSea Mint Guardian V4.10.1 يعمل الآن على Railway.\n"
+            "🟢 OpenSea Mint Guardian V4.11 يعمل الآن على Railway.\n"
             f"الاكتشاف التلقائي: {'مفعّل كل ' + format(self.auto_free_scan_seconds, 'g') + ' ثانية' if self.auto_free_enabled else 'متوقف'}.\n"
             f"OpenSea Stream: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} | REST Mint Events: {'مفعّل' if self.auto_event_fallback_enabled else 'متوقف'}.\n"
             f"التأهيل/المراقبة: تعمل بصمت وتظهر تفاصيلها عند فتح الأقسام.\n"
             f"Public المجاني: تنفيذ مباشر لكل المحافظ، والاستعداد قبل الفتح بـ {self.public_preopen_window_seconds:g} ثوانٍ.\n"
+            f"حماية Free Mint: {'مفعلة — التلقائي بدون تأهيل يحتاج X أو Website' if self.free_social_protection_enabled else 'متوقفة — جميع Free Mints مسموحة'}.\n"
             f"سياسة الكمية: الحد ≤{self.auto_stage_high_limit_threshold} كهدف؛ أعلى/غير محدود = {self.auto_stage_high_limit_quantity}.\n"
             "تمت استعادة المراقبات وخطط المدفوع والمحافظ النشطة بنجاح."
         )

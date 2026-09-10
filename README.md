@@ -1,52 +1,80 @@
-# OpenSea Mint Guardian V4.10.1 — Stable Speed Hotfix
+# OpenSea Mint Guardian V4.11 — Protected Free Mint Shield
 
-This release is intentionally based on the known-working V4.9 transaction path.
+V4.11 is built directly on the known-working V4.10.1/V4.9 transaction path. The Race transaction construction/signing/broadcast logic is intentionally unchanged.
 
-## Why V4.10 failed
+## New: Protected Free Mint Shield
 
-Railway logs showed two regressions:
+The shield is **enabled by default** and can be toggled from Telegram > ⚙️ الإعدادات.
 
-1. Auto-free REST discovery could create `ThreadPoolExecutor(max_workers=0)` when catalog filtering produced an empty list.
-2. The experimental V4.10 race transaction/RPC path repeatedly returned `rpc_or_tx_error` even though Stream discovery was fast.
+When enabled, it applies only to:
 
-## What V4.10.1 does
+- automatically discovered Free Public mints;
+- projects that are not qualification/allowlist projects;
+- projects the user did not add manually.
 
-- Restores `buyer.py` exactly to the V4.9 transaction construction/signing/broadcast behavior.
-- Removes the V4.10 experimental raw-HTTP broadcaster, wallet JSON-RPC batching, manual calldata cache, and Ethereum pending-transaction lane.
-- Keeps the V4.9 OpenSea Stream + SeaDrop + scheduled Public race logic.
-- Separates live signal, prewarm, and scheduled launch into independent thread pools so discovery/prewarm work cannot queue in front of a ready Public launch.
-- Fixes auto-free detail discovery so an empty filtered set returns cleanly and never constructs a zero-worker executor.
-- Keeps all Telegram/UI, qualification, monitoring, paid-mint, per-project gas, SQLite, and Railway Volume behavior from V4.9.
-- Adds the first failure detail to `RACE no-submit` logs for diagnostics.
+A project passes if OpenSea collection metadata contains **at least one** of:
 
-## Stable race defaults
+- an X/Twitter identity (`twitter_username` / X/Twitter link), or
+- an external project website (`external_url` / website link).
 
-```env
-RACE_LANE_ENABLED=true
-RACE_PREWARM_SECONDS=2.5
-RACE_SCHEDULER_TICK=0.005
-RACE_RETRY_SECONDS=0.04
-RACE_LAUNCH_WINDOW_SECONDS=8
-RACE_STREAM_WORKERS=24
-RACE_PREP_WORKERS=8
-RACE_LAUNCH_WORKERS=8
-RACE_GAS_STRATEGY=fast
-RACE_FEE_REFRESH_SECONDS=0.35
-RPC_BROADCAST_WORKERS=4
+No X/Twitter API is required in V4.11. Follower count, account age, recent posts, suspended status, and verification are intentionally reserved for a later version.
+
+## Safety behavior
+
+Protected mode is fail-closed. If the project has neither X nor a website, or OpenSea metadata cannot be verified yet, the automatic non-qualification free mint is not sent. This prevents gas spend on anonymous/spam drops.
+
+Manual watches, qualification/allowlist projects, and paid projects are exempt from this shield. Paid Public still requires the existing explicit wallet/quantity confirmation.
+
+If the shield is disabled from Telegram, behavior immediately returns to V4.10.1: all otherwise-valid automatic Free Mints may proceed.
+
+## Speed design
+
+The social check is project-level, never wallet-level:
+
+```text
+Project discovered
+   ├─ Race/prewarm preparation
+   └─ OpenSea social identity lookup (parallel, once per project)
+            ↓
+       RAM + SQLite cache
+            ↓
+PASS → Race lane can broadcast to all active wallets
 ```
 
-Existing Railway environment values override these defaults. `RPC_BROADCAST_WORKERS=4` is the known-working V4.9 setting.
+The social metadata worker has its own executor and never occupies Race signal/prewarm/launch workers. For projects known before Public, verification is normally cached before opening. For a completely new project first seen only after Public is already live, protected mode necessarily waits for the one identity lookup before spending gas.
 
-## Deployment
+Cache defaults:
 
-Replace `main.py`, `buyer.py`, and `storage.py` (and `requirements.txt` if desired), commit/push, then let Railway redeploy.
+```env
+SOCIAL_TRUST_PASS_TTL_SECONDS=86400
+SOCIAL_TRUST_REJECT_TTL_SECONDS=120
+SOCIAL_TRUST_ERROR_RETRY_SECONDS=5
+SOCIAL_TRUST_WORKERS=2
+```
+
+## Telegram setting
+
+Inside ⚙️ الإعدادات:
+
+- `🛡 حماية Free Mint: مفعلة` — only X/Website-backed automatic non-qualification free mints are allowed.
+- `⚠️ حماية Free Mint: متوقفة` — use the previous V4.10.1 behavior and allow all automatic free mints.
+
+The setting is persisted in SQLite on the Railway Volume.
+
+## Persistence
+
+V4.11 adds an additive `social_trust_cache` SQLite table. Existing wallets, watches, paid plans, gas settings, qualification data, and mint history remain intact.
 
 Do **not** change `WALLET_ENCRYPTION_KEY` and do **not** delete the Railway Volume.
 
-Expected startup line:
+## Expected startup logs
 
 ```text
-RACE LANE V4.10.1 STABLE ready
+Mint Guardian V4.11 starting
+RACE LANE V4.11 STABLE ready
+Protected Free Mint Shield ready | enabled=True | rule=X-or-website
 ```
 
-The auto-free discovery error `max_workers must be greater than 0` should disappear completely.
+## Deployment
+
+Replace `main.py` and `storage.py`. `buyer.py` remains the stable transaction path used by V4.10.1; replacing it with the V4.11 copy is safe because it is unchanged. Commit/push and let Railway redeploy.
