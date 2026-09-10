@@ -104,6 +104,16 @@ class SecureStore:
 
                 CREATE INDEX IF NOT EXISTS idx_mint_history_created ON mint_history(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_mint_history_slug ON mint_history(slug);
+                CREATE TABLE IF NOT EXISTS mint_totals (
+                    slug TEXT NOT NULL COLLATE NOCASE,
+                    chain TEXT NOT NULL COLLATE NOCASE,
+                    wallet_address TEXT NOT NULL COLLATE NOCASE,
+                    contract_address TEXT NOT NULL DEFAULT '' COLLATE NOCASE,
+                    confirmed_quantity INTEGER NOT NULL DEFAULT 0,
+                    last_confirmed_at REAL NOT NULL,
+                    PRIMARY KEY(slug,chain,wallet_address,contract_address)
+                );
+
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_name_nocase ON wallets(name COLLATE NOCASE);
 
                 CREATE TABLE IF NOT EXISTS qualification_projects (
@@ -171,6 +181,38 @@ class SecureStore:
 
                 CREATE INDEX IF NOT EXISTS idx_social_trust_slug
                     ON social_trust_cache(slug COLLATE NOCASE, checked_at DESC);
+
+                -- V4.12.0: Collection Offers are deliberately stored separately
+                -- from mint_history/watches so Offer bookkeeping cannot alter
+                -- Race Lane state or cumulative Mint accounting.
+                CREATE TABLE IF NOT EXISTS offer_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    slug TEXT NOT NULL,
+                    chain TEXT NOT NULL,
+                    wallet_name TEXT NOT NULL,
+                    wallet_address TEXT NOT NULL,
+                    order_hash TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    protocol_address TEXT NOT NULL,
+                    currency_address TEXT,
+                    currency_symbol TEXT NOT NULL DEFAULT 'WETH',
+                    unit_price_usdt TEXT,
+                    unit_price_weth TEXT,
+                    quantity INTEGER NOT NULL DEFAULT 1,
+                    total_weth TEXT,
+                    start_time REAL,
+                    end_time REAL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    protocol_data_json TEXT,
+                    response_json TEXT,
+                    detail TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_offer_history_wallet_status
+                    ON offer_history(wallet_address COLLATE NOCASE,status,created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_offer_history_slug_status
+                    ON offer_history(slug COLLATE NOCASE,status,created_at DESC);
                 """
             )
 
@@ -663,18 +705,28 @@ class SecureStore:
         chain: str,
         contract_address: str | None = None,
     ) -> int:
+        """Confirmed cumulative quantity, including compacted records older than 24h."""
+        contract = str(contract_address or "")
         with self.lock:
-            if contract_address:
-                row = self.conn.execute(
+            if contract:
+                hist = self.conn.execute(
                     """
                     SELECT COALESCE(SUM(COALESCE(quantity,0)),0) AS qty FROM mint_history
                     WHERE status='confirmed' AND wallet_address=? COLLATE NOCASE AND chain=? COLLATE NOCASE
                       AND (slug=? COLLATE NOCASE OR contract_address=? COLLATE NOCASE)
                     """,
-                    (wallet_address, chain, slug, contract_address),
+                    (wallet_address, chain, slug, contract),
+                ).fetchone()
+                old = self.conn.execute(
+                    """
+                    SELECT COALESCE(SUM(confirmed_quantity),0) AS qty FROM mint_totals
+                    WHERE wallet_address=? COLLATE NOCASE AND chain=? COLLATE NOCASE
+                      AND (slug=? COLLATE NOCASE OR contract_address=? COLLATE NOCASE)
+                    """,
+                    (wallet_address, chain, slug, contract),
                 ).fetchone()
             else:
-                row = self.conn.execute(
+                hist = self.conn.execute(
                     """
                     SELECT COALESCE(SUM(COALESCE(quantity,0)),0) AS qty FROM mint_history
                     WHERE status='confirmed' AND wallet_address=? COLLATE NOCASE AND chain=? COLLATE NOCASE
@@ -682,7 +734,16 @@ class SecureStore:
                     """,
                     (wallet_address, chain, slug),
                 ).fetchone()
-        return int(row["qty"] or 0) if row else 0
+                old = self.conn.execute(
+                    """
+                    SELECT COALESCE(SUM(confirmed_quantity),0) AS qty FROM mint_totals
+                    WHERE wallet_address=? COLLATE NOCASE AND chain=? COLLATE NOCASE
+                      AND slug=? COLLATE NOCASE
+                    """,
+                    (wallet_address, chain, slug),
+                ).fetchone()
+        return int((hist["qty"] if hist else 0) or 0) + int((old["qty"] if old else 0) or 0)
+
 
     def upsert_qualification_project(
         self,
@@ -798,9 +859,10 @@ class SecureStore:
             )
             return cur.rowcount > 0
 
-    def free_mint_summary(self, limit: int = 30) -> list[dict[str, Any]]:
-        """Aggregate confirmed zero-cost mints by logical project."""
+    def free_mint_summary(self, limit: int = 30, *, hours: float = 24.0) -> list[dict[str, Any]]:
+        """Confirmed zero-cost mints visible for the requested recent window."""
         limit = max(1, min(int(limit), 100))
+        cutoff = time.time() - max(0.1, float(hours)) * 3600.0
         with self.lock:
             rows = self.conn.execute(
                 """
@@ -812,20 +874,204 @@ class SecureStore:
                     GROUP_CONCAT(DISTINCT wallet_name) AS wallet_names
                 FROM mint_history
                 WHERE status='confirmed'
+                  AND created_at>=?
                   AND mint_value_native IS NOT NULL
                   AND ABS(CAST(mint_value_native AS REAL)) < 0.000000000000000001
                 GROUP BY slug COLLATE NOCASE, chain COLLATE NOCASE, COALESCE(contract_address,'') COLLATE NOCASE
                 ORDER BY last_confirmed_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (cutoff, limit),
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def recent_history(self, limit: int = 15) -> list[dict[str, Any]]:
+    def recent_history(self, limit: int = 15, *, hours: float = 24.0) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 100))
+        cutoff = time.time() - max(0.1, float(hours)) * 3600.0
         with self.lock:
             rows = self.conn.execute(
-                "SELECT * FROM mint_history ORDER BY created_at DESC LIMIT ?", (limit,)
+                "SELECT * FROM mint_history WHERE created_at>=? ORDER BY created_at DESC LIMIT ?",
+                (cutoff, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def purge_runtime_history(self, *, older_than_hours: float = 24.0) -> dict[str, int]:
+        """Compact confirmed mint rows, then delete all visible mint history older than retention.
+
+        mint_totals preserves cumulative quantities so stage accounting and duplicate
+        protection remain correct after the 24-hour visible-history cleanup.
+        """
+        cutoff = time.time() - max(1.0, float(older_than_hours)) * 3600.0
+        with self.lock, self.conn:
+            groups = self.conn.execute(
+                """
+                SELECT slug,chain,wallet_address,COALESCE(contract_address,'') AS contract_address,
+                       COALESCE(SUM(COALESCE(quantity,0)),0) AS qty,MAX(created_at) AS last_at
+                FROM mint_history
+                WHERE created_at<? AND status='confirmed'
+                GROUP BY slug COLLATE NOCASE,chain COLLATE NOCASE,wallet_address COLLATE NOCASE,
+                         COALESCE(contract_address,'') COLLATE NOCASE
+                """,
+                (cutoff,),
+            ).fetchall()
+            for row in groups:
+                self.conn.execute(
+                    """
+                    INSERT INTO mint_totals(slug,chain,wallet_address,contract_address,confirmed_quantity,last_confirmed_at)
+                    VALUES(?,?,?,?,?,?)
+                    ON CONFLICT(slug,chain,wallet_address,contract_address) DO UPDATE SET
+                        confirmed_quantity=mint_totals.confirmed_quantity+excluded.confirmed_quantity,
+                        last_confirmed_at=MAX(mint_totals.last_confirmed_at,excluded.last_confirmed_at)
+                    """,
+                    (row["slug"], row["chain"], row["wallet_address"], row["contract_address"],
+                     int(row["qty"] or 0), float(row["last_at"] or cutoff)),
+                )
+            deleted = self.conn.execute("DELETE FROM mint_history WHERE created_at<?", (cutoff,)).rowcount
+            # Old qualification-wallet detail is dashboard cache, not execution truth.
+            q_deleted = self.conn.execute(
+                "DELETE FROM qualification_wallets WHERE checked_at<? AND project_key IN "
+                "(SELECT project_key FROM qualification_projects WHERE status<>'active')",
+                (cutoff,),
+            ).rowcount
+            # Expired social cache can always be rebuilt outside Race.
+            social_deleted = self.conn.execute("DELETE FROM social_trust_cache WHERE checked_at<?", (cutoff,)).rowcount
+        return {"history": int(deleted or 0), "qualification": int(q_deleted or 0), "social": int(social_deleted or 0)}
+
+
+    # ---------- V4.12.0 Collection Offer persistence ----------
+    def record_offer(
+        self,
+        *,
+        slug: str,
+        chain: str,
+        wallet_name: str,
+        wallet_address: str,
+        order_hash: str,
+        protocol_address: str,
+        currency_address: str | None = None,
+        currency_symbol: str = "WETH",
+        unit_price_usdt: str | None = None,
+        unit_price_weth: str | None = None,
+        quantity: int = 1,
+        total_weth: str | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+        status: str = "active",
+        protocol_data_json: str | None = None,
+        response_json: str | None = None,
+        detail: str | None = None,
+    ) -> int:
+        now = time.time()
+        with self.lock, self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO offer_history(
+                    created_at,updated_at,slug,chain,wallet_name,wallet_address,order_hash,
+                    protocol_address,currency_address,currency_symbol,unit_price_usdt,unit_price_weth,
+                    quantity,total_weth,start_time,end_time,status,protocol_data_json,response_json,detail
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(order_hash) DO UPDATE SET
+                    updated_at=excluded.updated_at,slug=excluded.slug,chain=excluded.chain,
+                    wallet_name=excluded.wallet_name,wallet_address=excluded.wallet_address,
+                    protocol_address=excluded.protocol_address,currency_address=COALESCE(excluded.currency_address,offer_history.currency_address),
+                    currency_symbol=excluded.currency_symbol,
+                    unit_price_usdt=COALESCE(excluded.unit_price_usdt,offer_history.unit_price_usdt),
+                    unit_price_weth=COALESCE(excluded.unit_price_weth,offer_history.unit_price_weth),
+                    quantity=excluded.quantity,total_weth=COALESCE(excluded.total_weth,offer_history.total_weth),
+                    start_time=COALESCE(excluded.start_time,offer_history.start_time),
+                    end_time=COALESCE(excluded.end_time,offer_history.end_time),
+                    status=excluded.status,
+                    protocol_data_json=COALESCE(excluded.protocol_data_json,offer_history.protocol_data_json),
+                    response_json=COALESCE(excluded.response_json,offer_history.response_json),
+                    detail=COALESCE(excluded.detail,offer_history.detail)
+                """,
+                (
+                    now, now, slug, chain, wallet_name, wallet_address, order_hash, protocol_address,
+                    currency_address, currency_symbol, unit_price_usdt, unit_price_weth,
+                    max(1, min(int(quantity), 100)), total_weth, start_time, end_time, status,
+                    protocol_data_json, response_json, (detail or "")[:2000],
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT id FROM offer_history WHERE order_hash=? COLLATE NOCASE", (order_hash,)
+            ).fetchone()
+            return int(row["id"])
+
+    def upsert_remote_offer(
+        self,
+        *,
+        slug: str,
+        chain: str,
+        wallet_name: str,
+        wallet_address: str,
+        order_hash: str,
+        protocol_address: str,
+        currency_symbol: str = "WETH",
+        unit_price_weth: str | None = None,
+        quantity: int = 1,
+        total_weth: str | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+        status: str = "active",
+        response_json: str | None = None,
+        currency_address: str | None = None,
+        unit_price_usdt: str | None = None,
+        protocol_data_json: str | None = None,
+        detail: str | None = None,
+        **_ignored: Any,
+    ) -> int:
+        """Upsert an OpenSea profile-offer row without erasing richer local data."""
+        return self.record_offer(
+            slug=slug, chain=chain, wallet_name=wallet_name, wallet_address=wallet_address,
+            order_hash=order_hash, protocol_address=protocol_address, currency_address=currency_address,
+            currency_symbol=currency_symbol, unit_price_usdt=unit_price_usdt,
+            unit_price_weth=unit_price_weth, quantity=quantity, total_weth=total_weth,
+            start_time=start_time, end_time=end_time, status=status,
+            protocol_data_json=protocol_data_json, response_json=response_json, detail=detail,
+        )
+
+    def get_offer(self, offer_id: int) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.conn.execute("SELECT * FROM offer_history WHERE id=?", (int(offer_id),)).fetchone()
+        return dict(row) if row else None
+
+    def get_offer_by_hash(self, order_hash: str) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM offer_history WHERE order_hash=? COLLATE NOCASE", (order_hash,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_offers(
+        self,
+        *,
+        status: str | None = None,
+        wallet_address: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 200))
+        clauses: list[str] = []
+        args: list[Any] = []
+        if status:
+            clauses.append("status=?")
+            args.append(status)
+        if wallet_address:
+            clauses.append("wallet_address=? COLLATE NOCASE")
+            args.append(wallet_address)
+        sql = "SELECT * FROM offer_history"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        args.append(limit)
+        with self.lock:
+            rows = self.conn.execute(sql, tuple(args)).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_offer_status(self, offer_id: int, status: str, detail: str | None = None) -> bool:
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE offer_history SET status=?,detail=?,updated_at=? WHERE id=?",
+                (str(status), (detail or "")[:2000], time.time(), int(offer_id)),
+            )
+            return cur.rowcount > 0
+

@@ -169,7 +169,7 @@ class OpenSeaClient:
                 "X-API-KEY": self.api_key,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "OpenSea-Mint-Guardian/4.9",
+                "User-Agent": "OpenSea-Mint-Guardian/4.12",
             })
             self._local.session = session
         return session
@@ -341,6 +341,106 @@ class OpenSeaClient:
 
     def get_collection(self, slug: str) -> dict[str, Any]:
         return self._request("GET", f"/collections/{slug}", cache_ttl=self.collection_cache_seconds)
+
+    # ---------- V4.12.0 Collection Offers (user-triggered only) ----------
+    # These calls intentionally use the background REST class so they preserve
+    # the existing API-token reserve for mint-time builders and stage refreshes.
+    # The final POST is normal priority, but never critical/Race priority.
+    def get_collection_for_offer(self, slug: str) -> dict[str, Any]:
+        # Same Collection API/cache as get_collection(), but Offer-only reads
+        # preserve the REST reserve for mint/stage work when a network request is needed.
+        return self._request(
+            "GET", f"/collections/{slug}",
+            cache_ttl=self.collection_cache_seconds, request_class="background",
+        )
+
+    def get_collection_offers(self, slug: str, limit: int = 20, cursor: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": max(1, min(int(limit), 200))}
+        if cursor:
+            params["next"] = cursor
+        return self._request("GET", f"/offers/collection/{slug}", params=params, request_class="background")
+
+    def get_all_collection_offers(
+        self, slug: str, *, maker: str | None = None, limit: int = 50, cursor: str | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": max(1, min(int(limit), 200))}
+        if maker:
+            params["maker"] = maker
+        if cursor:
+            params["next"] = cursor
+        return self._request("GET", f"/offers/collection/{slug}/all", params=params, request_class="background")
+
+    def get_account_offers(
+        self,
+        address: str,
+        *,
+        limit: int = 50,
+        after: str | None = None,
+        collection_slugs: list[str] | None = None,
+        chains: list[str] | None = None,
+    ) -> dict[str, Any]:
+        params: list[tuple[str, Any]] = [("limit", max(1, min(int(limit), 50)))]
+        if after:
+            params.append(("after", after))
+        for slug in collection_slugs or []:
+            params.append(("collection_slugs", slug))
+        for chain in chains or []:
+            params.append(("chains", chain))
+        return self._request("GET", f"/account/{address}/offers", params=params, request_class="background")
+
+    def build_collection_offer(
+        self,
+        *,
+        offerer: str,
+        quantity: int,
+        slug: str,
+        protocol_address: str,
+        offer_protection_enabled: bool = True,
+    ) -> dict[str, Any]:
+        body = {
+            "criteria": {"collection": {"slug": slug}},
+            "offer_protection_enabled": bool(offer_protection_enabled),
+            "offerer": offerer,
+            "protocol_address": protocol_address,
+            "quantity": max(1, min(int(quantity), 100)),
+        }
+        return self._request("POST", "/offers/build", json=body, request_class="background")
+
+    def post_collection_offer(
+        self, *, slug: str, protocol_address: str, protocol_data: dict[str, Any]
+    ) -> dict[str, Any]:
+        # IMPORTANT: protocol_data.parameters is a Seaport struct and its inner
+        # keys must stay camelCase. requests/json sends this body verbatim.
+        body = {
+            "criteria": {"collection": {"slug": slug}},
+            "protocol_address": protocol_address,
+            "protocol_data": protocol_data,
+        }
+        return self._request("POST", "/offers", json=body, request_class="normal")
+
+    def get_order(self, *, chain: str, protocol_address: str, order_hash: str) -> dict[str, Any]:
+        return self._request(
+            "GET", f"/orders/chain/{chain}/protocol/{protocol_address}/{order_hash}",
+            request_class="background",
+        )
+
+    def cancel_order(
+        self,
+        *,
+        chain: str,
+        protocol_address: str,
+        order_hash: str,
+        offerer_signature: str,
+        auth_token: str | None = None,
+    ) -> dict[str, Any]:
+        headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else None
+        kwargs: dict[str, Any] = {"json": {"offererSignature": offerer_signature}}
+        if headers:
+            kwargs["headers"] = headers
+        return self._request(
+            "POST", f"/orders/chain/{chain}/protocol/{protocol_address}/{order_hash}/cancel",
+            request_class="normal", **kwargs,
+        )
 
     def get_contract(self, chain: str, address: str) -> dict[str, Any]:
         return self._request("GET", f"/chain/{chain}/contract/{address}", cache_ttl=self.contract_cache_seconds)
@@ -1698,9 +1798,14 @@ def prepare_seadrop_race_transactions(
 
         if max_gas_usd > 0:
             if gas_cost_usd is None:
-                results[addr_l] = MintResult(False, "gas_price_unavailable", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=q, detail="USD gas budget enabled but native/USD price unavailable")
-                continue
-            if gas_cost_usd > max_gas_usd:
+                # V4.12.1: FREE SeaDrop Race must not lose a scarce Public
+                # only because the background USD oracle is temporarily empty.
+                # Paid mints remain fail-closed.
+                if mint_value_native > 0:
+                    results[addr_l] = MintResult(False, "gas_price_unavailable", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=q, detail="USD gas budget enabled but native/USD price unavailable")
+                    continue
+                log.warning("FREE RACE USD oracle unavailable; continuing with RPC/native gas safeguards | chain=%s | wallet=%s", rpc_pool.chain, wallet.name)
+            if gas_cost_usd is not None and gas_cost_usd > max_gas_usd:
                 results[addr_l] = MintResult(False, "gas_usd_too_high", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=q, detail=f"Estimated max gas ${gas_cost_usd:.6f} > USD cap ${max_gas_usd}")
                 continue
         if max_gas_native > 0 and gas_cost_native > max_gas_native:
