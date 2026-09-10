@@ -124,33 +124,72 @@ class TenantSupervisor:
             bot=self.bots.get(uid); t=self.registry.get(uid)
             if bot and t: bot.tenant_runtime=TenantRuntime(t)
 
-    def fanout_resolved_signal(self, source_candidate, plan, public, source:str, emitted_perf:float, admin_headstart_seconds:float=0.0):
-        """Immediately enqueue one Admin-resolved event into every active tenant lane.
+    def _active_bot_snapshot(self) -> list[Any]:
+        """Return active tenant bots without holding the supervisor lock during fan-out.
 
-        This is RAM-only and non-blocking for Admin. No tenant discovery RPC is
-        performed; each tenant still applies its own permissions, pause, Safe
-        Protection, gas caps, wallets and notification policy.
+        Ordering is deterministic by tenant priority then id. Admin never appears in
+        this list: the Admin Race task is queued by the discovery engine first, then
+        this snapshot receives the same already-resolved event.
         """
         with self.lock:
-            targets=list(self.bots.items())
-        submitted=0
-        for uid,bot in targets:
+            items = list(self.bots.items())
+        def sort_key(item):
+            uid, bot = item
+            rt = getattr(bot, 'tenant_runtime', None)
+            tenant = getattr(rt, 'tenant', None)
+            return (int(getattr(tenant, 'priority', 100) or 100), int(uid))
+        result=[]
+        for uid, bot in sorted(items, key=sort_key):
+            rt = getattr(bot, 'tenant_runtime', None)
+            if getattr(bot, 'tenant_disabled', False):
+                continue
+            if rt is not None and not bool(getattr(rt, 'active', True)):
+                continue
+            result.append(bot)
+        return result
+
+    def requires_free_social_protection(self) -> bool:
+        """True when any active tenant needs the X/website gate for auto free mints.
+
+        The Admin discovery bot can then resolve social identity once globally;
+        protected tenants consume that shared result instead of each hitting the
+        OpenSea collection endpoint independently.
+        """
+        for bot in self._active_bot_snapshot():
             try:
-                t=self.registry.get(uid)
-                if not t or not t.active or getattr(bot,'tenant_disabled',False):
-                    continue
-                # Permission prefilter avoids even executor work for tenants that
-                # cannot participate. The Bot repeats this check server-side.
-                if getattr(source_candidate,'qualification_tracked',False):
-                    if 'qualification.mint' not in t.permissions:
-                        continue
-                elif 'free_mints.auto' not in t.permissions:
-                    continue
-                bot.race_signal_executor.submit(
-                    bot.receive_direct_resolved_signal, source_candidate, plan, public, source,
-                    emitted_perf, admin_headstart_seconds
-                )
-                submitted += 1
+                if bool(getattr(bot, 'free_social_protection_enabled', False)) and bot.can('free_mints.auto'):
+                    return True
             except Exception:
                 continue
-        return submitted
+        return False
+
+    def fanout_candidate_snapshot(self, snapshot:dict[str,Any], *, reason:str='discovery') -> int:
+        """Push a global discovery/stage snapshot directly into tenant lanes.
+
+        The receiver only queues RAM work; it does not make the Admin wait for tenant
+        database/RPC work. Periodic shared sync remains a low-frequency recovery path.
+        """
+        queued=0
+        for bot in self._active_bot_snapshot():
+            try:
+                if bot.receive_shared_candidate_snapshot(snapshot, reason=reason):
+                    queued += 1
+            except Exception:
+                # One tenant must never break discovery or another tenant.
+                continue
+        return queued
+
+    def fanout_resolved_stage(self, event:dict[str,Any]) -> int:
+        """Direct zero-poll handoff of an already-resolved SeaDrop stage.
+
+        No tenant re-reads SeaDrop here. Each tenant applies its own permissions,
+        protection, gas settings and wallet set before its independent Race launch.
+        """
+        queued=0
+        for bot in self._active_bot_snapshot():
+            try:
+                if bot.receive_shared_fast_stage(event):
+                    queued += 1
+            except Exception:
+                continue
+        return queued

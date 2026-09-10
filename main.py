@@ -137,6 +137,27 @@ def short_address(address: str) -> str:
     return f"{address[:6]}…{address[-4:]}" if len(address) >= 12 else address
 
 
+def wallet_supports_chain(wallet: Any, chain: str) -> bool:
+    """Compatibility-safe chain check for runtime and persisted wallets.
+
+    V4.14 introduced StoredWallet objects at a few persistence boundaries while
+    the Race engine primarily uses buyer.WalletConfig.  Never assume one class
+    here: a persisted wallet must be safe to use in lifecycle/completion paths
+    without crashing a tenant thread.
+    """
+    method = getattr(wallet, "supports_chain", None)
+    if callable(method):
+        try:
+            return bool(method(chain))
+        except Exception:
+            pass
+    chains = tuple(getattr(wallet, "chains", ()) or ())
+    if not chains:
+        return True
+    target = normalize_chain(chain)
+    return target in {normalize_chain(str(value)) for value in chains}
+
+
 def safe_endpoint_for_log(url: str) -> str:
     """Return a useful endpoint label without API credentials/query secrets."""
     try:
@@ -948,6 +969,11 @@ class WalletState:
     last_balance_wei: int | None = None
     required_balance_wei: int | None = None
     balance_recheck_at: float = 0.0
+    # Same-stage terminal guard.  Once the chain says this wallet already hit
+    # its limit / the drop is sold out, repeated Stream signals must not force
+    # another RPC precondition check until the stage actually changes.
+    terminal_stage_key: str = ""
+    terminal_reason: str = ""
 
 
 @dataclass
@@ -1184,12 +1210,12 @@ class Bot(OfferControllerMixin):
         self.tenant_supervisor = tenant_supervisor
         self.discovery_source = discovery_source
         self.shared_discovery_mode = discovery_source is not None
+        # V4.14.1: live global events are pushed directly into tenant Race lanes.
+        # Periodic copying is retained only as a slow recovery/sanity fallback,
+        # never as the latency path for Stream/SeaDrop/public-stage launches.
+        self.shared_sync_fallback_seconds = max(0.25, env_float("TENANT_SHARED_SYNC_FALLBACK_SECONDS", 1.0))
+        self._last_shared_sync = 0.0
         self.tenant_disabled = False
-        # V4.14.1: resolved Admin Stream/SeaDrop events are pushed directly into
-        # tenant Race lanes.  The old 20ms shared-candidate mirror remains only
-        # as a recovery/backfill path, never as the live-launch dependency.
-        self.direct_tenant_fanout = env_bool("DIRECT_TENANT_FANOUT", True)
-        self.tenant_admin_headstart_seconds = max(0.0, min(0.010, env_float("TENANT_ADMIN_HEADSTART_SECONDS", 0.002)))
         self.opensea = OpenSeaClient(os.getenv("OPENSEA_API_KEY", "").strip(), timeout=env_float("HTTP_TIMEOUT", 7.0))
         self.display_tz = ZoneInfo(os.getenv("DISPLAY_TIMEZONE", "Asia/Aden"))
         self.quantity_default = max(1, min(env_int("QUANTITY", 1), 100))
@@ -1327,8 +1353,9 @@ class Bot(OfferControllerMixin):
         self.race_stream_workers = max(4, min(env_int("RACE_STREAM_WORKERS", 24), 64))
         self.race_prep_workers = max(2, min(env_int("RACE_PREP_WORKERS", 8), 32))
         self.race_launch_workers = max(2, min(env_int("RACE_LAUNCH_WORKERS", 8), 32))
-        # V4.11.3 signal coalescer preserved unchanged: the first live signal still enters immediately,
-        # while duplicate Stream/SeaDrop events for the same contract/stage are
+        # V4.11.3 signal coalescer behavior is preserved: the first live signal still enters immediately.
+        # V4.14.1 only broadens the social-error retry trigger when a protected tenant needs it;
+        # duplicate Stream/SeaDrop events for the same contract/stage are
         # merged in RAM instead of consuming more race workers and RPC reads.
         self.race_signal_stream_quiet_seconds = max(0.20, env_float("RACE_SIGNAL_STREAM_QUIET_SECONDS", 1.50))
         self.race_signal_seadrop_quiet_seconds = max(0.10, env_float("RACE_SIGNAL_SEADROP_QUIET_SECONDS", 0.40))
@@ -1377,6 +1404,11 @@ class Bot(OfferControllerMixin):
         self.rpc_pools: dict[str, RpcPool] = {}
         self.candidates: dict[str, Candidate] = {}
         self.command_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        # V4.14.1 tenant metadata updates wake the main planner immediately.
+        # This removes the former up-to-20ms polling wait without running
+        # qualification mutation concurrently with the tenant's main planner.
+        self.shared_candidate_queue: queue.Queue[tuple[dict[str, Any], str]] = queue.Queue()
+        self.main_wakeup_event = threading.Event()
         # Telegram commands are processed by a dedicated worker. V4.4 coupled
         # command execution to the mint/stage loop, so long eligibility/network
         # checks could starve /start and inline-button callbacks.
@@ -1429,6 +1461,12 @@ class Bot(OfferControllerMixin):
         self.race_signal_stage_seen: dict[str, float] = {}
         self.race_signal_coalesced = 0
         self.race_signal_stage_suppressed = 0
+        # V4.14.1 direct tenant handoff state. These structures are RAM-only and
+        # contain no wallet secrets. They prevent duplicate tenant jobs while a
+        # single Admin-resolved stage is being consumed.
+        self.shared_direct_inflight: set[str] = set()
+        self.shared_direct_seen: dict[str, float] = {}
+        self.shared_public_hints: dict[str, tuple[float, dict[str, Any]]] = {}
         self.race_scheduler_thread: threading.Thread | None = None
         self.seadrop_log_threads: list[threading.Thread] = []
         self.race_market_thread: threading.Thread | None = None
@@ -1544,111 +1582,370 @@ class Bot(OfferControllerMixin):
             # Keep local manual watches; shared candidates naturally expire via normal cleanup.
         self.sync_wallets_into_candidates()
 
-    def _upsert_shared_candidate_direct(self, source_candidate: Candidate) -> Candidate | None:
-        """Copy one already-resolved global candidate into this tenant in RAM only.
+    # ---------- V4.14.1 direct multi-user fan-out ----------
+    _SHARED_CANDIDATE_FIELDS = (
+        "source", "public_start", "next_stage_start", "stage_lines", "wallet_limit",
+        "has_paid_stage", "remaining_supply", "mint_backend", "contract_address", "stage_end",
+        "watch_kind", "stage_plans", "current_stage_key", "current_stage_label",
+        "current_stage_start", "current_stage_end", "current_stage_public", "current_stage_free",
+        "current_stage_paid", "current_stage_limit", "final_public_start", "final_stage_end",
+        "qualification_tracked", "social_trust_status", "social_trust_checked_at",
+        "social_twitter_username", "social_twitter_url", "social_website_url",
+        "social_trust_detail", "social_trust_retry_at", "last_seen_auto",
+    )
 
-        No OpenSea/SeaDrop/RPC discovery call happens here. Wallet state, gas policy,
-        pause state, history and settings stay tenant-local.
+    def shared_candidate_snapshot(self, candidate: Candidate) -> dict[str, Any]:
+        """Create a wallet-free/project-only snapshot safe to fan out to tenants."""
+        payload: dict[str, Any] = {
+            "slug": candidate.slug,
+            "chain": candidate.chain,
+            "auto_discovered": bool(candidate.auto_discovered),
+        }
+        for attr in self._SHARED_CANDIDATE_FIELDS:
+            payload[attr] = copy.deepcopy(getattr(candidate, attr))
+        return payload
+
+    def _shared_snapshot_allowed(self, snapshot: dict[str, Any]) -> bool:
+        if self.is_admin or not self.shared_discovery_mode:
+            return False
+        if self.tenant_disabled or not bool(snapshot.get("auto_discovered", True)):
+            return False
+        if bool(snapshot.get("qualification_tracked")):
+            return self.can("qualification.mint")
+        return self.can("free_mints.auto")
+
+    def _upsert_shared_candidate_snapshot(
+        self, snapshot: dict[str, Any], *, sync_wallets: bool = True
+    ) -> Candidate | None:
+        """Merge global project metadata while preserving tenant-owned execution policy/state.
+
+        ``sync_wallets=False`` is reserved for the live direct-fan-out path: the
+        wallet list is already hot in RAM and _ensure_fast_candidate attaches it,
+        so a SQLite-backed synchronization must not sit in front of broadcast.
         """
-        if not source_candidate.auto_discovered:
+        if not self._shared_snapshot_allowed(snapshot):
             return None
-        if source_candidate.qualification_tracked:
-            if not self.can("qualification.mint"):
-                return None
-        elif not self.can("free_mints.auto"):
+        chain = normalize_chain(str(snapshot.get("chain") or ""))
+        slug = str(snapshot.get("slug") or "").strip()
+        if not slug or chain not in self.rpc_pools:
             return None
-        key = self.project_key_for_candidate(source_candidate)
+        contract = str(snapshot.get("contract_address") or "").strip() or None
+        if contract and Web3.is_address(contract):
+            contract = Web3.to_checksum_address(contract)
+        elif contract:
+            contract = None
+
         with self.candidates_lock:
-            lc = self.candidates.get(key)
-            if lc is None:
-                lc = copy.copy(source_candidate)
-                lc.wallets = {}
-                lc.checked_stage_keys = set(source_candidate.checked_stage_keys)
-                lc.stage_open_notified_keys = set()
-                lc.paid_wallet_addresses = set()
-                lc.paid_wallet_quantities = {}
-                lc.paid_selection_confirmed = False
-                lc.paid_selection_notified = False
-                lc.allow_paid = self.allow_paid_default
-                lc.max_mint_price_native = self.max_mint_price_default
-                lc.gas_override_usd = None
-                lc.ignore_gas_cap = False
-                lc.discovery_source = "shared-direct"
-                lc.race_inflight = False
-                lc.race_prepared = False
-                lc.race_last_attempt = 0.0
-                self.candidates[key] = lc
-            else:
-                for attr in (
-                    "slug","source","public_start","next_stage_start","stage_lines","wallet_limit","has_paid_stage",
-                    "remaining_supply","mint_backend","contract_address","stage_end","watch_kind","stage_plans",
-                    "current_stage_key","current_stage_label","current_stage_start","current_stage_end","current_stage_public",
-                    "current_stage_free","current_stage_paid","current_stage_limit","final_public_start","final_stage_end",
-                    "qualification_tracked","social_trust_status","social_trust_checked_at","social_twitter_username",
-                    "social_twitter_url","social_website_url","social_trust_detail","social_trust_retry_at","last_seen_auto",
-                ):
-                    setattr(lc, attr, copy.deepcopy(getattr(source_candidate, attr)))
-                lc.discovery_source = "shared-direct"
-        self.sync_wallets_into_candidates()
-        return lc
+            candidate = None
+            if contract:
+                contract_l = contract.lower()
+                candidate = next((
+                    c for c in self.candidates.values()
+                    if c.chain == chain and c.contract_address and c.contract_address.lower() == contract_l
+                ), None)
+            if candidate is None:
+                candidate = self.candidates.get(f"{chain}:{slug}")
+            if candidate is None:
+                candidate = Candidate(
+                    slug=slug,
+                    chain=chain,
+                    source=str(snapshot.get("source") or "shared-global"),
+                    allow_paid=self.allow_paid_default,
+                    max_mint_price_native=self.max_mint_price_default,
+                    auto_discovered=True,
+                    mint_backend=str(snapshot.get("mint_backend") or "seadrop"),
+                    contract_address=contract,
+                    discovery_source="shared-global",
+                    watch_kind=str(snapshot.get("watch_kind") or "auto_free"),
+                )
+                self.candidates[f"{chain}:{slug}"] = candidate
+            elif candidate.slug.startswith("contract-") and not slug.startswith("contract-"):
+                candidate.slug = slug
 
-    def receive_direct_resolved_signal(
-        self,
-        source_candidate: Candidate,
-        plan: dict[str, Any],
-        public: dict[str, Any],
-        source: str,
-        emitted_perf: float,
-        admin_headstart_seconds: float = 0.0,
-    ) -> None:
-        """Tenant hot-path for an Admin-resolved Stream/SeaDrop signal.
+            # Do not copy Admin wallet state, paid approvals, gas overrides,
+            # pause state, notification settings or any other tenant setting.
+            for attr in self._SHARED_CANDIDATE_FIELDS:
+                if attr == "contract_address":
+                    setattr(candidate, attr, contract)
+                elif attr == "source":
+                    setattr(candidate, attr, str(snapshot.get(attr) or candidate.source))
+                elif attr in snapshot:
+                    setattr(candidate, attr, copy.deepcopy(snapshot[attr]))
+            candidate.auto_discovered = True
+            candidate.discovery_source = "shared-global"
+            candidate.allow_paid = self.allow_paid_default
+            candidate.max_mint_price_native = self.max_mint_price_default
+            candidate.gas_override_usd = None
+            candidate.ignore_gas_cap = False
 
-        The event is already resolved on-chain by Admin, so this method performs
-        zero discovery RPC reads before scheduling the tenant Race.
+        if sync_wallets:
+            self.sync_wallets_into_candidates()
+        return candidate
+
+    def publish_shared_candidate_snapshot(self, candidate: Candidate, *, reason: str) -> int:
+        """Push discovery/qualification metadata without waiting for the tenant 20ms loop."""
+        if not self.is_admin or self.tenant_supervisor is None or not candidate.auto_discovered:
+            return 0
+        try:
+            return int(self.tenant_supervisor.fanout_candidate_snapshot(
+                self.shared_candidate_snapshot(candidate), reason=reason
+            ))
+        except Exception as exc:
+            log.debug("Tenant candidate fan-out skipped | %s | %s", candidate.slug, exc)
+            return 0
+
+    def drain_shared_candidate_updates(self, limit: int = 100) -> int:
+        """Apply pushed global metadata serially inside the tenant planner thread."""
+        applied = 0
+        for _ in range(max(1, int(limit))):
+            try:
+                snapshot, reason = self.shared_candidate_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                candidate = self._upsert_shared_candidate_snapshot(snapshot)
+                if candidate is not None:
+                    # Force the planner to evaluate the newly-pushed stage in this
+                    # same loop iteration instead of respecting an old 150ms tick.
+                    candidate.last_schedule_tick = 0.0
+                    applied += 1
+            except Exception as exc:
+                log.debug(
+                    "Shared candidate consume failed | tenant=%s | %s | %s",
+                    self.tenant_name(), reason, exc,
+                )
+            finally:
+                try:
+                    self.shared_candidate_queue.task_done()
+                except ValueError:
+                    pass
+        return applied
+
+    def receive_shared_candidate_snapshot(self, snapshot: dict[str, Any], *, reason: str = "discovery") -> bool:
+        """Zero-poll metadata receiver; the tenant planner is awakened immediately."""
+        if not self._shared_snapshot_allowed(snapshot):
+            return False
+        try:
+            # Snapshot objects are created as detached deep copies by Admin and
+            # treated as immutable during fan-out; avoid N additional copies here.
+            self.shared_candidate_queue.put_nowait((snapshot, str(reason or "discovery")))
+            self.main_wakeup_event.set()
+            return True
+        except Exception:
+            return False
+
+    def _shared_fast_event_key(self, event: dict[str, Any]) -> str:
+        chain = normalize_chain(str(event.get("chain") or ""))
+        contract = str(event.get("contract") or "").lower()
+        plan = event.get("plan") or {}
+        return f"{chain}:{contract}:{str(plan.get('key') or 'public')}"
+
+    def _remember_shared_public_hint(self, chain: str, contract: str, public: dict[str, Any]) -> None:
+        key = self._signal_contract_key(chain, contract)
+        now = time.time()
+        with self.race_state_lock:
+            self.shared_public_hints[key] = (now, copy.deepcopy(public))
+            if len(self.shared_public_hints) > 2000:
+                cutoff = now - 120.0
+                self.shared_public_hints = {
+                    k: v for k, v in self.shared_public_hints.items() if float(v[0]) >= cutoff
+                }
+
+    def _shared_public_hint_for_candidate(self, candidate: Candidate) -> dict[str, Any] | None:
+        if not candidate.contract_address:
+            return None
+        key = self._signal_contract_key(candidate.chain, candidate.contract_address)
+        with self.race_state_lock:
+            value = self.shared_public_hints.get(key)
+        if not value or time.time() - float(value[0]) > 120.0:
+            return None
+        return copy.deepcopy(value[1])
+
+    def _activate_live_public_wallets(self, candidate: Candidate, plan: dict[str, Any]) -> None:
+        """RAM-only stage transition used by the live Public hot path.
+
+        A wallet that was ineligible/backed-off during an allowlist stage must not
+        carry that ``next_attempt`` into Final Public. The normal scheduler does
+        the same reset, but the direct event cannot wait for its next tick.
         """
-        if STOP or self.tenant_disabled or (self.tenant_runtime is not None and not self.tenant_runtime.active) or not self.race_enabled:
-            return
-        candidate = self._upsert_shared_candidate_direct(source_candidate)
-        if candidate is None:
+        if not plan.get("is_public") or plan.get("is_paid"):
             return
         now = time.time()
-        start = float(plan.get("start") or 0)
-        end = float(plan.get("end") or 0)
-        active = (not start or now >= start) and (not end or now < end)
-        self._record_resolved_signal_stage(candidate.chain, candidate.contract_address, plan, source="shared-direct")
+        self.set_current_stage(candidate, plan)
+        active_addresses = {
+            w.address.lower() for w in self.wallets if wallet_supports_chain(w, candidate.chain)
+        }
+        target_total = self.stage_target_total(candidate, plan)
+        stage_key = str(plan.get("key") or candidate.current_stage_key or "public")
+        for state in candidate.wallets.values():
+            if state.wallet.address.lower() not in active_addresses or state.submitted:
+                continue
+            # Stream/SeaDrop may emit many signals for the same Public.  Do not
+            # reopen a wallet that is already terminal/final for this exact
+            # stage (limit reached, sold out, reverted, or otherwise resolved).
+            if state.final and str(state.stage_key or "") == stage_key:
+                continue
+            state.final = False
+            state.terminal_stage_key = ""
+            state.terminal_reason = ""
+            state.confirmed = False
+            state.tx_hash = None
+            state.status = "waiting"
+            state.last_notified_status = ""
+            self._clear_low_balance_state(state)
+            state.eligibility = "public_open"
+            state.target_total = target_total
+            state.stage_key = str(plan.get("key") or "")
+            state.stage_label = str(plan.get("label") or "Public SeaDrop")
+            state.next_attempt = now
 
-        if active:
-            if plan.get("is_paid"):
-                # Paid mint policy remains explicit and tenant-local.
-                if not self.can("paid_mints.use"):
+    def _consume_shared_fast_stage(self, event: dict[str, Any], event_key: str) -> None:
+        handoff_perf = time.perf_counter()
+        try:
+            if self.tenant_disabled:
+                return
+            snapshot = event.get("candidate") or {}
+            plan = copy.deepcopy(event.get("plan") or {})
+            public = copy.deepcopy(event.get("public") or {})
+            chain = normalize_chain(str(event.get("chain") or snapshot.get("chain") or ""))
+            contract = str(event.get("contract") or snapshot.get("contract_address") or "")
+            slug = str(event.get("slug") or snapshot.get("slug") or "").strip() or None
+            if chain not in self.rpc_pools or not contract or not Web3.is_address(contract) or not public.get("configured"):
+                return
+            if bool(plan.get("is_paid")) and not self.can("paid_mints.use"):
+                return
+            if bool(snapshot.get("qualification_tracked")):
+                if not self.can("qualification.mint"):
                     return
-                candidate.paid_detected = True
-                self.maybe_offer_paid_public(candidate)
+            elif not self.can("free_mints.auto"):
                 return
-            if self.paused:
-                return
-            if not self.social_protection_allows(candidate, plan):
-                return
-            # Event delivery is immediate. A tiny configurable Admin head-start
-            # is applied only inside the tenant worker, not by a 20ms polling loop.
-            remaining = float(admin_headstart_seconds) - (time.perf_counter() - emitted_perf)
-            if remaining > 0:
-                time.sleep(remaining)
-            self._launch_candidate_race(candidate, copy.deepcopy(plan), live=True, public_hint=copy.deepcopy(public))
-            log.info(
-                "Direct tenant signal handled | user=%s | source=%s | %s | %s | handoff=%.3fms",
-                self.tenant_name(), source, candidate.slug, candidate.chain,
-                (time.perf_counter() - emitted_perf) * 1000.0,
-            )
-            return
 
-        if start and start > now:
-            candidate.watch_kind = "auto_stage"
-            # The scheduler/prewarmer can now act immediately; persistence is a
-            # recovery concern and is deliberately kept outside this hot call.
-            for state in candidate.wallets.values():
-                if not state.submitted and not state.final:
-                    state.next_attempt = min(state.next_attempt or now, now)
+            # Hot path is RAM-only until the normal Race transaction accounting:
+            # attach already-loaded tenant wallets first, then overlay the richer
+            # shared qualification/social metadata without a SQLite wallet sync.
+            candidate = self._ensure_fast_candidate(chain, contract, slug, public, "shared-direct")
+            candidate2 = self._upsert_shared_candidate_snapshot(snapshot, sync_wallets=False)
+            if candidate2 is None:
+                return
+            candidate = candidate2
+            self._remember_shared_public_hint(chain, contract, public)
+
+            now = time.time()
+            start = float(plan.get("start") or 0)
+            end = float(plan.get("end") or 0)
+            active = (not start or now >= start) and (not end or now < end)
+            if active:
+                if plan.get("is_public") and not plan.get("is_paid"):
+                    self._activate_live_public_wallets(candidate, plan)
+                if plan.get("is_paid") and candidate.paid_decision != "confirmed":
+                    candidate.paid_detected = True
+                    self.maybe_offer_paid_public(candidate)
+                    return
+                if self.paused:
+                    return
+                if not self.social_protection_allows(candidate, plan):
+                    log.debug(
+                        "Direct tenant fan-out waiting for social trust | tenant=%s | %s | %s",
+                        self.tenant_name(), candidate.slug, chain,
+                    )
+                    return
+                self._launch_candidate_race(candidate, plan, live=True, public_hint=public)
+                log.info(
+                    "DIRECT TENANT RACE handled | tenant=%s | source=%s | %s | %s | handoff=%.4fs",
+                    self.tenant_name(), str(event.get("source") or "shared"), candidate.slug, chain,
+                    time.perf_counter() - handoff_perf,
+                )
+            elif start and start > now:
+                candidate.watch_kind = "auto_stage"
+                try:
+                    self.ensure_candidate_watch_persisted(candidate)
+                    self.persist_candidate_planning(candidate)
+                except Exception:
+                    pass
+        except Exception as exc:
+            log.debug("Direct tenant stage failed | tenant=%s | %s", self.tenant_name(), exc)
+        finally:
+            with self.race_state_lock:
+                self.shared_direct_inflight.discard(event_key)
+                self.shared_direct_seen[event_key] = time.time()
+
+    def receive_shared_fast_stage(self, event: dict[str, Any]) -> bool:
+        """Queue an Admin-resolved Stream/SeaDrop event directly into this tenant's Race lane."""
+        if self.is_admin or not self.shared_discovery_mode or self.tenant_disabled:
+            return False
+        snapshot = event.get("candidate") or {}
+        if not self._shared_snapshot_allowed(snapshot):
+            return False
+        plan = event.get("plan") or {}
+        if bool(event.get("protection_wake")) and not self.free_social_protection_enabled:
+            return False
+        if bool(plan.get("is_paid")) and not self.can("paid_mints.use"):
+            return False
+        event_key = self._shared_fast_event_key(event)
+        now = time.time()
+        force = str(event.get("source") or "") == "social-pass"
+        with self.race_state_lock:
+            if len(self.shared_direct_seen) > 5000:
+                cutoff = now - 300.0
+                self.shared_direct_seen = {k: v for k, v in self.shared_direct_seen.items() if v >= cutoff}
+            if event_key in self.shared_direct_inflight:
+                return False
+            if not force and now - self.shared_direct_seen.get(event_key, 0.0) < 0.05:
+                return False
+            self.shared_direct_inflight.add(event_key)
+        try:
+            # The event payload is immutable by convention; the consumer copies
+            # only the small fields it needs. This keeps N-user fan-out cheap.
+            self.race_signal_executor.submit(
+                self._consume_shared_fast_stage, event, event_key
+            )
+            return True
+        except Exception:
+            with self.race_state_lock:
+                self.shared_direct_inflight.discard(event_key)
+            return False
+
+    def shared_fast_stage_event(
+        self,
+        candidate: Candidate,
+        plan: dict[str, Any],
+        public: dict[str, Any],
+        *,
+        source: str,
+        protection_wake: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "chain": candidate.chain,
+            "contract": candidate.contract_address,
+            "slug": candidate.slug,
+            "source": str(source or "signal"),
+            "protection_wake": bool(protection_wake),
+            "resolved_at": time.time(),
+            "plan": copy.deepcopy(plan),
+            "public": copy.deepcopy(public),
+            "candidate": self.shared_candidate_snapshot(candidate),
+        }
+
+    def fanout_shared_fast_stage(
+        self,
+        candidate: Candidate,
+        plan: dict[str, Any],
+        public: dict[str, Any],
+        *,
+        source: str,
+        protection_wake: bool = False,
+    ) -> int:
+        if not self.is_admin or self.tenant_supervisor is None:
+            return 0
+        try:
+            return int(self.tenant_supervisor.fanout_resolved_stage(
+                self.shared_fast_stage_event(
+                    candidate, plan, public, source=source, protection_wake=protection_wake
+                )
+            ))
+        except Exception as exc:
+            log.debug("Direct tenant fast fan-out skipped | %s | %s", candidate.slug, exc)
+            return 0
 
     # ---------- persistence / wallets ----------
     def import_env_wallets(self) -> None:
@@ -1813,6 +2110,24 @@ class Bot(OfferControllerMixin):
                 status, candidate.slug, candidate.chain, bool(twitter_url), bool(website_url),
             )
 
+            # V4.14.1: social identity is project-global. Publish it once from
+            # Admin so tenant bots with Safe Protection ON never issue their own
+            # OpenSea collection lookup. A PASS can directly wake only protected
+            # tenants using the already-resolved Public SeaDrop hint.
+            if self.is_admin and self.tenant_supervisor is not None:
+                self.publish_shared_candidate_snapshot(candidate, reason=f"social-trust-{status}")
+                if status == "passed" and self.shared_tenant_social_protection_required():
+                    now_shared = time.time()
+                    plan_shared = self.current_plan_for_candidate(candidate, now_shared) if candidate.stage_plans else None
+                    public_shared = self._shared_public_hint_for_candidate(candidate)
+                    if (
+                        plan_shared and plan_shared.get("is_public") and not plan_shared.get("is_paid")
+                        and candidate.contract_address and public_shared
+                    ):
+                        self.fanout_shared_fast_stage(
+                            candidate, plan_shared, public_shared, source="social-pass", protection_wake=True
+                        )
+
             # A sudden Public free mint may have been waiting only on this gate.
             # PASS must wake the mint path even when OpenSea stage metadata and
             # the on-chain SeaDrop signal arrived in the opposite order.
@@ -1832,8 +2147,10 @@ class Bot(OfferControllerMixin):
                     race_key = self._race_key(candidate, str(plan.get("key") or ""))
                     with self.race_state_lock:
                         has_prepared = race_key in self.race_prepared
+                    _shared_public_hint = self._shared_public_hint_for_candidate(candidate) if self.shared_discovery_mode else None
                     self.race_launch_executor.submit(
-                        self._launch_candidate_race, candidate, plan, live=not has_prepared
+                        self._launch_candidate_race, candidate, plan, live=not has_prepared,
+                        public_hint=_shared_public_hint,
                     )
                     launched_from_plan = True
 
@@ -1871,6 +2188,8 @@ class Bot(OfferControllerMixin):
                 )
             except Exception:
                 pass
+            if self.is_admin and self.tenant_supervisor is not None:
+                self.publish_shared_candidate_snapshot(candidate, reason="social-trust-error")
             log.info(
                 "Free social trust temporary error | %s | %s | retry=%.1fs | %s",
                 candidate.slug, candidate.chain, retry_after, detail[:250],
@@ -1879,9 +2198,54 @@ class Bot(OfferControllerMixin):
             with self.social_trust_lock:
                 self.social_trust_inflight.discard(project_key)
 
-    def ensure_social_trust_async(self, candidate: Candidate, *, force: bool = False) -> str:
-        """Start at most one social lookup for a project and return current status."""
-        if not self.free_social_protection_enabled or not candidate.auto_discovered or candidate.qualification_tracked:
+    def shared_tenant_social_protection_required(self) -> bool:
+        if not self.is_admin or self.tenant_supervisor is None:
+            return False
+        try:
+            return bool(self.tenant_supervisor.requires_free_social_protection())
+        except Exception:
+            return False
+
+    def request_shared_social_verification(self) -> int:
+        """Wake global project-level social checks after a tenant enables protection."""
+        if not self.is_admin:
+            return 0
+        with self.candidates_lock:
+            candidates = [
+                c for c in self.candidates.values()
+                if c.auto_discovered and not c.qualification_tracked
+            ]
+        queued = 0
+        for candidate in candidates:
+            status = self.ensure_social_trust_async(candidate, shared_required=True)
+            if status == "pending":
+                queued += 1
+        return queued
+
+    def ensure_social_trust_async(
+        self, candidate: Candidate, *, force: bool = False, shared_required: bool = False
+    ) -> str:
+        """Start at most one social lookup for a project and return current status.
+
+        In tenant shared-discovery mode the Admin is the sole OpenSea social
+        resolver. Tenants only consume the pushed project-level result, which
+        keeps per-user protection independent without multiplying REST calls.
+        """
+        if not candidate.auto_discovered or candidate.qualification_tracked:
+            return "bypassed"
+        if self.shared_discovery_mode:
+            if not self.free_social_protection_enabled:
+                return "bypassed"
+            status = str(candidate.social_trust_status or "unknown")
+            if status in {"passed", "rejected", "error"}:
+                ttl = self._social_status_ttl(status)
+                if candidate.social_trust_checked_at and time.time() - candidate.social_trust_checked_at <= ttl:
+                    return status
+            # Never perform a tenant-local OpenSea lookup. The Admin discovery
+            # lane will push PASS/REJECT/ERROR and a social-pass wake event.
+            return "pending"
+        global_required = bool(shared_required or self.shared_tenant_social_protection_required())
+        if not self.free_social_protection_enabled and not global_required:
             return "bypassed"
         # Do not consume REST quota on paid-only projects. Unknown-price Public
         # stages are treated as potential free stages so their trust result can
@@ -2009,7 +2373,7 @@ class Bot(OfferControllerMixin):
 
             for wallet in self.wallets:
                 key = wallet.address.lower()
-                if not wallet.supports_chain(candidate.chain):
+                if not wallet_supports_chain(wallet, candidate.chain):
                     continue
                 confirmed_total = self.confirmed_total_for_wallet(candidate, wallet.address)
                 latest = self.store.latest_mint_record(
@@ -2625,8 +2989,12 @@ class Bot(OfferControllerMixin):
         self.persist_candidate_planning(candidate)
         if candidate.auto_discovered and not candidate.qualification_tracked:
             self.ensure_social_trust_async(
-                candidate, force=(candidate.social_trust_status == "error" and not candidate.slug.startswith("contract-"))
+                candidate,
+                force=(candidate.social_trust_status == "error" and not candidate.slug.startswith("contract-")),
+                shared_required=self.shared_tenant_social_protection_required(),
             )
+        if candidate.auto_discovered:
+            self.publish_shared_candidate_snapshot(candidate, reason="drop-stage-update")
         paid_text = "مسموح فقط بعد تأكيدك واختيار المحافظ والكميات" if allow_paid else "مجاني فقط"
         kind_text = f"{len(plans)} مرحلة" + (" — يحتوي مراحل تأهيل" if has_qualification_stages(plans) else "")
         message = (
@@ -2952,8 +3320,12 @@ class Bot(OfferControllerMixin):
         self.persist_candidate_planning(candidate)
         if candidate.auto_discovered and not candidate.qualification_tracked:
             self.ensure_social_trust_async(
-                candidate, force=(candidate.social_trust_status == "error" and not candidate.slug.startswith("contract-"))
+                candidate,
+                force=(candidate.social_trust_status == "error" and not candidate.slug.startswith("contract-")),
+                shared_required=self.shared_tenant_social_protection_required(),
             )
+        if candidate.auto_discovered:
+            self.publish_shared_candidate_snapshot(candidate, reason="onchain-stage-update")
 
         policy = "المدفوع لا يُنفذ إلا بعد تأكيدك" if allow_paid else "مجاني فقط"
         message = (
@@ -3018,7 +3390,7 @@ class Bot(OfferControllerMixin):
             chain = self.detect_chain(slug, drop, hint)
             if chain and chain in self.rpc_pools:
                 lines = [f"🧪 فحص الأهلية — {slug} ({chain_label(chain)})", "المصدر: OpenSea Drop API"]
-                configs = {w.address.lower(): w for w in self.wallets if w.supports_chain(chain)}
+                configs = {w.address.lower(): w for w in self.wallets if wallet_supports_chain(w, chain)}
                 for stored in active_wallets:
                     wallet = configs.get(stored.address.lower())
                     if not wallet:
@@ -3038,7 +3410,7 @@ class Bot(OfferControllerMixin):
             return f"⚠️ لم أتمكن من تحديد Drop أو عقد SeaDrop للمشروع {slug}."
         pool = self.rpc_pools[chain]
         lines = [f"🧪 فحص الأهلية — {slug} ({chain_label(chain)})", "المصدر: SeaDrop مباشرة من السلسلة", f"العقد: {contract}"]
-        configs = {w.address.lower(): w for w in self.wallets if w.supports_chain(chain)}
+        configs = {w.address.lower(): w for w in self.wallets if wallet_supports_chain(w, chain)}
         for stored in active_wallets:
             wallet = configs.get(stored.address.lower())
             if not wallet:
@@ -3097,7 +3469,7 @@ class Bot(OfferControllerMixin):
                     watch_kind="auto_free",
                 )
                 for wallet in self.wallets:
-                    if wallet.supports_chain(chain):
+                    if wallet_supports_chain(wallet, chain):
                         candidate.wallets[wallet.address.lower()] = WalletState(wallet=wallet, quantity=wallet.quantity)
                 self.candidates[f"{chain}:{safe_slug}"] = candidate
             plan = self._fast_plan_from_public(public, contract)
@@ -3147,7 +3519,7 @@ class Bot(OfferControllerMixin):
         target_total = self.stage_target_total(candidate, plan)
         now = time.time()
         for state in candidate.wallets.values():
-            if state.submitted:
+            if state.submitted or state.final:
                 continue
             # Prevent a wallet with no native gas balance from being hammered on
             # every 40ms Race retry. Healthy wallets still enter immediately.
@@ -3362,6 +3734,8 @@ class Bot(OfferControllerMixin):
                 self._clear_low_balance_state(state)
                 state.submitted = True
                 state.final = False
+                state.terminal_stage_key = ""
+                state.terminal_reason = ""
                 state.pending_quantity = int(result.quantity_used or state.quantity or 1)
                 state.quantity = state.pending_quantity
                 state.tx_hash = result.tx_hash
@@ -3407,6 +3781,8 @@ class Bot(OfferControllerMixin):
                     # Nothing useful can happen again in the same stage. A new
                     # stage automatically resets final=False in process_stage_schedule.
                     state.final = True
+                    state.terminal_stage_key = str(plan.get("key") or state.stage_key or candidate.current_stage_key or "public")
+                    state.terminal_reason = str(result.detail or result.status or "terminal_onchain")[:500]
                     state.next_attempt = now + max(15.0, self.stage_refresh_seconds)
                 else:
                     state.next_attempt = now + self.race_retry_seconds
@@ -3718,7 +4094,13 @@ class Bot(OfferControllerMixin):
                 }
 
     def _fast_live_contract_signal(self, chain: str, contract: str, slug: str | None, source: str) -> bool:
-        """Resolve one contract signal. Return True once a stable SeaDrop stage is known."""
+        """Resolve one contract signal. Return True once a stable SeaDrop stage is known.
+
+        V4.14.1 resolves SeaDrop once in the Admin discovery lane, queues Admin's
+        launch first, then immediately fans the same in-memory stage snapshot to
+        every active tenant. Tenant lanes never wait for the old ~20ms mirror loop
+        and never repeat this SeaDrop RPC read.
+        """
         signal_perf = time.perf_counter()
         if not self.race_enabled or chain not in self.rpc_pools or not Web3.is_address(contract):
             return False
@@ -3731,36 +4113,78 @@ class Bot(OfferControllerMixin):
             plan = self._fast_plan_from_public(public, contract)
             self._record_resolved_signal_stage(chain, contract, plan, source=source)
             candidate = self._ensure_fast_candidate(chain, contract, slug, public, source)
-            # V4.14.1 direct event fan-out: enqueue the already-resolved signal
-            # into every active tenant Race lane immediately. Tenants reuse this
-            # public config and therefore do not repeat the SeaDrop discovery RPC.
-            if self.is_admin and self.direct_tenant_fanout and self.tenant_supervisor:
-                try:
-                    self.tenant_supervisor.fanout_resolved_signal(
-                        candidate, plan, public, source, time.perf_counter(),
-                        self.tenant_admin_headstart_seconds,
-                    )
-                except Exception as fanout_exc:
-                    log.debug("Direct tenant fanout failed %s %s: %s", chain, contract, fanout_exc)
+            self._remember_shared_public_hint(chain, contract, public)
+            if (
+                self.is_admin and not candidate.qualification_tracked
+                and self.shared_tenant_social_protection_required()
+            ):
+                # One global social lookup serves every protected tenant, even
+                # when Admin disabled Safe Protection for its own wallets.
+                self.ensure_social_trust_async(candidate, shared_required=True)
             start = float(plan.get("start") or 0)
             end = float(plan.get("end") or 0)
             active = (not start or now >= start) and (not end or now < end)
+            if active and plan.get("is_public") and not plan.get("is_paid"):
+                self._activate_live_public_wallets(candidate, plan)
+
             if active:
-                if plan.get("is_paid") and candidate.paid_decision != "confirmed":
-                    candidate.paid_detected = True
-                    self.maybe_offer_paid_public(candidate)
+                if plan.get("is_paid"):
+                    if candidate.paid_decision != "confirmed":
+                        candidate.paid_detected = True
+                        self.maybe_offer_paid_public(candidate)
+                    # Each tenant owns its paid permission/approval state. The
+                    # already-resolved stage can still be delivered safely.
+                    tenant_count = self.fanout_shared_fast_stage(
+                        candidate, plan, public, source=source
+                    ) if self.is_admin else 0
+                    if candidate.paid_decision == "confirmed" and not self.paused:
+                        if self.is_admin and self.tenant_supervisor is not None:
+                            try:
+                                self.race_launch_executor.submit(
+                                    self._launch_candidate_race, candidate, plan,
+                                    live=True, public_hint=copy.deepcopy(public),
+                                )
+                            except Exception:
+                                self._launch_candidate_race(candidate, plan, live=True, public_hint=public)
+                        else:
+                            self._launch_candidate_race(candidate, plan, live=True, public_hint=public)
+                    if tenant_count:
+                        log.debug("Direct paid-stage fan-out | %s | tenants=%s", candidate.slug, tenant_count)
                     return True
-                if self.paused:
-                    # Discovery continues while paused, but no signing/broadcast.
-                    return True
-                if not self.social_protection_allows(candidate, plan):
-                    log.debug("Fast free mint waiting for social trust | %s | %s", candidate.slug, chain)
-                    return True
-                self._launch_candidate_race(candidate, plan, live=True, public_hint=public)
-                log.info(
-                    "Fast signal handled | source=%s | %s | %s | %.3fs",
-                    source, candidate.slug, chain, time.perf_counter() - signal_perf,
-                )
+
+                # Protection is per tenant. Therefore Admin pause/reject/pending
+                # must never prevent another user's independently allowed mint.
+                admin_allowed = (not self.paused) and self.social_protection_allows(candidate, plan)
+                tenant_count = 0
+                if self.is_admin and self.tenant_supervisor is not None:
+                    # Queue Admin first. This preserves Admin priority without an
+                    # artificial sleep; tenant jobs are then handed off directly.
+                    if admin_allowed:
+                        try:
+                            self.race_launch_executor.submit(
+                                self._launch_candidate_race, candidate, plan,
+                                live=True, public_hint=copy.deepcopy(public),
+                            )
+                        except Exception:
+                            self._launch_candidate_race(candidate, plan, live=True, public_hint=public)
+                    tenant_count = self.fanout_shared_fast_stage(
+                        candidate, plan, public, source=source
+                    )
+                else:
+                    if self.paused:
+                        return True
+                    if not admin_allowed:
+                        log.debug("Fast free mint waiting for social trust | %s | %s", candidate.slug, chain)
+                        return True
+                    self._launch_candidate_race(candidate, plan, live=True, public_hint=public)
+
+                if admin_allowed or tenant_count:
+                    log.info(
+                        "Fast signal handled | source=%s | %s | %s | %.3fs | direct-tenants=%s",
+                        source, candidate.slug, chain, time.perf_counter() - signal_perf, tenant_count,
+                    )
+                elif not admin_allowed:
+                    log.debug("Fast free mint waiting for Admin social trust | %s | %s", candidate.slug, chain)
             elif start and start > now:
                 candidate.watch_kind = "auto_stage"
                 # Persist future on-chain public stages so a Railway restart does
@@ -3770,6 +4194,10 @@ class Bot(OfferControllerMixin):
                     self.persist_candidate_planning(candidate)
                 except Exception:
                     pass
+                # Future stages are also handed off immediately so every tenant
+                # can prewarm on its own wallet set before opening.
+                if self.is_admin:
+                    self.fanout_shared_fast_stage(candidate, plan, public, source=source)
             return True
         except Exception as exc:
             log.debug("Fast live contract signal failed %s %s: %s", chain, contract, exc)
@@ -3805,7 +4233,8 @@ class Bot(OfferControllerMixin):
                         # Stream supplied a slug, kick the gate again asynchronously.
                         if (
                             candidate is not None and candidate.auto_discovered and not candidate.qualification_tracked
-                            and candidate.social_trust_status == "error" and self.free_social_protection_enabled
+                            and candidate.social_trust_status == "error"
+                            and (self.free_social_protection_enabled or self.shared_tenant_social_protection_required())
                         ):
                             self.ensure_social_trust_async(candidate, force=True)
                     # social-pass is an unlock event and must be replayed even if
@@ -4670,6 +5099,17 @@ class Bot(OfferControllerMixin):
                 futures = [executor.submit(one, state) for state in states]
                 for future in as_completed(futures):
                     state, confirmed_total, additional, result = future.result()
+                    # V4.14.1 isolation guard: a direct Final-Public signal may
+                    # arrive while an older allowlist eligibility RPC is still
+                    # in flight. Never let that stale result overwrite the new
+                    # Public wallet state/backoff after the stage changed.
+                    active_now = self.current_plan_for_candidate(candidate, time.time())
+                    if active_now is None or str(active_now.get("key") or "") != stage_key:
+                        log.debug(
+                            "Discarding stale qualification result | %s | wallet=%s | old-stage=%s",
+                            candidate.slug, state.wallet.name, stage_key,
+                        )
+                        continue
                     state.confirmed_total = confirmed_total
                     state.target_total = target_total
                     state.stage_key = stage_key
@@ -4911,6 +5351,8 @@ class Bot(OfferControllerMixin):
                         state.status = "waiting"
                         state.last_notified_status = ""
                         self._clear_low_balance_state(state)
+                        state.terminal_stage_key = ""
+                        state.terminal_reason = ""
                         state.stage_key = candidate.current_stage_key
                         state.stage_label = candidate.current_stage_label
                         state.next_attempt = now
@@ -4919,7 +5361,10 @@ class Bot(OfferControllerMixin):
                     # an OpenSea eligibility preflight. Activate every enabled
                     # wallet immediately; the mint transaction/simulation is the
                     # final oracle. This avoids losing small-supply drops to 429s.
-                    active_addresses = {w.address.lower() for w in self.store.list_wallets(enabled_only=True)}
+                    active_addresses = {
+                        w.address.lower() for w in self.store.list_wallets(enabled_only=True)
+                        if wallet_supports_chain(w, candidate.chain)
+                    }
                     target_total = self.stage_target_total(candidate, current)
                     for state in candidate.wallets.values():
                         if state.wallet.address.lower() not in active_addresses or state.submitted:
@@ -4990,7 +5435,7 @@ class Bot(OfferControllerMixin):
             return False
         active_addresses = {
             w.address.lower() for w in self.store.list_wallets(enabled_only=True)
-            if w.supports_chain(candidate.chain)
+            if wallet_supports_chain(w, candidate.chain)
         }
         states = [s for a, s in candidate.wallets.items() if a.lower() in active_addresses]
         if not states:
@@ -5370,6 +5815,8 @@ class Bot(OfferControllerMixin):
                     detail_l = str(result.detail or "").lower()
                     if any(marker in detail_l for marker in ("wallet already reached", "sold out", "no on-chain supply remains")):
                         state.final = True
+                        state.terminal_stage_key = str((plan or {}).get("key") or state.stage_key or candidate.current_stage_key or "public")
+                        state.terminal_reason = str(result.detail or result.status or "terminal_onchain")[:500]
                         state.next_attempt = time.time() + max(15.0, self.stage_refresh_seconds)
                     elif plan and plan.get("is_public") and not plan.get("is_paid"):
                         state.next_attempt = time.time() + self.public_fast_retry_seconds
@@ -5458,6 +5905,8 @@ class Bot(OfferControllerMixin):
                 # Do not hammer a reverting transaction in the same stage; a
                 # new stage will reset final=False automatically.
                 state.final = True
+                state.terminal_stage_key = str(state.stage_key or candidate.current_stage_key or "public")
+                state.terminal_reason = "transaction_reverted"
                 self.notify_all(
                     "❌ فشلت معاملة الـMint على الشبكة\n\n"
                     f"📦 المشروع: {candidate.slug}\n"
@@ -5583,7 +6032,7 @@ class Bot(OfferControllerMixin):
         total = len(self.store.list_wallets(enabled_only=False))
         self.telegram.send(
             chat_id,
-            "🤖 OpenSea Mint Guardian V4.14.0 Multi-User\n\n"
+            "🤖 OpenSea Mint Guardian V4.14.2 Stability Fix\n\n"
             "🆓 الاكتشاف المجاني: Stream لحظي + SeaDrop مباشر + REST احتياطي\n"
             f"⚡ الاستعداد للـPublic: آخر {self.public_preopen_window_seconds:g} ثوانٍ\n"
             f"📦 سياسة الكمية: حد المنت ≤100 يؤخذ كما هو، وإذا كان >100/غير محدود فالهدف {self.auto_stage_high_limit_quantity}\n"
@@ -6547,9 +6996,17 @@ class Bot(OfferControllerMixin):
             with self.candidates_lock:
                 candidates = list(self.candidates.values())
             if self.free_social_protection_enabled:
-                for candidate in candidates:
-                    if candidate.auto_discovered and not candidate.qualification_tracked:
-                        self.ensure_social_trust_async(candidate)
+                if self.shared_discovery_mode and self.discovery_source is not None:
+                    try:
+                        self.discovery_source.request_shared_social_verification()
+                    except Exception as exc:
+                        log.debug("Shared social verification wake failed | tenant=%s | %s", self.tenant_name(), exc)
+                else:
+                    for candidate in candidates:
+                        if candidate.auto_discovered and not candidate.qualification_tracked:
+                            self.ensure_social_trust_async(
+                                candidate, shared_required=self.shared_tenant_social_protection_required()
+                            )
             else:
                 # Restore the exact pre-shield behavior immediately: all due
                 # automatic free projects may proceed without another metadata check.
@@ -6562,7 +7019,10 @@ class Bot(OfferControllerMixin):
                         candidate.auto_discovered and plan and plan.get("is_public") and not plan.get("is_paid")
                         and candidate.contract_address and self.race_enabled
                     ):
-                        self.race_launch_executor.submit(self._launch_candidate_race, candidate, plan, live=True)
+                        _hint = self._shared_public_hint_for_candidate(candidate) if self.shared_discovery_mode else None
+                        self.race_launch_executor.submit(
+                            self._launch_candidate_race, candidate, plan, live=True, public_hint=_hint
+                        )
             self.edit_or_send(event, self.settings_text(), self.settings_buttons())
             return
 
@@ -7303,7 +7763,7 @@ class Bot(OfferControllerMixin):
     def run(self) -> None:
         if self.is_admin:
             start_health_server()
-        log.info("Mint Guardian V4.14.1 Direct Fan-Out starting")
+        log.info("Mint Guardian V4.14.2 Stability Fix starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
@@ -7339,12 +7799,11 @@ class Bot(OfferControllerMixin):
             self.seadrop_wss_enabled, self.race_fee_refresh_seconds, self.race_gas_strategy,
         )
         log.info(
-            "ULTRA RACE V4.14.1 ready | prewarm=%.2fs | fee-refresh=%.2fs | low-balance-recheck=%.2fs | live-fee-retry=True | history=24h",
+            "ULTRA RACE V4.14.2 ready | prewarm=%.2fs | fee-refresh=%.2fs | low-balance-recheck=%.2fs | live-fee-retry=True | history=24h",
             self.race_prewarm_seconds, self.race_fee_refresh_seconds, self.low_balance_recheck_seconds,
         )
         log.info(
-            "DIRECT TENANT FAN-OUT ready | enabled=%s | polling-dependency=0 | admin-headstart=%.1fms | resolved-public-reuse=True",
-            self.direct_tenant_fanout, self.tenant_admin_headstart_seconds * 1000.0,
+            "V4.14.2 stability guards ready | stored-wallet-compat=True | same-stage-terminal-cache=True | candidate-isolation=True"
         )
         log.info(
             "Race signal coalescer ready | single-flight=True | stream-quiet=%.2fs | seadrop-quiet=%.2fs | unknown-quiet=%.2fs",
@@ -7358,7 +7817,7 @@ class Bot(OfferControllerMixin):
         )
         log.info("Collection Offers ready | isolated-executor=True | main-loop-polling=False | Race-hooks=0")
         self.notify_all(
-            "🟢 OpenSea Mint Guardian V4.14.1 Direct Fan-Out يعمل الآن على Railway.\n"
+            "🟢 OpenSea Mint Guardian V4.14.2 Stability Fix يعمل الآن على Railway.\n"
             f"الاكتشاف التلقائي: {'مفعّل كل ' + format(self.auto_free_scan_seconds, 'g') + ' ثانية' if self.auto_free_enabled else 'متوقف'}.\n"
             f"OpenSea Stream: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} | REST Mint Events: {'مفعّل' if self.auto_event_fallback_enabled else 'متوقف'}.\n"
             f"التأهيل/المراقبة: تعمل بصمت وتظهر تفاصيلها عند فتح الأقسام.\n"
@@ -7368,30 +7827,63 @@ class Bot(OfferControllerMixin):
             f"سياسة الكمية: الحد ≤{self.auto_stage_high_limit_threshold} كهدف؛ أعلى/غير محدود = {self.auto_stage_high_limit_quantity}.\n"
             "تمت استعادة المراقبات وخطط المدفوع والمحافظ النشطة بنجاح."
         )
+        if self.shared_discovery_mode:
+            # Initial snapshot for tenants that started after an already-known project.
+            self.sync_shared_candidates()
+            self._last_shared_sync = time.time()
+            log.info(
+                "Direct tenant fan-out ready | zero-poll live handoff=True | shared-sync fallback=%.2fs",
+                self.shared_sync_fallback_seconds,
+            )
+        elif self.is_admin:
+            log.info("Direct tenant fan-out ready | Admin-first queue=True | SeaDrop read shared=True")
         while not STOP:
             if self.tenant_disabled:
                 time.sleep(0.10); continue
             if self.shared_discovery_mode:
-                self.sync_shared_candidates()
+                # Clear before draining: the queue is authoritative. If a producer
+                # arrives during/after the drain it sets the event again and the
+                # wait below returns immediately, so no wake-up can be lost.
+                self.main_wakeup_event.clear()
+                # Direct metadata push wakes this planner; qualification/stage
+                # mutation remains serialized here rather than racing live Race.
+                self.drain_shared_candidate_updates()
+                if time.time() - self._last_shared_sync >= self.shared_sync_fallback_seconds:
+                    # Recovery only: live/future stage updates normally arrive through
+                    # direct in-memory fan-out and do not wait for this timer.
+                    self.sync_shared_candidates()
+                    self._last_shared_sync = time.time()
             self.drain_auto_discovery()
             self.cleanup_auto_candidates()
             with self.candidates_lock:
                 ordered = sorted(list(self.candidates.items()), key=lambda kv: self.candidate_loop_priority(kv[1]))
             for key, candidate in ordered:
-                if not (self.shared_discovery_mode and str(candidate.discovery_source).startswith("shared-")):
-                    self.refresh_candidate(candidate)
-                self.process_stage_schedule(candidate)
-                self.try_candidate(candidate)
-                self.check_receipts(candidate)
-                if candidate.done:
-                    pending = any(s.submitted and not s.confirmed for s in candidate.wallets.values())
-                    if not pending:
-                        with self.candidates_lock:
-                            self.candidates.pop(key, None)
+                try:
+                    if not (self.shared_discovery_mode and candidate.discovery_source == "shared-global"):
+                        self.refresh_candidate(candidate)
+                    self.process_stage_schedule(candidate)
+                    self.try_candidate(candidate)
+                    self.check_receipts(candidate)
+                    if candidate.done:
+                        pending = any(s.submitted and not s.confirmed for s in candidate.wallets.values())
+                        if not pending:
+                            with self.candidates_lock:
+                                self.candidates.pop(key, None)
+                except Exception as exc:
+                    # Tenant isolation: a malformed/stale candidate must never
+                    # terminate the whole user's runtime thread.  Keep the
+                    # candidate recoverable and continue with every other job.
+                    candidate.next_refresh = max(candidate.next_refresh, time.time() + 1.0)
+                    log.exception(
+                        "Candidate loop isolated error | tenant=%s | project=%s | chain=%s | error=%s",
+                        self.tenant_name, candidate.slug, candidate.chain, exc,
+                    )
                 # Pull in any live Stream mint that arrived while this candidate
                 # was being processed; it will be first on the next sorted pass.
                 self.drain_auto_discovery()
-            time.sleep(0.02)
+            # Wake immediately on a pushed tenant stage update; otherwise keep
+            # the legacy ~20ms planner cadence as a safety/background tick.
+            self.main_wakeup_event.wait(timeout=0.02)
         log.info("Stopped")
 
 

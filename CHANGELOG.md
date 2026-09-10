@@ -1,24 +1,71 @@
-# Mint Guardian V4.14.1 — Direct Tenant Race Fan-Out
+# Mint Guardian V4.14.2 — Stability Fix
 
-## Speed improvement
-- Removed the 20ms shared-candidate polling loop as a dependency of live tenant mint launch.
-- Admin resolves each Stream/SeaDrop contract signal once, then immediately enqueues the already-resolved event into every eligible active tenant Race executor.
-- Tenant live launch reuses Admin's resolved SeaDrop public configuration (`public_hint`), so tenants do not repeat the discovery SeaDrop RPC before Race.
-- The existing 20ms shared-candidate synchronization remains only as recovery/backfill for metadata and missed/non-live state; it is no longer the live signal transport.
-- Configurable `TENANT_ADMIN_HEADSTART_SECONDS` defaults to 0.002 seconds. Event enqueue is immediate; the tiny head-start is applied inside tenant workers so Admin keeps launch priority without a polling delay.
-- `DIRECT_TENANT_FANOUT=true` enables the new path by default.
+## Fixed
+- Production tenant-thread crash after receipt/final-Public processing: `StoredWallet` now supports chain compatibility and all main wallet filtering uses a defensive `wallet_supports_chain(...)` helper.
+- Same-stage duplicate terminal retries: Race work skips final wallets, and duplicate live Public signals no longer reopen a wallet already final for that stage.
+- On-chain terminal results (`wallet limit reached`, `sold out`, `no on-chain supply remains`) are tagged with the current stage and remain suppressed until a genuinely new stage opens.
+- Reverted transactions remain final for the same stage instead of being reactivated by a later Stream burst.
+- Candidate processing is exception-isolated so one bad/stale project cannot terminate a tenant's entire main runtime thread.
 
-## Isolation preserved
-- Each tenant still applies its own `free_social_protection_enabled` setting before launch.
-- Protection ON: ordinary auto Free Mint requires X OR Website.
-- Protection OFF: that tenant may proceed without the social gate.
-- Qualification-tracked projects preserve the existing protection exemption and per-wallet qualification behavior.
-- Each tenant still applies its own pause state, permissions, wallets, gas limits, history, notifications and database.
-- Suspended tenants and tenants without the required permission are excluded before executor submission and checked again inside the tenant Bot.
-- Paid mint behavior remains explicit and tenant-local.
+## Preserved
+- V4.14.1 Direct Tenant Fan-Out and Admin-first ordering.
+- Shared Admin-resolved SeaDrop/Public snapshot with no tenant re-read in the direct hot path.
+- Independent per-user Safe Protection, gas limits, pause/resume, notifications, permissions, wallets, history and Offers.
+- V4.13.1 stale-fee recovery, low-balance auto-resume, quantity logic, RPC fallbacks, 24-hour visible history and cumulative anti-remint accounting.
 
-## Race behavior preserved
-- V4.13.1/V4.14.0 Race preparation, broadcast, stale-fee recovery, low-balance auto-resume, nonce safety, RPC pools, fee cache and price oracle remain intact.
-- Admin remains the global discovery owner and has priority.
-- Tenants share the verified RPC pools and hot market caches; no per-user OpenSea scanner or fee warmer was introduced.
-- Offers remain isolated from Race.
+---
+
+# Mint Guardian V4.14.1 — Direct Tenant Fan-Out
+
+## Ultra Race multi-user latency upgrade
+- Removed the tenant live-mint dependency on the former ~20ms shared-candidate mirror loop.
+- Admin resolves a Stream/SeaDrop contract stage once, queues the Admin Race launch first, then pushes the exact in-memory `public`/stage snapshot directly to every active tenant Race lane.
+- Tenant direct Race does **not** repeat the SeaDrop RPC read and does **not** run SQLite wallet synchronization before the live launch.
+- Each tenant still applies its own permissions, active wallets, gas limits, pause state and Safe Protection setting before signing/broadcast.
+- Admin pause or Admin Safe-Protection outcome cannot block another tenant whose own settings allow execution.
+- Direct event de-duplication prevents the same stage burst from spawning duplicate tenant jobs.
+- Future Public stage snapshots are also pushed immediately so tenant schedulers can prewarm before opening.
+- OpenSea qualification/drop metadata is pushed through an event-driven tenant wake-up instead of waiting for the next 20ms mirror poll. The tenant main planner remains the single writer for qualification-stage mutation.
+- The old shared-candidate sync is retained only as a recovery/sanity fallback (`TENANT_SHARED_SYNC_FALLBACK_SECONDS=1.0` by default).
+- Final Public has a RAM-only wallet activation step that clears stale allowlist backoff before Race without touching SQLite.
+- Added a stale-qualification-result guard: an old allowlist RPC result cannot overwrite wallet state after a newer/final Public stage has become active.
+- The last Admin-resolved Public snapshot is held briefly in tenant RAM so a Safe-Protection social PASS can launch without re-reading SeaDrop.
+- Safe Protection remains independently selectable per user, but X/Website identity resolution is now centralized: if any active tenant has protection ON, Admin performs one project-level OpenSea social lookup and pushes PASS/REJECT/ERROR to tenants.
+- Protected tenants never duplicate the OpenSea social REST lookup; protection-OFF tenants do not wait for the social result, and a social PASS wake is delivered only to protection-ON tenants.
+- Enabling Safe Protection on a tenant immediately asks the Admin discovery engine to verify already-known auto-free projects, without restarting any bot.
+
+## Preserved
+- V4.14.0 multi-user isolation, independent per-user Bot Token/Telegram ID, permissions, wallet limits, settings, pause, notifications, history, offers and databases.
+- V4.13.1 Race transaction builder/broadcaster, prewarm, fee warmer, stale EIP-1559 retry, low-balance auto-resume, quantity logic, 24-hour visible history and RPC fallbacks.
+- Safe Protection remains per tenant: ordinary auto Free Mint requires X OR website only for tenants that enabled the shield; qualification/manual exemptions remain unchanged.
+- Collection Offers remain isolated from the Race hot path.
+
+---
+
+# Mint Guardian V4.14.0 Multi-User Race
+
+## Added
+- Admin/user multi-tenant architecture while preserving the V4.13.1 Mint/Race engine.
+- Railway Telegram bot remains the Admin bot. Admin can create users with username, Telegram ID, encrypted Bot Token, wallet limit and granular permissions.
+- One private Telegram bot per user; exact Telegram ID allowlist is enforced for that bot.
+- User enable/suspend/resume without stopping Admin or other users.
+- Unlimited Admin wallets; enforced per-user wallet limits.
+- Separate encrypted SQLite tenant database per user for wallets, settings, watches, qualification state, offers and mint history.
+- Central encrypted users registry and audit log.
+- Global wallet ownership claims prevent one wallet being attached to two tenants.
+- Granular server-side permission checks; hiding buttons is not treated as authorization.
+- Per-user settings: global/per-chain gas cap, Free Mint protection, stage notifications, all notifications, and independent pause/resume.
+- Admin user management UI in Telegram with live permission toggles and wallet-limit editing.
+- Shared auto-discovery fan-out: Admin performs global OpenSea/Stream/SeaDrop discovery once; tenant engines receive RAM-only project metadata and keep independent wallet state.
+- Shared verified RPC pools, price oracle and warmed fee cache across tenants to avoid multiplying RPC/Alchemy load.
+- Admin-first execution: Admin sees/processes the source Race event before it is mirrored to tenant lanes; tenant wallets then execute concurrently in isolated Race executors.
+
+## Preserved from V4.13.1
+- Ultra Race prewarm, fee warmer, stale EIP-1559 refresh/re-sign, low-balance auto-resume, 24h visible history compaction, cumulative anti-remint totals, Safe Protection X-or-website rule, final Public behavior, quantity rules, paid-mint confirmation, Offers isolation and RPC fallbacks.
+
+## Isolation guarantees
+- No user's Telegram messages are routed to another user's bot.
+- Wallets/settings/history/offers/watches are physically separated by tenant DB.
+- A user's pause/settings do not change Admin or another user.
+- User bots cannot manage users.
+- User Bot Tokens and wallet private keys are encrypted at rest.

@@ -1,3 +1,76 @@
+# OpenSea Mint Guardian V4.14.2 — Stability Fix
+
+V4.14.2 is a focused stability release on top of V4.14.1 Direct Fan-Out. It preserves the same Admin-first direct in-memory Race path and per-user isolation while fixing the production traceback observed after a successful tenant mint and preventing repeated on-chain limit checks for the same wallet/stage.
+
+## V4.14.2 fixes
+
+- Fixed `AttributeError: 'StoredWallet' object has no attribute 'supports_chain'` in final-Public completion/accounting. Persisted `StoredWallet` and runtime `WalletConfig` now share compatible chain checks, and `main.py` uses a defensive compatibility helper at wallet boundaries.
+- Same-stage terminal cache: when the chain returns `Wallet already reached the on-chain public mint limit`, `sold out`, or `no on-chain supply remains`, that wallet is final for that exact stage and duplicate Stream/SeaDrop signals do not re-run the precondition RPC.
+- A genuinely new stage automatically clears the terminal guard, so qualification/future Public stages still work normally.
+- Race work now skips `state.final` wallets, closing the repeated `RACE no-submit ... Wallet already reached...` loop seen in production logs.
+- Reverted transactions are also kept final for the same stage instead of being reopened by duplicate live signals.
+- Added candidate-level exception isolation in the main tenant loop: an unexpected project-specific exception is logged and isolated instead of terminating the entire tenant runtime thread.
+- Added startup marker: `V4.14.2 stability guards ready | stored-wallet-compat=True | same-stage-terminal-cache=True | candidate-isolation=True`.
+
+## Speed / behavior preserved
+
+- Direct tenant handoff remains zero-poll for live events.
+- Admin Race task is still queued first, followed immediately by tenant fan-out.
+- Tenants still reuse the Admin-resolved Public/SeaDrop snapshot; no extra SeaDrop read is added to the direct hot path.
+- Per-user Safe Protection, gas caps, notifications, pause/resume, permissions, wallet ownership and databases remain independent.
+- Qualification and Final Public behavior remain unchanged except for eliminating same-stage duplicate retries after a terminal on-chain result.
+
+---
+
+# OpenSea Mint Guardian V4.14.1 — Direct Multi-User Race Fan-Out
+
+V4.14.1 is a latency-focused upgrade over V4.14.0. The multi-user model remains unchanged, but live global mint signals no longer wait for the tenant mirror loop. Admin performs the Stream/SeaDrop resolution once, queues Admin first, and directly pushes the already-resolved stage into every active tenant Race lane.
+
+## V4.14.1 direct path
+
+```text
+OpenSea Stream / SeaDrop WSS
+            │
+            ▼
+     Admin signal resolver
+     (one SeaDrop read)
+            │
+      ┌─────┴───────────────┐
+      │                     │
+      ▼                     ▼
+Admin Race queued       Direct RAM fan-out
+first                   to active tenants
+                              │
+                    ┌─────────┼─────────┐
+                    ▼         ▼         ▼
+                  User A    User B    User C
+                  own gas   own gas   own gas
+                  own safe  own safe  own safe
+                  own wallets / DB / notifications
+```
+
+Important behavior:
+- No tenant SeaDrop re-read is inserted in front of a direct live Free Mint.
+- No tenant SQLite wallet sync is inserted in front of the direct live broadcast.
+- Admin's launch task is queued before user fan-out; there is no artificial sleep between Admin and users.
+- A user's `Free Mint Shield`, gas caps, permissions and pause state are evaluated only for that user.
+- Safe Protection is still per-user, but project social identity is resolved once globally by Admin whenever at least one active protected tenant needs it. Protection-OFF users launch without waiting; protection-ON users consume the shared PASS/REJECT result and never duplicate the OpenSea social REST call.
+- A social PASS wakes only protected tenants and reuses the already-resolved Public SeaDrop snapshot, so the shield does not add another SeaDrop RPC read.
+- Qualification/drop metadata wakes tenant planners immediately.
+- When Final Public opens, stale allowlist backoff is cleared in RAM before launch and all active compatible wallets become eligible for the Public Race according to the existing cumulative quantity rules.
+- A late allowlist eligibility response is discarded if Public has already taken over, preventing cross-stage state corruption.
+- Periodic tenant mirroring remains only as a 1-second default recovery fallback and is not the normal speed path.
+
+Optional recovery tuning:
+
+```env
+TENANT_SHARED_SYNC_FALLBACK_SECONDS=1.0
+```
+
+There is normally no reason to lower this value for speed; live/future stage updates are pushed directly.
+
+---
+
 # OpenSea Mint Guardian V4.13.1 — Ultra Race Recovery
 
 V4.13.1 is an in-place performance/reliability upgrade over the working V4.12.x line. It preserves the existing Free Mint, qualification, Safe Protection, paid-mint confirmation, multi-wallet, Collection Offer, Telegram, SQLite, and Railway behavior. The changes are concentrated around Race latency, gas/balance recovery, stale fee handling, 24-hour visible history, and cache maintenance.
@@ -204,18 +277,3 @@ Each tenant receives its own SQLite database (`tenant_<id>.db`) and therefore it
 Global OpenSea/SeaDrop discovery stays on the Admin engine and is mirrored in RAM to tenants. Tenant engines reuse Admin's verified RPC pools, price oracle and fee cache. This is intentional: adding users does not create one OpenSea catalog scanner or fee warmer per user. Manual watch/eligibility actions remain private to the user who requested them.
 
 Per-user settings include gas limits, Free Mint Shield, notifications and independent execution pause. Suspending a user removes only that tenant from execution; it does not pause Admin or other tenants.
-
-## V4.14.1 Direct Tenant Fan-Out
-
-Live Stream/SeaDrop signals no longer depend on the tenant 20ms mirror loop. Admin resolves the on-chain public configuration once and immediately pushes that resolved event into each eligible tenant Race lane. The tenant uses the same public configuration as a `public_hint`, while applying its own permissions, pause state, Safe Protection setting, gas limits and wallets.
-
-Optional environment controls:
-
-```env
-DIRECT_TENANT_FANOUT=true
-TENANT_ADMIN_HEADSTART_SECONDS=0.002
-```
-
-`TENANT_ADMIN_HEADSTART_SECONDS` is not a discovery polling delay. The event is enqueued immediately; the small default head-start only keeps Admin's wallet lane ahead of tenant broadcast work. Set it to `0` if strict simultaneous scheduling is preferred.
-
-The old shared-candidate synchronization is intentionally retained as a safety/backfill mechanism so metadata/state can recover even if a tenant starts after the original live signal.

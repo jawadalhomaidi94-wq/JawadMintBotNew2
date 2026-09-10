@@ -21,6 +21,18 @@ class StoredWallet:
     chains: tuple[str, ...]
     enabled: bool
 
+    def supports_chain(self, chain: str) -> bool:
+        """Match buyer.WalletConfig without importing buyer (avoids cycles)."""
+        aliases = {
+            "eth": "ethereum", "mainnet": "ethereum", "ethereum-mainnet": "ethereum",
+            "rh": "robinhood", "hood": "robinhood", "robinhood-chain": "robinhood",
+            "robinhood_chain": "robinhood",
+        }
+        def norm(value: str) -> str:
+            key = str(value or "").strip().lower()
+            return aliases.get(key, key)
+        return not self.chains or norm(chain) in {norm(value) for value in self.chains}
+
 
 class SecureStore:
     """SQLite persistence + Fernet encryption for wallet private keys.
