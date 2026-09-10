@@ -640,41 +640,6 @@ class SecureStore:
                 ).fetchone()
         return int(row["qty"] or 0) if row else 0
 
-    def confirmed_quantities_for_target(
-        self,
-        slug: str,
-        *,
-        chain: str,
-        contract_address: str | None = None,
-    ) -> dict[str, int]:
-        """Bulk confirmed quantities keyed by lower-case wallet address."""
-        with self.lock:
-            if contract_address:
-                rows = self.conn.execute(
-                    """
-                    SELECT lower(wallet_address) AS wallet_address,
-                           COALESCE(SUM(COALESCE(quantity,0)),0) AS qty
-                    FROM mint_history
-                    WHERE status='confirmed' AND chain=? COLLATE NOCASE
-                      AND (slug=? COLLATE NOCASE OR contract_address=? COLLATE NOCASE)
-                    GROUP BY lower(wallet_address)
-                    """,
-                    (chain, slug, contract_address),
-                ).fetchall()
-            else:
-                rows = self.conn.execute(
-                    """
-                    SELECT lower(wallet_address) AS wallet_address,
-                           COALESCE(SUM(COALESCE(quantity,0)),0) AS qty
-                    FROM mint_history
-                    WHERE status='confirmed' AND chain=? COLLATE NOCASE
-                      AND slug=? COLLATE NOCASE
-                    GROUP BY lower(wallet_address)
-                    """,
-                    (chain, slug),
-                ).fetchall()
-        return {str(row["wallet_address"]).lower(): int(row["qty"] or 0) for row in rows}
-
     def upsert_qualification_project(
         self,
         *,

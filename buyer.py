@@ -8,7 +8,6 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from functools import lru_cache
 from decimal import Decimal
 from typing import Any, Iterable
 
@@ -18,25 +17,6 @@ from web3 import Web3
 from web3.exceptions import TransactionNotFound
 
 log = logging.getLogger("mint-buyer")
-
-
-@lru_cache(maxsize=512)
-def _cached_account(private_key: str):
-    # Wallet keys are already resident in process memory; caching only avoids
-    # repeated key parsing on the race path.
-    return Account.from_key(private_key)
-
-
-_MINT_PUBLIC_SELECTOR = Web3.keccak(text="mintPublic(address,address,address,uint256)")[:4]
-
-
-@lru_cache(maxsize=4096)
-def _mint_public_calldata(nft_contract: str, fee_recipient: str, quantity: int) -> str:
-    nft = bytes.fromhex(Web3.to_checksum_address(nft_contract)[2:]).rjust(32, b"\x00")
-    fee = bytes.fromhex(Web3.to_checksum_address(fee_recipient)[2:]).rjust(32, b"\x00")
-    zero = b"\x00" * 32
-    qty = int(quantity).to_bytes(32, "big")
-    return "0x" + (_MINT_PUBLIC_SELECTOR + nft + fee + zero + qty).hex()
 
 
 CHAIN_CONFIGS: dict[str, dict[str, Any]] = {
@@ -412,19 +392,6 @@ class RpcPool:
             max_workers=self._broadcast_pool_workers,
             thread_name_prefix=f"rpc-broadcast-{chain}",
         )
-        self._read_executor = ThreadPoolExecutor(
-            max_workers=max(8, min(64, self._broadcast_pool_workers)),
-            thread_name_prefix=f"rpc-read-{chain}",
-        )
-        self._session_lock = threading.RLock()
-        self._http_sessions: dict[str, requests.Session] = {}
-        self._burst_rebroadcast = os.getenv("RPC_BURST_REBROADCAST", "true").strip().lower() in {"1", "true", "yes", "on"}
-        try:
-            self._burst_delays_ms = [
-                max(0, int(x.strip())) for x in os.getenv("RPC_BURST_DELAYS_MS", "35,120").split(",") if x.strip()
-            ][:4]
-        except Exception:
-            self._burst_delays_ms = [35, 120]
         self.clients: list[tuple[float, str, Web3]] = []
 
         import time
@@ -462,145 +429,30 @@ class RpcPool:
     def urls(self) -> list[str]:
         return [url for _, url, _ in self.clients]
 
-    def _http_session(self, url: str) -> requests.Session:
-        with self._session_lock:
-            session = self._http_sessions.get(url)
-            if session is None:
-                session = requests.Session()
-                adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=64, max_retries=0)
-                session.mount("https://", adapter)
-                session.mount("http://", adapter)
-                session.headers.update({"content-type": "application/json"})
-                self._http_sessions[url] = session
-            return session
-
-    @staticmethod
-    def _raw_hex(raw_tx: bytes) -> str:
-        raw = bytes(raw_tx)
-        return "0x" + raw.hex()
-
-    def _send_raw_http(self, url: str, raw_hex: str, local_hash: str) -> tuple[str, str]:
-        payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction", "params": [raw_hex]}
-        response = self._http_session(url).post(url, json=payload, timeout=self.timeout)
-        response.raise_for_status()
-        body = response.json()
-        if isinstance(body, dict) and body.get("result"):
-            return str(body["result"]), url
-        error = body.get("error") if isinstance(body, dict) else None
-        message = str((error or {}).get("message") or error or body)
-        low = message.lower()
-        if "already known" in low or "known transaction" in low or "already imported" in low:
-            return local_hash, url
-        raise RuntimeError(message)
-
-    def _rebroadcast_later(self, raw_hex: str, local_hash: str, delay_ms: int) -> None:
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000.0)
-        targets = self.clients[: max(1, min(self.broadcast_workers, len(self.clients)))]
-        for _latency, url, _w3 in targets:
-            self._broadcast_executor.submit(self._quiet_send_raw, url, raw_hex, local_hash)
-
-    def _quiet_send_raw(self, url: str, raw_hex: str, local_hash: str) -> None:
-        try:
-            self._send_raw_http(url, raw_hex, local_hash)
-        except Exception:
-            pass
-
     def broadcast_raw_transaction(self, raw_tx: bytes) -> tuple[str, str]:
-        """Low-overhead parallel broadcast using persistent HTTP connections.
+        """Broadcast the same signed transaction to verified RPCs in parallel.
 
-        The actual race is won when the first RPC receives the raw transaction,
-        not when Web3.py finishes parsing its response. V4.10 therefore sends
-        JSON-RPC directly over warmed requests.Session connections, fans out to
-        every configured race RPC immediately, and performs a couple of quiet
-        re-broadcast waves for propagation/reliability.
+        V4.9 uses one persistent executor for the lifetime of the process, so a
+        multi-wallet public race does not repeatedly create/destroy thread pools.
         """
-        raw_hex = self._raw_hex(raw_tx)
-        local_hash = "0x" + bytes(Web3.keccak(bytes(raw_tx))).hex()
+        def send(item: tuple[float, str, Web3]) -> tuple[str, str]:
+            _, url, w3 = item
+            tx_hash = w3.eth.send_raw_transaction(raw_tx)
+            return tx_hash.hex(), url
+
         targets = self.clients[: max(1, min(self.broadcast_workers, len(self.clients)))]
-        futures = [
-            self._broadcast_executor.submit(self._send_raw_http, url, raw_hex, local_hash)
-            for _latency, url, _w3 in targets
-        ]
+        futures = [self._broadcast_executor.submit(send, item) for item in targets]
         errors: list[str] = []
         for future in as_completed(futures):
             try:
                 tx_hash, url = future.result()
-                if self._burst_rebroadcast:
-                    for delay_ms in self._burst_delays_ms:
-                        timer = threading.Timer(
-                            max(0, delay_ms) / 1000.0,
-                            self._rebroadcast_later,
-                            args=(raw_hex, local_hash, 0),
-                        )
-                        timer.daemon = True
-                        timer.start()
-                return tx_hash or local_hash, url
+                for f in futures:
+                    if f is not future:
+                        f.cancel()
+                return tx_hash, url
             except Exception as exc:
                 errors.append(str(exc))
         raise RuntimeError("All RPC broadcasts failed: " + " | ".join(errors[:4]))
-
-    def batch_wallet_runtime(self, addresses: list[str], *, include_balance: bool = True) -> dict[str, tuple[int, int | None]]:
-        """Fetch pending nonce (+ optional balance) for many wallets in one RPC batch.
-
-        Falls back to parallel Web3 calls if the provider rejects JSON-RPC batches.
-        """
-        checksummed = [Web3.to_checksum_address(a) for a in addresses]
-        if not checksummed:
-            return {}
-        url = self.primary_url
-        batch: list[dict[str, Any]] = []
-        id_map: dict[int, tuple[str, str]] = {}
-        rpc_id = 1
-        for address in checksummed:
-            addr_l = address.lower()
-            batch.append({"jsonrpc": "2.0", "id": rpc_id, "method": "eth_getTransactionCount", "params": [address, "pending"]})
-            id_map[rpc_id] = (addr_l, "nonce")
-            rpc_id += 1
-            if include_balance:
-                batch.append({"jsonrpc": "2.0", "id": rpc_id, "method": "eth_getBalance", "params": [address, "latest"]})
-                id_map[rpc_id] = (addr_l, "balance")
-                rpc_id += 1
-        try:
-            response = self._http_session(url).post(url, json=batch, timeout=self.timeout)
-            response.raise_for_status()
-            body = response.json()
-            if not isinstance(body, list):
-                raise RuntimeError("RPC batch response was not a list")
-            temp: dict[str, dict[str, int]] = {}
-            for item in body:
-                if not isinstance(item, dict) or item.get("error") or item.get("id") not in id_map:
-                    continue
-                addr_l, kind = id_map[int(item["id"])]
-                value = item.get("result")
-                if value is None:
-                    continue
-                temp.setdefault(addr_l, {})[kind] = int(str(value), 16)
-            result: dict[str, tuple[int, int | None]] = {}
-            for address in checksummed:
-                addr_l = address.lower()
-                values = temp.get(addr_l) or {}
-                if "nonce" in values and (not include_balance or "balance" in values):
-                    result[addr_l] = (values["nonce"], values.get("balance"))
-            if len(result) == len(checksummed):
-                return result
-        except Exception as exc:
-            log.debug("RPC wallet batch unsupported/failed on %s: %s", self.chain, exc)
-
-        def read_one(address: str) -> tuple[str, int, int | None]:
-            nonce = int(self.primary.eth.get_transaction_count(address, "pending"))
-            balance = int(self.primary.eth.get_balance(address)) if include_balance else None
-            return address.lower(), nonce, balance
-
-        result: dict[str, tuple[int, int | None]] = {}
-        futures = [self._read_executor.submit(read_one, address) for address in checksummed]
-        for future in as_completed(futures):
-            try:
-                addr_l, nonce, balance = future.result()
-                result[addr_l] = (nonce, balance)
-            except Exception as exc:
-                log.debug("RPC wallet runtime fallback failed: %s", exc)
-        return result
 
     def receipt_status(self, tx_hash: str) -> int | None:
         try:
@@ -833,7 +685,7 @@ def mint_drop(
     max_gas_usd: Decimal = Decimal("0"),
     native_usd_price: Decimal | None = None,
 ) -> MintResult:
-    account = _cached_account(wallet.private_key)
+    account = Account.from_key(wallet.private_key)
     address = Web3.to_checksum_address(account.address)
     w3 = rpc_pool.primary
 
@@ -1103,9 +955,14 @@ def _seadrop_base_tx(
     chain_id: int,
     nonce: int | None = None,
 ) -> dict[str, Any]:
-    # Calldata is identical for every wallet using the same project/quantity,
-    # so encode it once and reuse it from an LRU cache.
-    data = _mint_public_calldata(nft_contract, fee_recipient, int(quantity))
+    seadrop = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
+    fn = seadrop.functions.mintPublic(
+        Web3.to_checksum_address(nft_contract),
+        Web3.to_checksum_address(fee_recipient),
+        ZERO_ADDRESS,
+        int(quantity),
+    )
+    data = fn._encode_transaction_data()
     tx: dict[str, Any] = {
         "chainId": int(chain_id),
         "from": Web3.to_checksum_address(payer),
@@ -1224,7 +1081,7 @@ def mint_seadrop_public(
     native_usd_price: Decimal | None = None,
 ) -> MintResult:
     """Mint a public SeaDrop directly, preserving all V4.x safety guards."""
-    account = _cached_account(wallet.private_key)
+    account = Account.from_key(wallet.private_key)
     address = Web3.to_checksum_address(account.address)
     w3 = rpc_pool.primary
     public = read_seadrop_public_drop(w3, nft_contract)
@@ -1441,7 +1298,6 @@ def prepare_seadrop_race_transactions(
     public_override: dict[str, Any] | None = None,
     allow_before_start: bool = False,
     static_gas_limit: int | None = None,
-    static_gas_limit_by_qty: dict[int, int] | None = None,
     skip_balance_check: bool = False,
     clamp_fees_to_gas_budget: bool = False,
 ) -> dict[str, Any]:
@@ -1545,12 +1401,7 @@ def prepare_seadrop_race_transactions(
         return {"entries": [], "results": results, "prepared_at": time.time(), "public": public}
 
     gas_by_qty: dict[int, int] = {}
-    if static_gas_limit_by_qty:
-        for _wallet, q in adjusted:
-            value = int(static_gas_limit_by_qty.get(int(q), static_gas_limit or 0))
-            if value > 21_000:
-                gas_by_qty[q] = value
-    elif static_gas_limit is not None and int(static_gas_limit) > 21_000:
+    if static_gas_limit is not None and int(static_gas_limit) > 21_000:
         for _wallet, q in adjusted:
             gas_by_qty[q] = int(static_gas_limit)
     else:
@@ -1585,13 +1436,25 @@ def prepare_seadrop_race_transactions(
     if not eligible:
         return {"entries": [], "results": results, "prepared_at": time.time(), "public": public}
 
-    # V4.10: one JSON-RPC batch for all pending nonces/balances instead of
-    # one HTTP round trip per wallet. The RpcPool has a parallel fallback for
-    # providers that do not accept batch payloads.
-    wallet_runtime = rpc_pool.batch_wallet_runtime(
-        [wallet.address for wallet, _q in eligible],
-        include_balance=not skip_balance_check,
-    )
+    # Fetch pending nonces (and, during prewarm, balances) concurrently. These
+    # calls finish before opening for scheduled races.
+    wallet_runtime: dict[str, tuple[int, int | None]] = {}
+
+    def read_wallet_runtime(item: tuple[WalletConfig, int]) -> tuple[str, int, int | None]:
+        wallet, _q = item
+        address = Web3.to_checksum_address(wallet.address)
+        nonce = int(w3.eth.get_transaction_count(address, "pending"))
+        balance = None if skip_balance_check else int(w3.eth.get_balance(address))
+        return wallet.address.lower(), nonce, balance
+
+    with ThreadPoolExecutor(max_workers=min(32, len(eligible))) as executor:
+        futures = [executor.submit(read_wallet_runtime, item) for item in eligible]
+        for future in as_completed(futures):
+            try:
+                addr, nonce, balance = future.result()
+                wallet_runtime[addr] = (nonce, balance)
+            except Exception as exc:
+                log.debug("Race wallet prewarm failed: %s", exc)
 
     entries: list[dict[str, Any]] = []
     for wallet, q in eligible:
@@ -1633,7 +1496,7 @@ def prepare_seadrop_race_transactions(
             results[addr_l] = MintResult(False, "insufficient_balance", mint_value_native=mint_value_native, gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd, total_max_native=total_max_native, target=SEADROP_ADDRESS, quantity_used=q, detail=f"Wallet balance {balance} wei < estimated requirement {gas_cost_wei + value} wei")
             continue
 
-        account = _cached_account(wallet.private_key)
+        account = Account.from_key(wallet.private_key)
         base_tx = _seadrop_base_tx(
             w3,
             payer=wallet.address,
@@ -1671,7 +1534,7 @@ def prepare_seadrop_race_transactions(
         "fee_recipient": fee_recipient,
         "fees": fees,
         "prepared_at": time.time(),
-        "static_gas": static_gas_limit is not None or bool(static_gas_limit_by_qty),
+        "static_gas": static_gas_limit is not None,
     }
 
 
@@ -1700,7 +1563,7 @@ def broadcast_seadrop_race_transactions(
                 gas_cost_native=entry["gas_cost_native"],
                 gas_cost_usd=entry["gas_cost_usd"],
                 total_max_native=entry["total_max_native"],
-                detail="V4.10 ultra-race pre-signed SeaDrop transaction.",
+                detail="V4.9 race-lane pre-signed SeaDrop transaction.",
                 rpc=rpc_url,
                 target=SEADROP_ADDRESS,
                 quantity_used=int(entry["quantity"]),
