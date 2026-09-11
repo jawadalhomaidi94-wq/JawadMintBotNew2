@@ -1082,16 +1082,9 @@ class TelegramController(threading.Thread):
             "disable_web_page_preview": "true",
         }
         if buttons:
-            keyboard = []
-            for row in buttons:
-                rendered_row = []
-                for label, action in row:
-                    if str(action).startswith("url:"):
-                        rendered_row.append({"text": label, "url": str(action)[4:]})
-                    else:
-                        rendered_row.append({"text": label, "callback_data": action})
-                keyboard.append(rendered_row)
-            data["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
+            data["reply_markup"] = json.dumps({
+                "inline_keyboard": [[{"text": label, "callback_data": callback} for label, callback in row] for row in buttons]
+            })
         try:
             self.api("sendMessage", **data)
         except Exception as exc:
@@ -1105,16 +1098,9 @@ class TelegramController(threading.Thread):
             "disable_web_page_preview": "true",
         }
         if buttons is not None:
-            keyboard = []
-            for row in buttons:
-                rendered_row = []
-                for label, action in row:
-                    if str(action).startswith("url:"):
-                        rendered_row.append({"text": label, "url": str(action)[4:]})
-                    else:
-                        rendered_row.append({"text": label, "callback_data": action})
-                keyboard.append(rendered_row)
-            data["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
+            data["reply_markup"] = json.dumps({
+                "inline_keyboard": [[{"text": label, "callback_data": callback} for label, callback in row] for row in buttons]
+            })
         try:
             self.api("editMessageText", **data)
         except Exception:
@@ -1794,10 +1780,16 @@ class Bot(OfferControllerMixin):
         for state in candidate.wallets.values():
             if state.wallet.address.lower() not in active_addresses or state.submitted:
                 continue
-            # Stream/SeaDrop may emit many signals for the same Public.  Do not
-            # reopen a wallet that is already terminal/final for this exact
-            # stage (limit reached, sold out, reverted, or otherwise resolved).
+            # Stream/SeaDrop may emit many signals for the same Public. Do not
+            # reopen a wallet that is terminal OR currently latched for low
+            # balance in this exact stage. The isolated balance watcher wakes
+            # insufficient-balance wallets immediately after funding.
             if state.final and str(state.stage_key or "") == stage_key:
+                continue
+            if state.status == "insufficient_balance" and str(state.stage_key or "") == stage_key:
+                state.eligibility = "public_open"
+                state.target_total = target_total
+                state.stage_label = str(plan.get("label") or state.stage_label or "Public SeaDrop")
                 continue
             state.final = False
             state.terminal_stage_key = ""
@@ -3527,6 +3519,23 @@ class Bot(OfferControllerMixin):
             candidate.last_seen_auto = now
             return candidate
 
+    @staticmethod
+    def _race_has_ready_state(candidate: Candidate, now: float | None = None) -> bool:
+        """RAM-only gate used before any SeaDrop/RPC read on the Race path.
+
+        A low-balance wallet is latched with next_attempt=inf, so repeated Stream
+        signals and the 5ms scheduler cannot spend RPC calls until the isolated
+        balance watcher re-arms it. New stages reset next_attempt normally.
+        """
+        current = time.time() if now is None else float(now)
+        for state in candidate.wallets.values():
+            if state.submitted or state.final:
+                continue
+            if state.next_attempt and state.next_attempt > current:
+                continue
+            return True
+        return False
+
     def _race_wallet_work(self, candidate: Candidate, plan: dict[str, Any]) -> list[tuple[WalletState, int]]:
         work: list[tuple[WalletState, int]] = []
         is_paid = bool(plan.get("is_paid"))
@@ -3564,13 +3573,10 @@ class Bot(OfferControllerMixin):
             work.append((state, qty))
         return work
 
-    def _remember_low_balance(
-        self, state: WalletState, result: Any | None = None, detail: str | None = None
-    ) -> None:
-        """Remember only the minimum data needed to detect a later gas top-up."""
-        text = str(detail or getattr(result, "detail", "") or "")
-        have: int | None = None
-        need: int | None = None
+    @staticmethod
+    def _parse_balance_requirement_wei(detail: str | None) -> tuple[int | None, int | None]:
+        """Extract provider/preflight `have` + `need` values without exposing raw RPC payloads."""
+        text = str(detail or "")
         patterns = (
             r"\bhave\s+(\d+)\s+want\s+(\d+)",
             r"wallet balance\s+(\d+)\s+wei\s*<[^0-9]+(\d+)\s+wei",
@@ -3578,12 +3584,48 @@ class Bot(OfferControllerMixin):
         )
         for pattern in patterns:
             match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
-                try:
-                    have, need = int(match.group(1)), int(match.group(2))
-                except Exception:
-                    have, need = None, None
-                break
+            if not match:
+                continue
+            try:
+                return int(match.group(1)), int(match.group(2))
+            except Exception:
+                return None, None
+        return None, None
+
+    @staticmethod
+    def _format_native_wei(wei: int | None) -> str | None:
+        if wei is None:
+            return None
+        try:
+            value = Decimal(int(wei)) / Decimal(10**18)
+            text = format(value, "f").rstrip("0").rstrip(".")
+            return text or "0"
+        except Exception:
+            return None
+
+    def _friendly_insufficient_balance_detail(self, detail: str | None, chain: str) -> list[str]:
+        """Telegram-safe explanation; raw RPC dict/error stays in Railway logs only."""
+        symbol = native_symbol(chain)
+        have, need = self._parse_balance_requirement_wei(detail)
+        lines = ["📝 السبب: الرصيد المتوفر لا يكفي لتغطية رسوم الشبكة الحالية."]
+        have_native = self._format_native_wei(have)
+        need_native = self._format_native_wei(need)
+        if have_native is not None:
+            lines.append(f"💳 الرصيد الحالي: {have_native} {symbol}")
+        if need_native is not None:
+            lines.append(f"📌 المطلوب تقريبًا: {need_native} {symbol}")
+        if have is not None and need is not None and need > have:
+            missing_native = self._format_native_wei(need - have)
+            if missing_native is not None:
+                lines.append(f"➖ النقص التقريبي: {missing_native} {symbol}")
+        return lines
+
+    def _remember_low_balance(
+        self, state: WalletState, result: Any | None = None, detail: str | None = None
+    ) -> None:
+        """Remember only the minimum data needed to detect a later gas top-up."""
+        text = str(detail or getattr(result, "detail", "") or "")
+        have, need = self._parse_balance_requirement_wei(text)
         if need is None and result is not None:
             total_native = getattr(result, "total_max_native", None)
             try:
@@ -3700,6 +3742,11 @@ class Bot(OfferControllerMixin):
         """
         state.status = "insufficient_balance"
         state.last_detail = str(detail or getattr(result, "detail", "") or "") or state.last_detail
+        # Latch this wallet out of Stream/scheduler Race retries. The isolated
+        # balance watcher is the only component that re-arms it after a real
+        # top-up (or a new stage reset). This prevents repeated RPC broadcasts
+        # while preserving immediate recovery after funding.
+        state.next_attempt = float("inf")
         self._remember_low_balance(state, result=result, detail=detail)
         alert_key = f"insufficient_balance:{state.stage_key or candidate.current_stage_key or 'mint'}"
         if state.last_notified_status == alert_key:
@@ -3729,14 +3776,11 @@ class Bot(OfferControllerMixin):
             f"⚠️ أضف رصيد {symbol} لهذه المحفظة؛ يراقب البوت الرصيد تلقائيًا كل "
             f"{self.low_balance_recheck_seconds:g}s تقريبًا، وأي تعبئة توقظ محاولة جديدة إذا كانت المرحلة ما زالت مفتوحة."
         )
-        if detail:
-            lines.append(f"📝 السبب: {str(detail)[:350]}")
-        mint_url = self.candidate_mint_url(candidate)
-        lines.extend(["", "🔗 رابط المنت:", mint_url])
-        self.notify_all(
-            "\n".join(lines)[:3900],
-            buttons=[[("🔗 فتح المنت في OpenSea", f"url:{mint_url}")]],
-        )
+        # Do not expose raw provider/Python dict payloads in Telegram. They stay
+        # in Railway logs for diagnostics; users receive a localized explanation.
+        lines.extend(self._friendly_insufficient_balance_detail(detail or state.last_detail, candidate.chain))
+        lines.extend(["", self.mint_link_block(candidate)])
+        self.notify_all("\n".join(lines)[:3900])
 
     def _apply_race_results(self, candidate: Candidate, plan: dict[str, Any], results: dict[str, Any]) -> int:
         submitted = 0
@@ -3896,6 +3940,10 @@ class Bot(OfferControllerMixin):
         if self.paused or not self.race_enabled or not candidate.contract_address:
             return
         if not self.social_protection_allows(candidate, plan):
+            return
+        # Zero-network fast gate: do not read SeaDrop/fees again when every
+        # wallet is terminal/submitted/backed off (especially low balance).
+        if not self._race_has_ready_state(candidate):
             return
         stage_key = str(plan.get("key") or candidate.current_stage_key or "public")
         key = self._race_key(candidate, stage_key)
@@ -4395,6 +4443,10 @@ class Bot(OfferControllerMixin):
                     if now > end or now < start - self.race_prewarm_seconds:
                         continue
                     if plan.get("is_paid") and candidate.paid_decision != "confirmed":
+                        continue
+                    # Do not let the ultra-fast scheduler repeatedly enter RPC
+                    # work for wallets latched on insufficient balance.
+                    if not self._race_has_ready_state(candidate, now):
                         continue
                     key = self._race_key(candidate, str(plan.get("key") or ""))
                     if now < launch_at:
@@ -6050,7 +6102,7 @@ class Bot(OfferControllerMixin):
         total = len(self.store.list_wallets(enabled_only=False))
         self.telegram.send(
             chat_id,
-            "🤖 OpenSea Mint Guardian V4.14.2 Stability Fix\n\n"
+            "🤖 OpenSea Mint Guardian V4.14.3 Friendly Alerts\n\n"
             "🆓 الاكتشاف المجاني: Stream لحظي + SeaDrop مباشر + REST احتياطي\n"
             f"⚡ الاستعداد للـPublic: آخر {self.public_preopen_window_seconds:g} ثوانٍ\n"
             f"📦 سياسة الكمية: حد المنت ≤100 يؤخذ كما هو، وإذا كان >100/غير محدود فالهدف {self.auto_stage_high_limit_quantity}\n"
@@ -7769,19 +7821,19 @@ class Bot(OfferControllerMixin):
             return (5, float(current.get("start") or 0))
         return (6, float(candidate.next_stage_start or 9e18))
 
-    def notify_all(self, text: str, buttons: list[list[tuple[str, str]]] | None = None) -> None:
+    def notify_all(self, text: str) -> None:
         if not self.notifications_enabled or not self.can("notifications.receive"):
             return
         if not self.telegram.enabled:
             return
         for chat_id in self.telegram.allowed_chat_ids:
-            self.telegram.send(chat_id, text, buttons=buttons)
+            self.telegram.send(chat_id, text)
 
     # ---------- main loop ----------
     def run(self) -> None:
         if self.is_admin:
             start_health_server()
-        log.info("Mint Guardian V4.14.3 Telegram Link & Balance Retry Fix starting")
+        log.info("Mint Guardian V4.14.3 Friendly Alerts starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
@@ -7817,11 +7869,11 @@ class Bot(OfferControllerMixin):
             self.seadrop_wss_enabled, self.race_fee_refresh_seconds, self.race_gas_strategy,
         )
         log.info(
-            "ULTRA RACE V4.14.2 ready | prewarm=%.2fs | fee-refresh=%.2fs | low-balance-recheck=%.2fs | live-fee-retry=True | history=24h",
+            "ULTRA RACE V4.14.3 ready | prewarm=%.2fs | fee-refresh=%.2fs | low-balance-recheck=%.2fs | live-fee-retry=True | history=24h",
             self.race_prewarm_seconds, self.race_fee_refresh_seconds, self.low_balance_recheck_seconds,
         )
         log.info(
-            "V4.14.2 stability guards ready | stored-wallet-compat=True | same-stage-terminal-cache=True | candidate-isolation=True"
+            "V4.14.3 guards ready | stored-wallet-compat=True | same-stage-terminal-cache=True | candidate-isolation=True | friendly-rpc-alerts=True | low-balance-latch=True"
         )
         log.info(
             "Race signal coalescer ready | single-flight=True | stream-quiet=%.2fs | seadrop-quiet=%.2fs | unknown-quiet=%.2fs",
@@ -7835,7 +7887,7 @@ class Bot(OfferControllerMixin):
         )
         log.info("Collection Offers ready | isolated-executor=True | main-loop-polling=False | Race-hooks=0")
         self.notify_all(
-            "🟢 OpenSea Mint Guardian V4.14.2 Stability Fix يعمل الآن على Railway.\n"
+            "🟢 OpenSea Mint Guardian V4.14.3 Friendly Alerts يعمل الآن على Railway.\n"
             f"الاكتشاف التلقائي: {'مفعّل كل ' + format(self.auto_free_scan_seconds, 'g') + ' ثانية' if self.auto_free_enabled else 'متوقف'}.\n"
             f"OpenSea Stream: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} | REST Mint Events: {'مفعّل' if self.auto_event_fallback_enabled else 'متوقف'}.\n"
             f"التأهيل/المراقبة: تعمل بصمت وتظهر تفاصيلها عند فتح الأقسام.\n"

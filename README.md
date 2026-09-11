@@ -1,3 +1,35 @@
+# OpenSea Mint Guardian V4.14.3 — Friendly Alerts & Low-Balance Latch
+
+V4.14.3 is a focused production patch over V4.14.2. It keeps the same Direct Fan-Out/Race architecture and fixes two issues visible in Railway/Telegram logs: raw RPC dictionaries appearing in user notifications and repeated Race attempts while a wallet is already known to have insufficient native gas.
+
+## V4.14.3 fixes
+
+- User-facing insufficient-gas messages are now clean Arabic text. Provider/Python structures stay in Railway logs for diagnostics and are never copied into Telegram.
+- When exact provider numbers are available, the alert includes current balance, approximate required balance, and approximate shortfall.
+- After `insufficient_balance`, the wallet is latched for the same stage instead of retrying on every Stream burst or scheduler tick.
+- The isolated low-balance watcher continues checking balance at the configured interval (default `0.35s`). A real top-up re-arms the wallet immediately and submits a fresh Race attempt if the stage is still valid.
+- A genuinely new stage clears the latch normally, so qualification/Public transitions are not blocked.
+- Added a RAM-only ready-wallet guard before SeaDrop/RPC work, reducing unnecessary RPC traffic without adding latency to healthy wallets.
+
+### Example of the new Telegram reason
+
+```text
+📝 السبب: الرصيد المتوفر لا يكفي لتغطية رسوم الشبكة الحالية.
+💳 الرصيد الحالي: 0.000017560973951746 ETH
+📌 المطلوب تقريبًا: 0.000018205959 ETH
+➖ النقص التقريبي: 0.000000644985048254 ETH
+```
+
+## Speed / isolation preserved
+
+- Direct tenant handoff remains in-memory and zero-poll.
+- Admin-first ordering is unchanged.
+- Healthy wallets are not delayed by the low-balance latch.
+- Safe Protection and gas limits remain independent per user.
+- No change to `buyer.py`, `multi_user.py`, `offers.py`, `storage.py`, `health.py`, `requirements.txt`, or `railway.json`.
+
+---
+
 # OpenSea Mint Guardian V4.14.2 — Stability Fix
 
 V4.14.2 is a focused stability release on top of V4.14.1 Direct Fan-Out. It preserves the same Admin-first direct in-memory Race path and per-user isolation while fixing the production traceback observed after a successful tenant mint and preventing repeated on-chain limit checks for the same wallet/stage.
@@ -277,7 +309,3 @@ Each tenant receives its own SQLite database (`tenant_<id>.db`) and therefore it
 Global OpenSea/SeaDrop discovery stays on the Admin engine and is mirrored in RAM to tenants. Tenant engines reuse Admin's verified RPC pools, price oracle and fee cache. This is intentional: adding users does not create one OpenSea catalog scanner or fee warmer per user. Manual watch/eligibility actions remain private to the user who requested them.
 
 Per-user settings include gas limits, Free Mint Shield, notifications and independent execution pause. Suspending a user removes only that tenant from execution; it does not pause Admin or other tenants.
-
-
-### V4.14.3 Telegram links
-Insufficient-balance alerts show the OpenSea URL as normal text plus a native **فتح المنت في OpenSea** button.

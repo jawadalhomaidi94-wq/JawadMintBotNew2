@@ -1,3 +1,20 @@
+# Mint Guardian V4.14.3 — Friendly Alerts & Low-Balance Latch
+
+## Fixed
+- Telegram insufficient-balance alerts no longer expose raw RPC/Python payloads such as `{'code': -32000, 'message': ...}`. Raw provider details remain in Railway logs only.
+- Insufficient-balance alerts now show a localized reason plus current balance, approximate required balance, and approximate shortfall when the provider supplies `have/want` or preflight balance data.
+- Same-stage Stream/SeaDrop signals no longer reopen a wallet already waiting for a gas top-up.
+- Low-balance wallets are latched out of Race until the isolated balance watcher detects funding; a genuinely new stage still resets them normally.
+- The 5ms Race scheduler now uses a RAM-only ready-wallet gate before entering SeaDrop/RPC work, preventing repeated RPC/prewarm/broadcast churn while all wallets are low-balance/terminal/backed off.
+
+## Preserved
+- V4.14.2 StoredWallet compatibility, same-stage terminal cache and candidate exception isolation.
+- V4.14.1 Direct Tenant Fan-Out, Admin-first ordering and shared resolved Public snapshot.
+- Independent per-user Safe Protection, gas caps, pause/resume, notifications, permissions, wallets, history and Offers.
+- V4.13.1 low-balance watcher behavior: a real top-up re-arms the wallet immediately while the stage remains open.
+
+---
+
 # Mint Guardian V4.14.2 — Stability Fix
 
 ## Fixed
@@ -69,11 +86,3 @@
 - A user's pause/settings do not change Admin or another user.
 - User bots cannot manage users.
 - User Bot Tokens and wallet private keys are encrypted at rest.
-
-
-## V4.14.3 — Telegram Link & Balance Retry Fix
-- Insufficient-balance alerts now include a native Telegram URL button: "فتح المنت في OpenSea".
-- The OpenSea URL remains visible as ordinary text and is no longer labeled as a copy/code block.
-- Telegram button rendering now supports URL buttons without changing existing callback buttons.
-- Preserves V4.14.2 Direct Fan-Out, tenant isolation, Safe Protection, qualification/public logic, and Race hot path.
-- Log review confirmed Stream reconnect is self-healing; repeated insufficient-balance results are real balance shortages, not execution crashes.
