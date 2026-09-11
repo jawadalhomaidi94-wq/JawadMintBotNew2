@@ -1360,6 +1360,21 @@ class Bot(OfferControllerMixin):
         self.race_signal_stream_quiet_seconds = max(0.20, env_float("RACE_SIGNAL_STREAM_QUIET_SECONDS", 1.50))
         self.race_signal_seadrop_quiet_seconds = max(0.10, env_float("RACE_SIGNAL_SEADROP_QUIET_SECONDS", 0.40))
         self.race_signal_unknown_quiet_seconds = max(0.05, env_float("RACE_SIGNAL_UNKNOWN_QUIET_SECONDS", 0.20))
+        # V4.14.4: a social/Stream signal can arrive a few milliseconds before a
+        # provider exposes the newly-configured SeaDrop Public. Keep resolution
+        # in a dedicated recovery lane instead of waiting for the 15s catalog scan.
+        _recovery_raw = csv_values(os.getenv(
+            "FAST_STAGE_RECOVERY_DELAYS_SECONDS",
+            "0.05,0.10,0.20,0.40,0.80,1.50,3.00",
+        ))
+        _recovery_delays: list[float] = []
+        for _value in _recovery_raw:
+            try:
+                _recovery_delays.append(max(0.02, float(_value)))
+            except (TypeError, ValueError):
+                continue
+        self.fast_stage_recovery_delays = tuple(_recovery_delays or [0.05, 0.10, 0.20, 0.40, 0.80, 1.50, 3.00])
+        self.fast_stage_recovery_max_age = max(5.0, env_float("FAST_STAGE_RECOVERY_MAX_AGE_SECONDS", 30.0))
         self.race_gas_strategy = os.getenv("RACE_GAS_STRATEGY", "fast").strip().lower()
         if self.race_gas_strategy not in {"economy", "balanced", "smart", "fast", "turbo"}:
             self.race_gas_strategy = "fast"
@@ -1461,6 +1476,10 @@ class Bot(OfferControllerMixin):
         self.race_signal_stage_seen: dict[str, float] = {}
         self.race_signal_coalesced = 0
         self.race_signal_stage_suppressed = 0
+        # Dedicated unresolved-stage recovery. It never occupies signal workers
+        # while sleeping and is cancelled immediately once Public is resolved.
+        self.stage_recovery: dict[str, dict[str, Any]] = {}
+        self.stage_recovery_thread: threading.Thread | None = None
         # V4.14.1 direct tenant handoff state. These structures are RAM-only and
         # contain no wallet secrets. They prevent duplicate tenant jobs while a
         # single Admin-resolved stage is being consumed.
@@ -3997,7 +4016,11 @@ class Bot(OfferControllerMixin):
                     public_override=public,
                     allow_before_start=not live,
                     static_gas_limit=None if live else self.race_static_gas_limit,
-                    skip_balance_check=live,
+                    # V4.14.4: every newly-detected mint/project verifies the
+                    # wallet's native balance. buyer.py performs nonce + balance
+                    # reads concurrently, so this does not serialize an extra RPC
+                    # in front of the live launch.
+                    skip_balance_check=False,
                     clamp_fees_to_gas_budget=True,
                     allow_missing_usd_for_free=not paid,
                 )
@@ -4159,6 +4182,153 @@ class Bot(OfferControllerMixin):
                     k: ts for k, ts in self.race_signal_stage_seen.items() if ts >= cutoff
                 }
 
+    def _read_fast_public_for_signal(
+        self, chain: str, contract: str, source: str
+    ) -> dict[str, Any] | None:
+        """Read SeaDrop Public with a no-penalty fallback on unresolved signals.
+
+        The healthy path is still one primary-RPC call. Only when that call does
+        not expose a configured stage do social/SeaDrop/recovery signals probe one
+        already-verified secondary RPC, if available.
+        """
+        pool = self.rpc_pools.get(chain)
+        if pool is None:
+            return None
+        public = read_seadrop_public_fast(pool.primary, contract)
+        if public and public.get("configured"):
+            return public
+        if str(source or "").lower() not in {"social-pass", "seadrop-wss", "stage-recovery"}:
+            return public
+        for _latency, _url, client in list(getattr(pool, "clients", []))[1:2]:
+            try:
+                fallback = read_seadrop_public_fast(client, contract)
+                if fallback and fallback.get("configured"):
+                    log.info(
+                        "SeaDrop stage resolved by RPC fallback | %s | %s | source=%s",
+                        chain, short_address(contract), source,
+                    )
+                    return fallback
+            except Exception:
+                continue
+        return public
+
+    def _stage_recovery_allowed(self, source: str) -> bool:
+        source_n = str(source or "").lower()
+        if source_n in {"social-pass", "seadrop-wss", "stage-recovery"}:
+            return True
+        if source_n not in {"stream", "events"}:
+            return False
+        # When nobody requires social protection, there may never be a
+        # social-pass event to re-arm the contract. Give Stream a bounded
+        # recovery lane in that configuration as well.
+        try:
+            protection_required = bool(self.free_social_protection_enabled) or bool(
+                self.shared_tenant_social_protection_required()
+            )
+        except Exception:
+            protection_required = bool(self.free_social_protection_enabled)
+        return not protection_required
+
+    def _arm_stage_resolution_recovery(
+        self, chain: str, contract: str, slug: str | None, source: str
+    ) -> None:
+        if self.shared_discovery_mode or not self._stage_recovery_allowed(source):
+            return
+        key = self._signal_contract_key(chain, contract)
+        now = time.time()
+        first_delay = float(self.fast_stage_recovery_delays[0])
+        created = False
+        with self.race_state_lock:
+            item = self.stage_recovery.get(key)
+            if item is None:
+                item = {
+                    "chain": chain,
+                    "contract": Web3.to_checksum_address(contract),
+                    "slug": slug,
+                    "source": str(source or "signal"),
+                    "attempt": 0,
+                    "armed_at": now,
+                    "deadline": now + self.fast_stage_recovery_max_age,
+                    "next_at": now + first_delay,
+                }
+                self.stage_recovery[key] = item
+                created = True
+            else:
+                if slug:
+                    item["slug"] = slug
+                # social-pass is the strongest proof that the project passed the
+                # user's shield; extend/re-prioritize its recovery window.
+                if str(source or "").lower() == "social-pass":
+                    item["source"] = "social-pass"
+                    item["deadline"] = max(float(item.get("deadline") or 0), now + self.fast_stage_recovery_max_age)
+                    item["next_at"] = min(float(item.get("next_at") or now + first_delay), now + first_delay)
+        if created:
+            log.info(
+                "Fast stage unresolved; recovery armed | %s | %s | source=%s | max=%.1fs",
+                slug or short_address(contract), chain, source, self.fast_stage_recovery_max_age,
+            )
+
+    def _cancel_stage_resolution_recovery(self, chain: str, contract: str) -> None:
+        key = self._signal_contract_key(chain, contract)
+        with self.race_state_lock:
+            item = self.stage_recovery.pop(key, None)
+        if item and int(item.get("attempt") or 0) > 0:
+            log.info(
+                "Fast stage recovery resolved | %s | %s | attempts=%s",
+                item.get("slug") or short_address(contract), chain, int(item.get("attempt") or 0),
+            )
+
+    def _stage_resolution_recovery_loop(self) -> None:
+        log.info(
+            "Fast stage recovery ready | first=%.0fms | max=%.1fs | fallback-RPC=True",
+            float(self.fast_stage_recovery_delays[0]) * 1000.0, self.fast_stage_recovery_max_age,
+        )
+        while not STOP:
+            now = time.time()
+            due: list[dict[str, Any]] = []
+            expired: list[dict[str, Any]] = []
+            with self.race_state_lock:
+                for key, item in list(self.stage_recovery.items()):
+                    if now >= float(item.get("deadline") or 0):
+                        expired.append(dict(item))
+                        self.stage_recovery.pop(key, None)
+                        continue
+                    if now < float(item.get("next_at") or 0):
+                        continue
+                    due.append(dict(item))
+                    attempt = int(item.get("attempt") or 0) + 1
+                    item["attempt"] = attempt
+                    delay_index = min(attempt, len(self.fast_stage_recovery_delays) - 1)
+                    item["next_at"] = now + float(self.fast_stage_recovery_delays[delay_index])
+            for item in due:
+                try:
+                    self.submit_fast_contract_signal(
+                        str(item.get("chain") or ""),
+                        str(item.get("contract") or ""),
+                        str(item.get("slug") or "") or None,
+                        "stage-recovery",
+                        force=True,
+                    )
+                except Exception as exc:
+                    log.debug("Stage recovery submit failed: %s", exc)
+            for item in expired:
+                log.info(
+                    "Fast stage recovery window ended | %s | %s | attempts=%s",
+                    item.get("slug") or short_address(str(item.get("contract") or "")),
+                    item.get("chain"), int(item.get("attempt") or 0),
+                )
+            time.sleep(0.01 if due else 0.02)
+
+    def start_stage_resolution_recovery(self) -> None:
+        if self.stage_recovery_thread and self.stage_recovery_thread.is_alive():
+            return
+        self.stage_recovery_thread = threading.Thread(
+            target=self._stage_resolution_recovery_loop,
+            name="fast-stage-recovery",
+            daemon=True,
+        )
+        self.stage_recovery_thread.start()
+
     def _fast_live_contract_signal(self, chain: str, contract: str, slug: str | None, source: str) -> bool:
         """Resolve one contract signal. Return True once a stable SeaDrop stage is known.
 
@@ -4173,9 +4343,11 @@ class Bot(OfferControllerMixin):
         contract = Web3.to_checksum_address(contract)
         now = time.time()
         try:
-            public = read_seadrop_public_fast(self.rpc_pools[chain].primary, contract)
+            public = self._read_fast_public_for_signal(chain, contract, source)
             if not public or not public.get("configured"):
+                self._arm_stage_resolution_recovery(chain, contract, slug, source)
                 return False
+            self._cancel_stage_resolution_recovery(chain, contract)
             plan = self._fast_plan_from_public(public, contract)
             self._record_resolved_signal_stage(chain, contract, plan, source=source)
             candidate = self._ensure_fast_candidate(chain, contract, slug, public, source)
@@ -6102,7 +6274,7 @@ class Bot(OfferControllerMixin):
         total = len(self.store.list_wallets(enabled_only=False))
         self.telegram.send(
             chat_id,
-            "🤖 OpenSea Mint Guardian V4.14.3 Friendly Alerts\n\n"
+            "🤖 OpenSea Mint Guardian V4.14.4 Reliability Gate\n\n"
             "🆓 الاكتشاف المجاني: Stream لحظي + SeaDrop مباشر + REST احتياطي\n"
             f"⚡ الاستعداد للـPublic: آخر {self.public_preopen_window_seconds:g} ثوانٍ\n"
             f"📦 سياسة الكمية: حد المنت ≤100 يؤخذ كما هو، وإذا كان >100/غير محدود فالهدف {self.auto_stage_high_limit_quantity}\n"
@@ -7833,7 +8005,7 @@ class Bot(OfferControllerMixin):
     def run(self) -> None:
         if self.is_admin:
             start_health_server()
-        log.info("Mint Guardian V4.14.3 Friendly Alerts starting")
+        log.info("Mint Guardian V4.14.4 Reliability Gate starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
@@ -7849,6 +8021,7 @@ class Bot(OfferControllerMixin):
         self.start_maintenance()
         self.start_race_scheduler()
         if not self.shared_discovery_mode:
+            self.start_stage_resolution_recovery()
             self.start_seadrop_log_discovery()
             self.start_auto_free_discovery()
         log.info(
@@ -7869,11 +8042,11 @@ class Bot(OfferControllerMixin):
             self.seadrop_wss_enabled, self.race_fee_refresh_seconds, self.race_gas_strategy,
         )
         log.info(
-            "ULTRA RACE V4.14.3 ready | prewarm=%.2fs | fee-refresh=%.2fs | low-balance-recheck=%.2fs | live-fee-retry=True | history=24h",
+            "ULTRA RACE V4.14.4 ready | prewarm=%.2fs | fee-refresh=%.2fs | low-balance-recheck=%.2fs | live-fee-retry=True | history=24h",
             self.race_prewarm_seconds, self.race_fee_refresh_seconds, self.low_balance_recheck_seconds,
         )
         log.info(
-            "V4.14.3 guards ready | stored-wallet-compat=True | same-stage-terminal-cache=True | candidate-isolation=True | friendly-rpc-alerts=True | low-balance-latch=True"
+            "V4.14.4 guards ready | stored-wallet-compat=True | same-stage-terminal-cache=True | candidate-isolation=True | friendly-rpc-alerts=True | low-balance-latch=True | per-mint-balance=True | stage-recovery=True"
         )
         log.info(
             "Race signal coalescer ready | single-flight=True | stream-quiet=%.2fs | seadrop-quiet=%.2fs | unknown-quiet=%.2fs",
@@ -7887,7 +8060,7 @@ class Bot(OfferControllerMixin):
         )
         log.info("Collection Offers ready | isolated-executor=True | main-loop-polling=False | Race-hooks=0")
         self.notify_all(
-            "🟢 OpenSea Mint Guardian V4.14.3 Friendly Alerts يعمل الآن على Railway.\n"
+            "🟢 OpenSea Mint Guardian V4.14.4 Reliability Gate يعمل الآن على Railway.\n"
             f"الاكتشاف التلقائي: {'مفعّل كل ' + format(self.auto_free_scan_seconds, 'g') + ' ثانية' if self.auto_free_enabled else 'متوقف'}.\n"
             f"OpenSea Stream: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} | REST Mint Events: {'مفعّل' if self.auto_event_fallback_enabled else 'متوقف'}.\n"
             f"التأهيل/المراقبة: تعمل بصمت وتظهر تفاصيلها عند فتح الأقسام.\n"

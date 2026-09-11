@@ -1,3 +1,62 @@
+# OpenSea Mint Guardian V4.14.4 — Reliability Gate & Per-Mint Balance
+
+V4.14.4 is a reliability/speed patch over V4.14.3. It closes the production gap where a project could pass X/Website protection but the first SeaDrop read did not yet expose Public, and it makes native gas-balance verification mandatory for every newly detected mint without serializing an extra RPC round-trip in front of Race.
+
+## Live Free Mint path
+
+```text
+OpenSea Stream / SeaDrop WSS / Social PASS
+            │
+            ▼
+  Primary SeaDrop stage read
+      │ configured?
+      ├── yes ──► Admin queued first ──► Direct RAM fan-out to tenants
+      │                                  │
+      │                                  ▼
+      │                         per-user Safe Protection
+      │                                  │
+      │                                  ▼
+      │                     nonce + balance in parallel
+      │                                  │
+      │                                  ▼
+      │                         sign + parallel broadcast
+      │
+      └── no ───► Fast Stage Recovery (50ms → bounded backoff)
+                         │
+                         ├─ optional verified RPC fallback
+                         └─ configured Public → same Direct Fan-Out immediately
+```
+
+The recovery lane is independent of the 15-second catalog scan. It is RAM-only, deduplicated per chain+contract, and cancelled as soon as Public is resolved.
+
+## Balance behavior
+
+Every mint/project checks the native balance on its own chain before signing/broadcast. In the live Race path the bot reads pending nonce and balance concurrently, so the additional safety check does not become a serialized delay. If balance is insufficient, the wallet is latched for that stage and the existing isolated watcher checks for a top-up every `0.35s` by default. A detected top-up rebuilds nonce, fee fields, balance and signature before retrying.
+
+For scheduled/prewarmed Public stages, balance is checked during preparation. The checked balance is retained in the prepared entry; if warmed fees rise before opening and make the maximum requirement exceed that snapshot, the bundle fails closed as `insufficient_balance` instead of knowingly sending it.
+
+## Safe Protection remains per user
+
+- Protection ON: ordinary automatic Free Mint requires X **or** Website.
+- Protection OFF: that user's ordinary automatic Free Mint does not wait for the social gate.
+- Qualification/allowlist projects preserve their existing eligibility rules.
+- Final Public rebuilds the active Public wallet state and does not inherit stale qualification blocking.
+- One user's protection, gas cap, notifications or pause state never changes another user's settings.
+
+## Optional recovery tuning
+
+Defaults are already suitable for Railway:
+
+```env
+FAST_STAGE_RECOVERY_DELAYS_SECONDS=0.05,0.10,0.20,0.40,0.80,1.50,3.00
+FAST_STAGE_RECOVERY_MAX_AGE_SECONDS=30
+LOW_BALANCE_RECHECK_SECONDS=0.35
+```
+
+Do not lower the recovery intervals aggressively unless the RPC provider can sustain the additional reads.
+
+---
+
 # OpenSea Mint Guardian V4.14.3 — Friendly Alerts & Low-Balance Latch
 
 V4.14.3 is a focused production patch over V4.14.2. It keeps the same Direct Fan-Out/Race architecture and fixes two issues visible in Railway/Telegram logs: raw RPC dictionaries appearing in user notifications and repeated Race attempts while a wallet is already known to have insufficient native gas.

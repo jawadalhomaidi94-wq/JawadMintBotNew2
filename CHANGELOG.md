@@ -1,3 +1,29 @@
+# Mint Guardian V4.14.4 — Reliability Gate & Per-Mint Balance
+
+## Fixed
+- A protected project that reaches `Social PASS` is no longer dropped when the first SeaDrop read lands during a short configuration/provider transition. A dedicated fast stage-recovery lane retries on-chain resolution from 50ms onward, then backs off gradually for a bounded 30s window.
+- Stage recovery is cancelled immediately once a configured Public is resolved and then uses the existing Admin-first Direct Tenant Fan-Out; it never waits for the 15s catalog scan.
+- On unresolved social/SeaDrop recovery signals, one already-verified secondary RPC is probed when available. The healthy first-read path is still one primary RPC call.
+- Every newly detected mint now checks the native gas balance of every participating wallet before signing/broadcast, including surprise live Public mints. Qualification/normal paths already had their balance guard and remain protected.
+- Live Race no longer uses `skip_balance_check=True`. Pending nonce and native balance are fetched concurrently per wallet, preserving latency while adding the required balance gate.
+- Prepared bundles retain their checked balance snapshot. If the warmed EIP-1559 fee rises before broadcast and the new maximum requirement exceeds that checked balance, the wallet is converted to `insufficient_balance` instead of knowingly broadcasting an underfunded transaction.
+- Existing V4.14.3 low-balance latch/watcher remains authoritative: insufficient wallets are removed from repeated Stream/Race churn and a real top-up wakes a fresh nonce/fee/balance attempt while the stage remains open.
+
+## Preserved
+- V4.14.1 zero-poll Direct Tenant Fan-Out and Admin-first ordering.
+- Independent per-user Safe Protection, gas settings, pause/resume, notifications, permissions, wallets, history and Offers.
+- Safe Protection rule remains X OR Website for ordinary automatic Free Mints when enabled by that user.
+- Qualification/allowlist behavior and Final Public takeover remain unchanged.
+- V4.14.2 StoredWallet compatibility, terminal same-stage cache and candidate exception isolation.
+- V4.14.3 friendly Telegram alerts and low-balance latch.
+- Offers remain isolated from the Race hot path.
+
+## New runtime markers
+- `Fast stage recovery ready | first=50ms | max=30.0s | fallback-RPC=True`
+- `V4.14.4 guards ready | ... | per-mint-balance=True | stage-recovery=True`
+
+---
+
 # Mint Guardian V4.14.3 — Friendly Alerts & Low-Balance Latch
 
 ## Fixed

@@ -169,7 +169,7 @@ class OpenSeaClient:
                 "X-API-KEY": self.api_key,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "OpenSea-Mint-Guardian/4.13.1",
+                "User-Agent": "OpenSea-Mint-Guardian/4.14.4",
             })
             self._local.session = session
         return session
@@ -1773,32 +1773,58 @@ def prepare_seadrop_race_transactions(
     if not eligible:
         return {"entries": [], "results": results, "prepared_at": time.time(), "public": public}
 
-    # Fetch pending nonces (and, during prewarm, balances) concurrently. These
-    # calls finish before opening for scheduled races.
-    wallet_runtime: dict[str, tuple[int, int | None]] = {}
+    # Fetch pending nonces and balances concurrently. V4.14.4 requires a real
+    # native-balance check for every newly-detected mint, including the live Race
+    # path. Nonce and balance are separate parallel RPC calls, so enabling the
+    # check does not serialize another round-trip in front of signing/broadcast.
+    wallet_runtime_parts: dict[str, dict[str, int | None]] = {
+        wallet.address.lower(): {"nonce": None, "balance": None} for wallet, _q in eligible
+    }
 
-    def read_wallet_runtime(item: tuple[WalletConfig, int]) -> tuple[str, int, int | None]:
-        wallet, _q = item
+    def read_wallet_field(wallet: WalletConfig, field: str) -> tuple[str, str, int]:
         address = Web3.to_checksum_address(wallet.address)
-        nonce = int(w3.eth.get_transaction_count(address, "pending"))
-        balance = None if skip_balance_check else int(w3.eth.get_balance(address))
-        return wallet.address.lower(), nonce, balance
+        if field == "nonce":
+            value = int(w3.eth.get_transaction_count(address, "pending"))
+        else:
+            value = int(w3.eth.get_balance(address))
+        return wallet.address.lower(), field, value
 
-    with ThreadPoolExecutor(max_workers=min(32, len(eligible))) as executor:
-        futures = [executor.submit(read_wallet_runtime, item) for item in eligible]
+    jobs: list[tuple[WalletConfig, str]] = []
+    for wallet, _q in eligible:
+        jobs.append((wallet, "nonce"))
+        if not skip_balance_check:
+            jobs.append((wallet, "balance"))
+    with ThreadPoolExecutor(max_workers=max(1, min(64, len(jobs)))) as executor:
+        futures = [executor.submit(read_wallet_field, wallet, field) for wallet, field in jobs]
         for future in as_completed(futures):
             try:
-                addr, nonce, balance = future.result()
-                wallet_runtime[addr] = (nonce, balance)
+                addr, field, value = future.result()
+                wallet_runtime_parts.setdefault(addr, {"nonce": None, "balance": None})[field] = value
             except Exception as exc:
-                log.debug("Race wallet prewarm failed: %s", exc)
+                log.debug("Race wallet runtime read failed: %s", exc)
+
+    wallet_runtime: dict[str, tuple[int, int | None]] = {}
+    for addr, parts in wallet_runtime_parts.items():
+        nonce = parts.get("nonce")
+        balance = parts.get("balance")
+        if nonce is None:
+            continue
+        if not skip_balance_check and balance is None:
+            continue
+        wallet_runtime[addr] = (int(nonce), None if balance is None else int(balance))
 
     entries: list[dict[str, Any]] = []
     for wallet, q in eligible:
         addr_l = wallet.address.lower()
         runtime = wallet_runtime.get(addr_l)
         if runtime is None:
-            results[addr_l] = MintResult(False, "rpc_or_tx_error", target=SEADROP_ADDRESS, quantity_used=q, detail="Could not prefetch pending nonce.")
+            results[addr_l] = MintResult(
+                False, "rpc_or_tx_error", target=SEADROP_ADDRESS, quantity_used=q,
+                detail=(
+                    "Could not prefetch pending nonce/balance."
+                    if not skip_balance_check else "Could not prefetch pending nonce."
+                ),
+            )
             continue
         nonce, balance = runtime
         gas_limit = int(gas_by_qty[q])
@@ -1868,6 +1894,7 @@ def prepare_seadrop_race_transactions(
             "mint_value_native": mint_value_native,
             "total_max_native": total_max_native,
             "fee_fields": tx_fees,
+            "balance_wei": balance,
         })
 
     return {
@@ -1926,6 +1953,7 @@ def refresh_seadrop_race_bundle_fees(
     price_each = int(public.get("mint_price_wei") or 0)
 
     refreshed: list[dict[str, Any]] = []
+    refreshed_results: dict[str, MintResult] = dict(bundle.get("results") or {})
     for entry in list(bundle.get("entries") or []):
         gas_limit = int(entry.get("gas_limit") or 0)
         candidate_fees = dict(fee_fields)
@@ -1946,6 +1974,19 @@ def refresh_seadrop_race_bundle_fees(
                 return bundle
 
         wallet: WalletConfig = entry["wallet"]
+        balance_snapshot = entry.get("balance_wei")
+        value_wei = price_each * int(entry["quantity"])
+        needed_wei = int(gas_cost_wei) + int(value_wei)
+        if balance_snapshot is not None and int(balance_snapshot) < needed_wei:
+            refreshed_results[wallet.address.lower()] = MintResult(
+                False, "insufficient_balance",
+                mint_value_native=Decimal(value_wei) / Decimal(10**18),
+                gas_cost_native=gas_cost_native, gas_cost_usd=gas_cost_usd,
+                total_max_native=Decimal(needed_wei) / Decimal(10**18),
+                target=SEADROP_ADDRESS, quantity_used=int(entry["quantity"]),
+                detail=f"Wallet balance {int(balance_snapshot)} wei < estimated requirement {needed_wei} wei",
+            )
+            continue
         base_tx = _seadrop_base_tx(
             w3 or Web3(), payer=wallet.address, nft_contract=nft_contract, fee_recipient=fee_recipient,
             quantity=int(entry["quantity"]), mint_price_wei=price_each,
@@ -1968,6 +2009,7 @@ def refresh_seadrop_race_bundle_fees(
         refreshed.append(updated)
     bundle = dict(bundle)
     bundle["entries"] = refreshed
+    bundle["results"] = refreshed_results
     bundle["fees"] = dict(fee_fields)
     bundle["native_usd_price"] = price_usd
     bundle["fee_refreshed_at"] = time.time()
