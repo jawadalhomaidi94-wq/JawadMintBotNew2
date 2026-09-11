@@ -277,3 +277,7 @@ Each tenant receives its own SQLite database (`tenant_<id>.db`) and therefore it
 Global OpenSea/SeaDrop discovery stays on the Admin engine and is mirrored in RAM to tenants. Tenant engines reuse Admin's verified RPC pools, price oracle and fee cache. This is intentional: adding users does not create one OpenSea catalog scanner or fee warmer per user. Manual watch/eligibility actions remain private to the user who requested them.
 
 Per-user settings include gas limits, Free Mint Shield, notifications and independent execution pause. Suspending a user removes only that tenant from execution; it does not pause Admin or other tenants.
+
+
+### V4.14.3 Telegram links
+Insufficient-balance alerts show the OpenSea URL as normal text plus a native **فتح المنت في OpenSea** button.

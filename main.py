@@ -1082,9 +1082,16 @@ class TelegramController(threading.Thread):
             "disable_web_page_preview": "true",
         }
         if buttons:
-            data["reply_markup"] = json.dumps({
-                "inline_keyboard": [[{"text": label, "callback_data": callback} for label, callback in row] for row in buttons]
-            })
+            keyboard = []
+            for row in buttons:
+                rendered_row = []
+                for label, action in row:
+                    if str(action).startswith("url:"):
+                        rendered_row.append({"text": label, "url": str(action)[4:]})
+                    else:
+                        rendered_row.append({"text": label, "callback_data": action})
+                keyboard.append(rendered_row)
+            data["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
         try:
             self.api("sendMessage", **data)
         except Exception as exc:
@@ -1098,9 +1105,16 @@ class TelegramController(threading.Thread):
             "disable_web_page_preview": "true",
         }
         if buttons is not None:
-            data["reply_markup"] = json.dumps({
-                "inline_keyboard": [[{"text": label, "callback_data": callback} for label, callback in row] for row in buttons]
-            })
+            keyboard = []
+            for row in buttons:
+                rendered_row = []
+                for label, action in row:
+                    if str(action).startswith("url:"):
+                        rendered_row.append({"text": label, "url": str(action)[4:]})
+                    else:
+                        rendered_row.append({"text": label, "callback_data": action})
+                keyboard.append(rendered_row)
+            data["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
         try:
             self.api("editMessageText", **data)
         except Exception:
@@ -3717,8 +3731,12 @@ class Bot(OfferControllerMixin):
         )
         if detail:
             lines.append(f"📝 السبب: {str(detail)[:350]}")
-        lines.extend(["", self.mint_link_block(candidate)])
-        self.notify_all("\n".join(lines)[:3900])
+        mint_url = self.candidate_mint_url(candidate)
+        lines.extend(["", "🔗 رابط المنت:", mint_url])
+        self.notify_all(
+            "\n".join(lines)[:3900],
+            buttons=[[("🔗 فتح المنت في OpenSea", f"url:{mint_url}")]],
+        )
 
     def _apply_race_results(self, candidate: Candidate, plan: dict[str, Any], results: dict[str, Any]) -> int:
         submitted = 0
@@ -7751,19 +7769,19 @@ class Bot(OfferControllerMixin):
             return (5, float(current.get("start") or 0))
         return (6, float(candidate.next_stage_start or 9e18))
 
-    def notify_all(self, text: str) -> None:
+    def notify_all(self, text: str, buttons: list[list[tuple[str, str]]] | None = None) -> None:
         if not self.notifications_enabled or not self.can("notifications.receive"):
             return
         if not self.telegram.enabled:
             return
         for chat_id in self.telegram.allowed_chat_ids:
-            self.telegram.send(chat_id, text)
+            self.telegram.send(chat_id, text, buttons=buttons)
 
     # ---------- main loop ----------
     def run(self) -> None:
         if self.is_admin:
             start_health_server()
-        log.info("Mint Guardian V4.14.2 Stability Fix starting")
+        log.info("Mint Guardian V4.14.3 Telegram Link & Balance Retry Fix starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
