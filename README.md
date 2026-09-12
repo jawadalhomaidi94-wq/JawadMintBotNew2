@@ -368,3 +368,6 @@ Each tenant receives its own SQLite database (`tenant_<id>.db`) and therefore it
 Global OpenSea/SeaDrop discovery stays on the Admin engine and is mirrored in RAM to tenants. Tenant engines reuse Admin's verified RPC pools, price oracle and fee cache. This is intentional: adding users does not create one OpenSea catalog scanner or fee warmer per user. Manual watch/eligibility actions remain private to the user who requested them.
 
 Per-user settings include gas limits, Free Mint Shield, notifications and independent execution pause. Suspending a user removes only that tenant from execution; it does not pause Admin or other tenants.
+
+### V4.14.5 paid-mint behavior
+After the user explicitly confirms a paid Public plan, the bot immediately checks the current SeaDrop Public configuration. If the paid Public stage is already active it launches Race immediately for the selected wallets/quantities. Confirmed-paid failures are never silent: the attempt is recorded and the owning tenant receives the reason. Telegram inline callbacks are acknowledged immediately and paid-plan redraws avoid blocking RPC price reads.

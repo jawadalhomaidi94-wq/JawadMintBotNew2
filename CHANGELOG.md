@@ -112,3 +112,15 @@
 - A user's pause/settings do not change Admin or another user.
 - User bots cannot manage users.
 - User Bot Tokens and wallet private keys are encrypted at rest.
+
+## V4.14.5 — Paid Mint & Telegram UI Hotfix
+
+### Fixed
+- Confirming an already-open paid Public mint now triggers an immediate fresh on-chain SeaDrop read and Race launch; it no longer waits for another Stream event or scheduler transition.
+- Paid mint failures after explicit confirmation are persisted to mint history and always notify the owning tenant, including balance, gas-cap, price-cap, precondition, and RPC/transaction failures.
+- Paid confirmation refreshes the active on-chain stage so stale OpenSea metadata cannot leave a confirmed purchase idle.
+- Telegram inline callback taps are acknowledged before command processing, removing the long Telegram spinner while keeping command work isolated from Race.
+- Paid selector redraw no longer performs a blocking SeaDrop RPC price lookup on every button press; it reuses already-resolved stage data.
+
+### Preserved
+- V4.14.4 Reliability Gate, tenant isolation, Admin priority, Safe Protection, qualification/Public behavior, low-balance auto-resume, gas caps, Offers isolation, and shared discovery/Race architecture.

@@ -1166,11 +1166,17 @@ class TelegramController(threading.Thread):
                         if not chat_id or not self.authorized(chat_id):
                             continue
                         log.info("Telegram callback received | chat_id=%s | data=%s", chat_id, str(cb.get("data", ""))[:80])
+                        # V4.14.5: acknowledge the tap before it waits behind any command work.
+                        # Telegram's spinner disappears immediately; the actual action remains
+                        # serialized by the command worker and cannot interfere with Race.
+                        callback_id = str(cb.get("id", ""))
+                        self.answer_callback(callback_id)
                         self.bot.command_queue.put({
                             "type": "callback",
                             "chat_id": chat_id,
                             "chat_type": str(chat.get("type", "")),
-                            "callback_id": str(cb.get("id", "")),
+                            "callback_id": callback_id,
+                            "callback_acked": True,
                             "message_id": int(msg.get("message_id", 0)),
                             "data": str(cb.get("data", "")),
                         })
@@ -3845,6 +3851,14 @@ class Bot(OfferControllerMixin):
                     + "\n\n🔎 المعاملة:\n" + explorer_tx_url(candidate.chain, result.tx_hash or "")
                 )
             else:
+                # V4.14.5: an explicitly confirmed paid mint must never fail
+                # silently. Persist the attempt and tell only this tenant through
+                # its normal notify_all routing, while preserving retry policy.
+                if bool(plan.get("is_paid")) and candidate.paid_decision == "confirmed":
+                    try:
+                        self._paid_failure_notice(candidate, state, result)
+                    except Exception:
+                        log.exception("Could not persist/notify paid failure | %s | %s", candidate.slug, state.wallet.name)
                 # Keep hot failures retryable while the short launch window is
                 # still open. Safety/policy failures use a slower retry so they
                 # cannot consume every Race tick.
@@ -6674,19 +6688,15 @@ class Bot(OfferControllerMixin):
                     return numeric / Decimal(10**18)
                 return numeric
 
-        # Fallback to exact SeaDrop on-chain configuration when metadata does
-        # not expose a parseable price.
-        if candidate.contract_address:
-            pool = self.rpc_pools.get(candidate.chain)
-            if pool:
-                try:
-                    public = read_seadrop_public_drop(pool.primary, candidate.contract_address)
-                    if public and public.get("configured") and public.get("mint_price_wei") is not None:
-                        wei = Decimal(str(public.get("mint_price_wei")))
-                        if wei >= 0:
-                            return wei / Decimal(10**18)
-                except Exception:
-                    pass
+        # V4.14.5 UI hot path: never perform a blocking RPC read merely to redraw
+        # an inline keyboard. Live SeaDrop reads are done by discovery/stage/Race.
+        # Reuse the candidate's already-resolved current-stage price when present.
+        for p in candidate.stage_plans:
+            if p.get("is_paid") and p.get("price") is not None:
+                numeric = _numeric_value(p.get("price"))
+                if numeric is not None and numeric >= 0:
+                    text = str(p.get("price") or "").lower()
+                    return numeric / Decimal(10**18) if ("wei" in text or numeric >= Decimal("1000000000")) else numeric
         return None
 
     @staticmethod
@@ -6874,10 +6884,88 @@ class Bot(OfferControllerMixin):
         return [[('⏸ إيقاف' if active else '▶️ تشغيل',f'user_toggle:{uid}')],[('👛 تعديل حد المحافظ',f'user_limit:{uid}')],
                 [('🔐 الصلاحيات',f'user_perms:{uid}')],[('🗑 حذف المستخدم',f'user_delete:{uid}')],[('↩️ المستخدمون','users_manage')]]
 
+    def _paid_failure_notice(self, candidate: Candidate, state: WalletState, result: Any) -> None:
+        """Paid mint failures are never silent after explicit user confirmation."""
+        status = str(getattr(result, "status", "unknown") or "unknown")
+        detail = str(getattr(result, "detail", "") or "")[:700]
+        self.store.record_mint(
+            slug=candidate.slug, chain=candidate.chain,
+            wallet_name=state.wallet.name, wallet_address=state.wallet.address,
+            status=status, tx_hash=getattr(result, "tx_hash", None),
+            mint_value_native=str(getattr(result, "mint_value_native", "") or ""),
+            gas_max_native=str(getattr(result, "gas_cost_native", "") or ""),
+            quantity=max(1, int(candidate.paid_wallet_quantities.get(state.wallet.address.lower(), 1))),
+            detail=detail, contract_address=candidate.contract_address,
+            stage_key=state.stage_key or candidate.paid_stage_key or None,
+            stage_label=state.stage_label or "Public Paid",
+            watch_kind=candidate.watch_kind,
+        )
+        labels = {
+            "insufficient_balance": "💸 الرصيد غير كافٍ لقيمة المنت + الغاز",
+            "gas_usd_too_high": "⛽ رسوم الغاز أعلى من الحد المضبوط",
+            "gas_too_high": "⛽ رسوم الغاز أعلى من الحد المضبوط",
+            "gas_price_unavailable": "⏳ تعذر التحقق من سعر الغاز الآن",
+            "mint_price_too_high": "💰 سعر المنت أعلى من حد السعر المضبوط",
+            "paid_not_allowed": "🔒 تنفيذ المنت المدفوع غير مسموح",
+            "paid_wallet_selection_required": "👛 المحفظة لم تُعتمد في خطة الشراء",
+            "precondition_failed": "⚠️ شروط المنت على السلسلة لم تسمح بالتنفيذ",
+            "rpc_or_tx_error": "⚠️ فشل RPC/إرسال المعاملة",
+        }
+        self.notify_all(
+            f"{labels.get(status, '⚠️ فشل تنفيذ المنت المدفوع')}\n\n"
+            f"📦 المشروع: {candidate.slug}\n🌐 الشبكة: {chain_label(candidate.chain)}\n"
+            f"👛 المحفظة: {state.wallet.name} {short_address(state.wallet.address)}\n"
+            f"🔢 الكمية: {candidate.paid_wallet_quantities.get(state.wallet.address.lower(), 1)}\n"
+            + (f"📝 السبب: {detail}\n\n" if detail else "\n") + self.mint_link_block(candidate)
+        )
+
+    def _execute_confirmed_paid_now(self, candidate: Candidate) -> None:
+        """After explicit confirmation, execute immediately if Public paid is already open."""
+        if self.paused or candidate.paid_decision != "confirmed" or not candidate.contract_address:
+            return
+        try:
+            public = read_seadrop_public_fast(self.rpc_pools[candidate.chain].primary, candidate.contract_address)
+            if not public or not public.get("configured"):
+                log.warning("Paid immediate launch: SeaDrop public config unavailable | %s | %s", candidate.slug, candidate.chain)
+                self.notify_all(
+                    f"⏳ تم حفظ خطة شراء {candidate.slug}، لكن تعذر قراءة إعداد Public من السلسلة الآن. "
+                    "ستبقى الخطة فعالة وسيعيد البوت المحاولة تلقائيًا."
+                )
+                return
+            plan = self._fast_plan_from_public(public, candidate.contract_address)
+            if not plan.get("is_paid"):
+                # Do not accidentally turn an explicit paid approval into a free/other-stage action.
+                log.info("Paid immediate launch deferred: current Public is not paid | %s | %s", candidate.slug, candidate.chain)
+                return
+            now = time.time()
+            start = float(plan.get("start") or 0)
+            end = float(plan.get("end") or 0)
+            if (start and now < start) or (end and now >= end):
+                return
+            # The chain is authoritative at confirmation time. This also fixes stale
+            # OpenSea metadata when the user confirms while Public is already open.
+            candidate.paid_stage_key = str(plan.get("key") or candidate.paid_stage_key or "public-paid")
+            candidate.paid_stage_start = start or candidate.paid_stage_start
+            self.set_current_stage(candidate, plan)
+            self._remember_shared_public_hint(candidate.chain, candidate.contract_address, public)
+            for state in candidate.wallets.values():
+                if state.wallet.address.lower() in candidate.paid_wallet_addresses and not state.submitted:
+                    state.final = False
+                    state.next_attempt = now
+            log.info("PAID CONFIRM immediate launch | %s | %s | wallets=%s", candidate.slug, candidate.chain, len(candidate.paid_wallet_addresses))
+            self._launch_candidate_race(candidate, plan, live=True, public_hint=public)
+        except Exception as exc:
+            log.exception("Paid immediate launch failed | %s | %s", candidate.slug, candidate.chain)
+            self.notify_all(
+                f"⚠️ تعذر بدء شراء المنت المدفوع فورًا للمشروع {candidate.slug}.\n"
+                f"سيستمر البوت بالمحاولة ما دامت المرحلة مفتوحة.\n📝 {str(exc)[:500]}"
+            )
+
     def handle_callback(self, event: dict[str, Any]) -> None:
         chat_id = event["chat_id"]
         data = event.get("data", "")
-        self.telegram.answer_callback(event.get("callback_id", ""))
+        if not event.get("callback_acked"):
+            self.telegram.answer_callback(event.get("callback_id", ""))
 
         if data == "users_manage":
             if not self.is_admin or self.user_registry is None: return
@@ -7511,10 +7599,18 @@ class Bot(OfferControllerMixin):
                 f"📦 المشروع: {candidate.slug}\n"
                 f"⏰ وقت الفتح: {format_ts(candidate.paid_stage_start, self.display_tz)}\n\n"
                 + "👛 المحافظ والكميات:\n" + "\n".join(names)
-                + "\n\n⚙️ سيبدأ الاستعداد قبل الفتح مباشرة، مع تطبيق سقف الغاز والسعر قبل التوقيع.\n\n"
+                + "\n\n⚡ إذا كان Public مفتوحًا الآن فسأبدأ التنفيذ فورًا؛ وإذا لم يفتح بعد فسيبقى Race جاهزًا للموعد."
+                + "\n🛡 ما زالت حدود الغاز/السعر مطبقة قبل التوقيع.\n\n"
                 + self.mint_link_block(candidate),
                 self.paid_watches_buttons(),
             )
+            # Never wait for another Stream event after the user confirms an
+            # already-open paid Public. Keep Telegram worker responsive by handing
+            # the chain read/sign/broadcast to the dedicated launch executor.
+            try:
+                self.race_launch_executor.submit(self._execute_confirmed_paid_now, candidate)
+            except Exception:
+                threading.Thread(target=self._execute_confirmed_paid_now, args=(candidate,), daemon=True).start()
             return
 
         if data.startswith("pwn:"):
@@ -8005,7 +8101,7 @@ class Bot(OfferControllerMixin):
     def run(self) -> None:
         if self.is_admin:
             start_health_server()
-        log.info("Mint Guardian V4.14.4 Reliability Gate starting")
+        log.info("Mint Guardian V4.14.5 Paid Mint & UI Hotfix starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
