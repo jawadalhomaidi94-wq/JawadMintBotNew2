@@ -1061,17 +1061,108 @@ class TelegramController(threading.Thread):
         self.allowed_chat_ids = set(allowed_chat_ids) if allowed_chat_ids is not None else set(csv_values(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS")))
         self.allow_any = False if allowed_chat_ids is not None else env_bool("TELEGRAM_ALLOW_ANY_CHAT", False)
         self.offset = 0
-        self.session = requests.Session()
+        # V4.14.6: Telegram network I/O is isolated from both the polling thread
+        # and the serialized command worker. A slow send/edit/ACK can no longer
+        # make buttons appear dead or delay wallet/menu commands.
+        self.poll_session = requests.Session()
+        self.control_session = requests.Session()
+        self.outbound_session = requests.Session()
+        self.ack_session = requests.Session()
+        self.outbound_queue: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
+        self.ack_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.outbound_thread: threading.Thread | None = None
+        self.ack_thread: threading.Thread | None = None
+        self._io_lock = threading.Lock()
 
     @property
     def enabled(self) -> bool:
         return bool(self.token)
 
-    def api(self, method: str, **data: Any) -> dict[str, Any]:
-        response = self.session.post(f"https://api.telegram.org/bot{self.token}/{method}", data=data, timeout=35)
+    def _post_api(
+        self,
+        session: requests.Session,
+        method: str,
+        *,
+        timeout: tuple[float, float] | float,
+        **data: Any,
+    ) -> dict[str, Any]:
+        response = session.post(
+            f"https://api.telegram.org/bot{self.token}/{method}",
+            data=data,
+            timeout=timeout,
+        )
         response.raise_for_status()
         payload = response.json()
         return payload if isinstance(payload, dict) else {}
+
+    def api(self, method: str, **data: Any) -> dict[str, Any]:
+        # Direct calls are reserved for long polling/setup only. User-facing
+        # output uses the dedicated outbound workers below.
+        if method == "getUpdates":
+            return self._post_api(self.poll_session, method, timeout=(5.0, 35.0), **data)
+        return self._post_api(self.control_session, method, timeout=(5.0, 10.0), **data)
+
+    def _ensure_io_workers(self) -> None:
+        with self._io_lock:
+            if not self.outbound_thread or not self.outbound_thread.is_alive():
+                self.outbound_thread = threading.Thread(
+                    target=self._outbound_loop, name="telegram-outbound", daemon=True
+                )
+                self.outbound_thread.start()
+            if not self.ack_thread or not self.ack_thread.is_alive():
+                self.ack_thread = threading.Thread(
+                    target=self._ack_loop, name="telegram-callback-ack", daemon=True
+                )
+                self.ack_thread.start()
+
+    def _outbound_loop(self) -> None:
+        log.info("Telegram outbound worker ready")
+        while not STOP:
+            try:
+                method, data = self.outbound_queue.get(timeout=0.50)
+            except queue.Empty:
+                continue
+            try:
+                self._post_api(self.outbound_session, method, timeout=(4.0, 10.0), **data)
+            except Exception as exc:
+                # editMessageText commonly fails when content is unchanged; do
+                # not turn that harmless case into a noisy operational error.
+                if method != "editMessageText":
+                    log.debug("Telegram outbound %s failed: %s", method, exc)
+            finally:
+                try:
+                    self.outbound_queue.task_done()
+                except ValueError:
+                    pass
+
+    def _ack_loop(self) -> None:
+        log.info("Telegram callback ACK worker ready")
+        while not STOP:
+            try:
+                callback_id, text = self.ack_queue.get(timeout=0.50)
+            except queue.Empty:
+                continue
+            try:
+                self._post_api(
+                    self.ack_session,
+                    "answerCallbackQuery",
+                    timeout=(3.0, 5.0),
+                    callback_query_id=callback_id,
+                    text=text[:180],
+                )
+            except Exception:
+                pass
+            finally:
+                try:
+                    self.ack_queue.task_done()
+                except ValueError:
+                    pass
+
+    def _queue_outbound(self, method: str, data: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        self._ensure_io_workers()
+        self.outbound_queue.put((method, data))
 
     def send(self, chat_id: str | int, text: str, buttons: list[list[tuple[str, str]]] | None = None) -> None:
         if not self.enabled:
@@ -1085,10 +1176,7 @@ class TelegramController(threading.Thread):
             data["reply_markup"] = json.dumps({
                 "inline_keyboard": [[{"text": label, "callback_data": callback} for label, callback in row] for row in buttons]
             })
-        try:
-            self.api("sendMessage", **data)
-        except Exception as exc:
-            log.debug("Telegram send failed: %s", exc)
+        self._queue_outbound("sendMessage", data)
 
     def edit(self, chat_id: str | int, message_id: int, text: str, buttons: list[list[tuple[str, str]]] | None = None) -> None:
         data: dict[str, Any] = {
@@ -1101,23 +1189,16 @@ class TelegramController(threading.Thread):
             data["reply_markup"] = json.dumps({
                 "inline_keyboard": [[{"text": label, "callback_data": callback} for label, callback in row] for row in buttons]
             })
-        try:
-            self.api("editMessageText", **data)
-        except Exception:
-            # Editing can fail if Telegram sees no content change; this is harmless.
-            pass
+        self._queue_outbound("editMessageText", data)
 
     def answer_callback(self, callback_id: str, text: str = "") -> None:
-        try:
-            self.api("answerCallbackQuery", callback_query_id=callback_id, text=text[:180])
-        except Exception:
-            pass
+        if not callback_id or not self.enabled:
+            return
+        self._ensure_io_workers()
+        self.ack_queue.put((callback_id, text))
 
     def delete_message(self, chat_id: str, message_id: int) -> None:
-        try:
-            self.api("deleteMessage", chat_id=chat_id, message_id=message_id)
-        except Exception:
-            pass
+        self._queue_outbound("deleteMessage", {"chat_id": chat_id, "message_id": int(message_id)})
 
     def authorized(self, chat_id: str) -> bool:
         return self.allow_any or chat_id in self.allowed_chat_ids
@@ -1145,6 +1226,7 @@ class TelegramController(threading.Thread):
 
     def run(self) -> None:
         log.info("Telegram listener enabled")
+        self._ensure_io_workers()
         self.setup_commands()
         while not STOP:
             try:
@@ -1166,11 +1248,10 @@ class TelegramController(threading.Thread):
                         if not chat_id or not self.authorized(chat_id):
                             continue
                         log.info("Telegram callback received | chat_id=%s | data=%s", chat_id, str(cb.get("data", ""))[:80])
-                        # V4.14.5: acknowledge the tap before it waits behind any command work.
-                        # Telegram's spinner disappears immediately; the actual action remains
-                        # serialized by the command worker and cannot interfere with Race.
+                        # V4.14.6: queue the action FIRST, then ACK on a dedicated
+                        # Telegram I/O lane. Neither the long-poll listener nor the
+                        # command worker waits for Telegram network latency.
                         callback_id = str(cb.get("id", ""))
-                        self.answer_callback(callback_id)
                         self.bot.command_queue.put({
                             "type": "callback",
                             "chat_id": chat_id,
@@ -1180,6 +1261,7 @@ class TelegramController(threading.Thread):
                             "message_id": int(msg.get("message_id", 0)),
                             "data": str(cb.get("data", "")),
                         })
+                        self.answer_callback(callback_id)
                         continue
 
                     message = update.get("message") or {}
@@ -1434,6 +1516,15 @@ class Bot(OfferControllerMixin):
         # command execution to the mint/stage loop, so long eligibility/network
         # checks could starve /start and inline-button callbacks.
         self.command_worker_thread: threading.Thread | None = None
+        # V4.14.6: read-only UI network work (wallet balances/details) must never
+        # block the serialized Telegram command worker or any Race executor.
+        self.ui_network_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ui-network")
+        self.ui_rpc_executor = ThreadPoolExecutor(
+            max_workers=max(2, min(len(self.enabled_chains) * 2, 8)),
+            thread_name_prefix="ui-rpc",
+        )
+        self.ui_balance_cache: dict[tuple[int, str], tuple[float, Decimal]] = {}
+        self.ui_balance_cache_lock = threading.RLock()
 
         # V4.11 stable independent hot-path state. None of these workers consumes the
         # catalog/discovery queue used by the slower metadata lane.
@@ -6288,7 +6379,7 @@ class Bot(OfferControllerMixin):
         total = len(self.store.list_wallets(enabled_only=False))
         self.telegram.send(
             chat_id,
-            "🤖 OpenSea Mint Guardian V4.14.4 Reliability Gate\n\n"
+            "🤖 OpenSea Mint Guardian V4.14.6 Telegram I/O Isolation\n\n"
             "🆓 الاكتشاف المجاني: Stream لحظي + SeaDrop مباشر + REST احتياطي\n"
             f"⚡ الاستعداد للـPublic: آخر {self.public_preopen_window_seconds:g} ثوانٍ\n"
             f"📦 سياسة الكمية: حد المنت ≤100 يؤخذ كما هو، وإذا كان >100/غير محدود فالهدف {self.auto_stage_high_limit_quantity}\n"
@@ -6328,41 +6419,86 @@ class Bot(OfferControllerMixin):
         rows.append([("➕ إضافة محفظة", "add_wallet"), ("↩️ القائمة الرئيسية", "menu")])
         return rows
 
-    def wallet_balances_text(self) -> str:
-        """Manual-only live balance view; never called from Race/discovery loops."""
+    def _wallet_supported_chains(self, wallet: Any) -> list[str]:
+        supported = {normalize_chain(x) for x in wallet.chains} if wallet.chains else set()
+        return [
+            chain for chain in self.enabled_chains
+            if (not supported or normalize_chain(chain) in supported) and self.rpc_pools.get(chain)
+        ]
+
+    def _cached_wallet_balance(self, wallet_id: int, chain: str) -> tuple[Decimal | None, float | None]:
+        with self.ui_balance_cache_lock:
+            row = self.ui_balance_cache.get((int(wallet_id), normalize_chain(chain)))
+        if not row:
+            return None, None
+        ts, balance = row
+        return balance, ts
+
+    def _read_wallet_balances_parallel(self, wallets: list[Any]) -> dict[tuple[int, str], Decimal | None]:
+        """Read manual UI balances in parallel, isolated from Race/low-balance pools."""
+        jobs: dict[Any, tuple[int, str]] = {}
+        results: dict[tuple[int, str], Decimal | None] = {}
+        for wallet in wallets:
+            for chain in self._wallet_supported_chains(wallet):
+                pool = self.rpc_pools.get(chain)
+                if not pool:
+                    continue
+                key = (int(wallet.id), normalize_chain(chain))
+                future = self.ui_rpc_executor.submit(pool.balance_native, wallet.address)
+                jobs[future] = key
+        for future in as_completed(list(jobs.keys())):
+            key = jobs[future]
+            try:
+                balance = future.result()
+            except Exception:
+                balance = None
+            results[key] = balance
+            if balance is not None:
+                with self.ui_balance_cache_lock:
+                    self.ui_balance_cache[key] = (time.time(), balance)
+        return results
+
+    def wallet_balances_text(self, *, live: bool = False) -> str:
+        """Render balances. Live RPC reads happen only on a dedicated UI executor."""
         wallets = self.all_stored_wallets()
         if not wallets:
             return "👛 لا توجد محافظ مضافة بعد."
+        live_results = self._read_wallet_balances_parallel(wallets) if live else {}
         prices: dict[str, Decimal | None] = {}
         for chain in self.enabled_chains:
             symbol = native_symbol(chain)
             if symbol not in prices:
-                try:
-                    prices[symbol] = self.price_oracle.get_usd(symbol)
-                except Exception:
-                    prices[symbol] = self.price_oracle.peek_usd(symbol)
-        lines = ["💰 الأرصدة الحالية للمحافظ", "", "🔄 القراءة مباشرة عند الضغط — لا تُستخدم كاشًا لمنع الـMint."]
+                # Never perform a market HTTP request from a Telegram UI action.
+                prices[symbol] = self.price_oracle.peek_usd(symbol)
+        lines = ["💰 الأرصدة الحالية للمحافظ", ""]
+        if live:
+            lines.append("✅ تم تحديث الأرصدة مباشرة من الشبكات وبالتوازي.")
+        else:
+            lines.append("⚡ العرض فوري من آخر قراءة محفوظة. اضغط تحديث لقراءة الشبكات الآن.")
         for wallet in wallets:
             lines.append(f"\n{'🟢' if wallet.enabled else '🔴'} {wallet.name} {short_address(wallet.address)}")
-            supported = {normalize_chain(x) for x in wallet.chains} if wallet.chains else set()
-            shown = False
-            for chain in self.enabled_chains:
-                if supported and normalize_chain(chain) not in supported:
-                    continue
-                pool = self.rpc_pools.get(chain)
-                if not pool:
-                    continue
-                shown = True
-                try:
-                    balance = pool.balance_native(wallet.address)
-                    symbol = native_symbol(chain)
-                    usd = prices.get(symbol)
-                    equivalent = f" ≈ ${balance * usd:.4f} USDT" if usd is not None else ""
-                    lines.append(f"• {chain_label(chain)}: {balance:.8f} {symbol}{equivalent}")
-                except Exception as exc:
-                    lines.append(f"• {chain_label(chain)}: تعذر قراءة الرصيد ({str(exc)[:80]})")
-            if not shown:
+            chains = self._wallet_supported_chains(wallet)
+            if not chains:
                 lines.append("• لا توجد شبكة مفعلة لهذه المحفظة")
+                continue
+            for chain in chains:
+                key = (int(wallet.id), normalize_chain(chain))
+                if live:
+                    balance = live_results.get(key)
+                    ts = time.time() if balance is not None else None
+                else:
+                    balance, ts = self._cached_wallet_balance(wallet.id, chain)
+                if balance is None:
+                    lines.append(f"• {chain_label(chain)}: " + ("تعذر قراءة الرصيد" if live else "لم تُقرأ بعد"))
+                    continue
+                symbol = native_symbol(chain)
+                usd = prices.get(symbol)
+                equivalent = f" ≈ ${balance * usd:.4f} USDT" if usd is not None else ""
+                age = ""
+                if not live and ts:
+                    seconds = max(0, int(time.time() - ts))
+                    age = f" | منذ {seconds}s" if seconds < 120 else ""
+                lines.append(f"• {chain_label(chain)}: {balance:.8f} {symbol}{equivalent}{age}")
         return "\n".join(lines)[:3900]
 
     def wallet_balances_buttons(self) -> list[list[tuple[str, str]]]:
@@ -6371,11 +6507,12 @@ class Bot(OfferControllerMixin):
             [("↩️ المحافظ", "wallets"), ("🏠 الرئيسية", "menu")],
         ]
 
-    def wallet_detail_text(self, wallet_id: int) -> str:
+    def wallet_detail_text(self, wallet_id: int, *, live: bool = False) -> str:
         wallet = self.store.get_wallet_by_id(wallet_id)
         if not wallet:
             return "⚠️ لم يتم العثور على المحفظة."
         status = "🟢 نشطة وتشارك في الـMint" if wallet.enabled else "🔴 متوقفة ولا يتم تنفيذ Mint لها"
+        live_results = self._read_wallet_balances_parallel([wallet]) if live else {}
         lines = [
             f"👛 {wallet.name}",
             status,
@@ -6383,18 +6520,39 @@ class Bot(OfferControllerMixin):
             f"كمية الـMint الافتراضية اليدوية: {wallet.quantity}",
             f"المنت التلقائي بالمراحل: يتبع حد المرحلة؛ وإذا كان الحد >{self.auto_stage_high_limit_threshold} أو غير محدود فالهدف {self.auto_stage_high_limit_quantity}",
             "",
-            "الأرصدة:",
+            "الأرصدة:" if live else "الأرصدة (آخر قراءة محفوظة):",
         ]
-        for chain in self.enabled_chains:
-            pool = self.rpc_pools.get(chain)
-            if not pool or (wallet.chains and normalize_chain(chain) not in {normalize_chain(x) for x in wallet.chains}):
-                continue
-            try:
-                balance = pool.balance_native(wallet.address)
+        chains = self._wallet_supported_chains(wallet)
+        for chain in chains:
+            key = (int(wallet.id), normalize_chain(chain))
+            if live:
+                balance = live_results.get(key)
+            else:
+                balance, _ = self._cached_wallet_balance(wallet.id, chain)
+            if balance is None:
+                lines.append(f"• {chain_label(chain)}: " + ("تعذر قراءة الرصيد" if live else "اضغط «تحديث الرصيد»"))
+            else:
                 lines.append(f"• {chain_label(chain)}: {balance:.8f} {native_symbol(chain)}")
-            except Exception:
-                lines.append(f"• {chain_label(chain)}: تعذر قراءة الرصيد")
         return "\n".join(lines)[:3900]
+
+    def _refresh_wallet_balances_screen(self, event: dict[str, Any]) -> None:
+        started = time.perf_counter()
+        try:
+            text = self.wallet_balances_text(live=True)
+            self.edit_or_send(event, text, self.wallet_balances_buttons())
+            log.info("Wallet balances UI refreshed | %.3fs", time.perf_counter() - started)
+        except Exception:
+            log.exception("Wallet balances UI refresh failed")
+            self.edit_or_send(event, "⚠️ تعذر تحديث الأرصدة الآن. حاول مرة أخرى.", self.wallet_balances_buttons())
+
+    def _refresh_wallet_detail_screen(self, event: dict[str, Any], wallet_id: int) -> None:
+        started = time.perf_counter()
+        try:
+            text = self.wallet_detail_text(wallet_id, live=True)
+            self.edit_or_send(event, text, self.wallet_detail_buttons(wallet_id))
+            log.info("Wallet detail UI refreshed | wallet_id=%s | %.3fs", wallet_id, time.perf_counter() - started)
+        except Exception:
+            log.exception("Wallet detail UI refresh failed | wallet_id=%s", wallet_id)
 
     def wallet_detail_buttons(self, wallet_id: int) -> list[list[tuple[str, str]]]:
         wallet = self.store.get_wallet_by_id(wallet_id)
@@ -7059,7 +7217,13 @@ class Bot(OfferControllerMixin):
             return
 
         if data == "wallet_balances":
-            self.edit_or_send(event, self.wallet_balances_text(), self.wallet_balances_buttons())
+            # Immediate UI response; RPC work is isolated from the command worker.
+            self.edit_or_send(
+                event,
+                "⏳ جارٍ قراءة أرصدة المحافظ من الشبكات بالتوازي…\nيمكنك استخدام بقية البوت أثناء التحديث.",
+                self.wallet_balances_buttons(),
+            )
+            self.ui_network_executor.submit(self._refresh_wallet_balances_screen, dict(event))
             return
 
         if data.startswith("wbr:"):
@@ -7067,7 +7231,12 @@ class Bot(OfferControllerMixin):
                 wallet_id = int(data.split(":", 1)[1])
             except ValueError:
                 return
-            self.edit_or_send(event, self.wallet_detail_text(wallet_id), self.wallet_detail_buttons(wallet_id))
+            self.edit_or_send(
+                event,
+                self.wallet_detail_text(wallet_id),
+                self.wallet_detail_buttons(wallet_id),
+            )
+            self.ui_network_executor.submit(self._refresh_wallet_detail_screen, dict(event), wallet_id)
             return
 
         if data.startswith("wv:"):
@@ -7075,7 +7244,10 @@ class Bot(OfferControllerMixin):
                 wallet_id = int(data.split(":", 1)[1])
             except ValueError:
                 return
+            # Opening a wallet never waits for RPC. Show the cached/local screen
+            # immediately, then refresh balances in the background.
             self.edit_or_send(event, self.wallet_detail_text(wallet_id), self.wallet_detail_buttons(wallet_id))
+            self.ui_network_executor.submit(self._refresh_wallet_detail_screen, dict(event), wallet_id)
             return
 
         if data.startswith("wt:"):
@@ -8047,9 +8219,17 @@ class Bot(OfferControllerMixin):
                 event = self.command_queue.get(timeout=0.50)
             except queue.Empty:
                 continue
+            started = time.perf_counter()
             try:
                 self._process_command_event(event)
             finally:
+                elapsed = time.perf_counter() - started
+                if elapsed >= 0.25:
+                    log.info(
+                        "Telegram command handled slowly | type=%s | data=%s | %.3fs | queued=%s",
+                        event.get("type", ""), str(event.get("data") or event.get("text") or "")[:60],
+                        elapsed, self.command_queue.qsize(),
+                    )
                 try:
                     self.command_queue.task_done()
                 except ValueError:
@@ -8101,7 +8281,7 @@ class Bot(OfferControllerMixin):
     def run(self) -> None:
         if self.is_admin:
             start_health_server()
-        log.info("Mint Guardian V4.14.5 Paid Mint & UI Hotfix starting")
+        log.info("Mint Guardian V4.14.6 Telegram I/O Isolation starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
@@ -8138,11 +8318,11 @@ class Bot(OfferControllerMixin):
             self.seadrop_wss_enabled, self.race_fee_refresh_seconds, self.race_gas_strategy,
         )
         log.info(
-            "ULTRA RACE V4.14.4 ready | prewarm=%.2fs | fee-refresh=%.2fs | low-balance-recheck=%.2fs | live-fee-retry=True | history=24h",
+            "ULTRA RACE V4.14.6 ready | prewarm=%.2fs | fee-refresh=%.2fs | low-balance-recheck=%.2fs | live-fee-retry=True | history=24h",
             self.race_prewarm_seconds, self.race_fee_refresh_seconds, self.low_balance_recheck_seconds,
         )
         log.info(
-            "V4.14.4 guards ready | stored-wallet-compat=True | same-stage-terminal-cache=True | candidate-isolation=True | friendly-rpc-alerts=True | low-balance-latch=True | per-mint-balance=True | stage-recovery=True"
+            "V4.14.6 guards ready | stored-wallet-compat=True | same-stage-terminal-cache=True | candidate-isolation=True | friendly-rpc-alerts=True | low-balance-latch=True | per-mint-balance=True | stage-recovery=True | paid-hotfix=True | telegram-io-isolated=True | ui-rpc-isolated=True"
         )
         log.info(
             "Race signal coalescer ready | single-flight=True | stream-quiet=%.2fs | seadrop-quiet=%.2fs | unknown-quiet=%.2fs",
@@ -8156,7 +8336,7 @@ class Bot(OfferControllerMixin):
         )
         log.info("Collection Offers ready | isolated-executor=True | main-loop-polling=False | Race-hooks=0")
         self.notify_all(
-            "🟢 OpenSea Mint Guardian V4.14.4 Reliability Gate يعمل الآن على Railway.\n"
+            "🟢 OpenSea Mint Guardian V4.14.6 Telegram I/O Isolation يعمل الآن على Railway.\n"
             f"الاكتشاف التلقائي: {'مفعّل كل ' + format(self.auto_free_scan_seconds, 'g') + ' ثانية' if self.auto_free_enabled else 'متوقف'}.\n"
             f"OpenSea Stream: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} | REST Mint Events: {'مفعّل' if self.auto_event_fallback_enabled else 'متوقف'}.\n"
             f"التأهيل/المراقبة: تعمل بصمت وتظهر تفاصيلها عند فتح الأقسام.\n"

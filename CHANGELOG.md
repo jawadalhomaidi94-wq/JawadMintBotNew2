@@ -1,3 +1,19 @@
+# Mint Guardian V4.14.6 — Telegram I/O Isolation & Responsive UI
+
+## Fixed
+- Fixed the V4.14.5 callback regression where `answerCallbackQuery` was executed synchronously inside the Telegram long-poll listener before the callback was queued. A slow Telegram API response could therefore make buttons appear dead even though `callback received` was logged.
+- Callback actions are now queued first and callback ACKs run on a dedicated non-blocking Telegram ACK worker.
+- `sendMessage`, `editMessageText`, and `deleteMessage` now run on a dedicated outbound Telegram worker, so Telegram network latency cannot stall the serialized command worker.
+- Wallet balance and wallet detail RPC reads no longer run inside the Telegram command worker. UI opens immediately from local/cache state and live balances refresh on isolated UI network/RPC executors.
+- Manual UI balance reads run in parallel across supported chains and reuse cached USD prices only; they never compete with Race, low-balance, discovery, or fee-warmer executors.
+- Added slow-command diagnostics to expose any future callback/command that blocks the command worker for 250ms or more.
+
+## Preserved
+- V4.14.5 paid-mint immediate execution and paid failure notifications are unchanged.
+- V4.14.4 Direct Fan-Out, Race, Safe Protection, Qualification, stage recovery, per-mint balance checks, low-balance wake, tenant isolation, and Offers logic are unchanged.
+
+---
+
 # Mint Guardian V4.14.4 — Reliability Gate & Per-Mint Balance
 
 ## Fixed

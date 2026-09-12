@@ -1,6 +1,6 @@
-# OpenSea Mint Guardian V4.14.4 — Reliability Gate & Per-Mint Balance
+# OpenSea Mint Guardian V4.14.6 — Telegram I/O Isolation & Responsive UI
 
-V4.14.4 is a reliability/speed patch over V4.14.3. It closes the production gap where a project could pass X/Website protection but the first SeaDrop read did not yet expose Public, and it makes native gas-balance verification mandatory for every newly detected mint without serializing an extra RPC round-trip in front of Race.
+V4.14.6 is a hotfix over V4.14.5. It keeps the paid-mint and Race behavior intact while removing Telegram and manual wallet-balance network I/O from the serialized command path. Button callbacks are queued before ACK, Telegram output is sent on dedicated workers, and wallet balance/detail reads run on isolated UI executors.
 
 ## Live Free Mint path
 
