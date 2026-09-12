@@ -1,3 +1,36 @@
+# OpenSea Mint Guardian V4.14.8 — Telegram Polling Regression Fix
+
+V4.14.8 fixes the exact Telegram inbound regression introduced when Telegram I/O was split in V4.14.6 and still present in V4.14.7. The Telegram Bot API parameter `timeout` for `getUpdates` and the HTTP/socket timeout had accidentally been passed to `_post_api` under the same Python keyword name. Python raised `got multiple values for keyword argument 'timeout'` before any `getUpdates` request could reach Telegram.
+
+## Fixed
+
+- Restored the proven V4.13.1/V4.14.5 separation between the Telegram long-poll timeout and the HTTP request timeout.
+- `_post_api(..., request_timeout=...)` now reserves a distinct keyword for requests/socket timing; `getUpdates(timeout=N)` remains a normal Telegram form parameter.
+- The listener, outbound worker, callback ACK worker, webhook cleanup, and control API all use the new non-conflicting HTTP timeout name.
+- Existing V4.14.7 inbound self-heal/409 diagnostics remain enabled.
+- Existing V4.14.6 non-blocking UI/Telegram I/O isolation remains enabled.
+
+Expected healthy startup now includes:
+
+```text
+Mint Guardian V4.14.8 Telegram Polling Fix starting
+Telegram listener enabled
+Telegram polling mode ensured | webhook=off | pending-updates=preserved
+Telegram polling ready | mode=getUpdates | long-poll=10s | ... | self-heal=True
+```
+
+After `/start`, Railway should immediately show:
+
+```text
+Telegram message received | ... | input=/start
+```
+
+## Mint behavior preserved
+
+The Race, Direct Tenant Fan-Out, Paid Mint immediate execution, Safe Protection, Qualification, Stage Recovery, per-mint balance checks, Low-Balance Auto Resume, gas policy, Offers, and tenant isolation are unchanged from V4.14.7.
+
+---
+
 # OpenSea Mint Guardian V4.14.7 — Telegram Inbound Recovery
 
 V4.14.7 is a control-channel reliability hotfix over V4.14.6. It fixes the production case where the bot could send its startup message while `/start`, `/wallets`, and button callbacks were never received. The mint/Race engines were still alive; the failure was isolated to Telegram `getUpdates`.

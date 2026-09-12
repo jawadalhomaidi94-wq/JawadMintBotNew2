@@ -1073,7 +1073,7 @@ class TelegramController(threading.Thread):
         self.outbound_thread: threading.Thread | None = None
         self.ack_thread: threading.Thread | None = None
         self._io_lock = threading.Lock()
-        # V4.14.7: inbound Telegram recovery. The UI must stay usable even if
+        # V4.14.8: inbound Telegram polling regression fix. The UI must stay usable even if
         # Telegram leaves a webhook configured, a prior Railway deployment is
         # still draining, or a long-poll TCP session goes stale.
         self.poll_timeout_seconds = max(5, min(env_int("TELEGRAM_POLL_TIMEOUT_SECONDS", 10), 25))
@@ -1095,13 +1095,18 @@ class TelegramController(threading.Thread):
         session: requests.Session,
         method: str,
         *,
-        timeout: tuple[float, float] | float,
+        request_timeout: tuple[float, float] | float,
         **data: Any,
     ) -> dict[str, Any]:
+        # IMPORTANT: Telegram's getUpdates has its own form field named
+        # ``timeout``. Keep the HTTP/socket timeout under a DIFFERENT Python
+        # keyword so getUpdates(timeout=N) can coexist with requests' timeout.
+        # V4.14.6/7 accidentally used ``timeout`` for both and polling never
+        # reached Telegram ("multiple values for keyword argument 'timeout'").
         response = session.post(
             f"https://api.telegram.org/bot{self.token}/{method}",
             data=data,
-            timeout=timeout,
+            timeout=request_timeout,
         )
         response.raise_for_status()
         payload = response.json()
@@ -1116,9 +1121,9 @@ class TelegramController(threading.Thread):
             # for tens of seconds/minutes.
             return self._post_api(
                 self.poll_session, method,
-                timeout=(4.0, float(self.poll_timeout_seconds) + 5.0), **data
+                request_timeout=(4.0, float(self.poll_timeout_seconds) + 5.0), **data
             )
-        return self._post_api(self.control_session, method, timeout=(5.0, 10.0), **data)
+        return self._post_api(self.control_session, method, request_timeout=(5.0, 10.0), **data)
 
     def _ensure_io_workers(self) -> None:
         with self._io_lock:
@@ -1141,7 +1146,7 @@ class TelegramController(threading.Thread):
             except queue.Empty:
                 continue
             try:
-                self._post_api(self.outbound_session, method, timeout=(4.0, 10.0), **data)
+                self._post_api(self.outbound_session, method, request_timeout=(4.0, 10.0), **data)
             except Exception as exc:
                 # editMessageText commonly fails when content is unchanged; do
                 # not turn that harmless case into a noisy operational error.
@@ -1164,7 +1169,7 @@ class TelegramController(threading.Thread):
                 self._post_api(
                     self.ack_session,
                     "answerCallbackQuery",
-                    timeout=(3.0, 5.0),
+                    request_timeout=(3.0, 5.0),
                     callback_query_id=callback_id,
                     text=text[:180],
                 )
@@ -1284,7 +1289,7 @@ class TelegramController(threading.Thread):
         with self._poll_setup_lock:
             try:
                 payload = self._post_api(
-                    self.control_session, "deleteWebhook", timeout=(4.0, 8.0),
+                    self.control_session, "deleteWebhook", request_timeout=(4.0, 8.0),
                     drop_pending_updates="false",
                 )
                 if payload.get("ok", True):
@@ -6495,7 +6500,7 @@ class Bot(OfferControllerMixin):
         total = len(self.store.list_wallets(enabled_only=False))
         self.telegram.send(
             chat_id,
-            "🤖 OpenSea Mint Guardian V4.14.7 Telegram Inbound Recovery\n\n"
+            "🤖 OpenSea Mint Guardian V4.14.8 Telegram Polling Fix\n\n"
             "🆓 الاكتشاف المجاني: Stream لحظي + SeaDrop مباشر + REST احتياطي\n"
             f"⚡ الاستعداد للـPublic: آخر {self.public_preopen_window_seconds:g} ثوانٍ\n"
             f"📦 سياسة الكمية: حد المنت ≤100 يؤخذ كما هو، وإذا كان >100/غير محدود فالهدف {self.auto_stage_high_limit_quantity}\n"
@@ -8397,7 +8402,7 @@ class Bot(OfferControllerMixin):
     def run(self) -> None:
         if self.is_admin:
             start_health_server()
-        log.info("Mint Guardian V4.14.7 Telegram Inbound Recovery starting")
+        log.info("Mint Guardian V4.14.8 Telegram Polling Fix starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
@@ -8434,11 +8439,11 @@ class Bot(OfferControllerMixin):
             self.seadrop_wss_enabled, self.race_fee_refresh_seconds, self.race_gas_strategy,
         )
         log.info(
-            "ULTRA RACE V4.14.7 ready | prewarm=%.2fs | fee-refresh=%.2fs | low-balance-recheck=%.2fs | live-fee-retry=True | history=24h",
+            "ULTRA RACE V4.14.8 ready | prewarm=%.2fs | fee-refresh=%.2fs | low-balance-recheck=%.2fs | live-fee-retry=True | history=24h",
             self.race_prewarm_seconds, self.race_fee_refresh_seconds, self.low_balance_recheck_seconds,
         )
         log.info(
-            "V4.14.7 guards ready | stored-wallet-compat=True | same-stage-terminal-cache=True | candidate-isolation=True | friendly-rpc-alerts=True | low-balance-latch=True | per-mint-balance=True | stage-recovery=True | paid-hotfix=True | telegram-io-isolated=True | ui-rpc-isolated=True | telegram-inbound-self-heal=True"
+            "V4.14.8 guards ready | stored-wallet-compat=True | same-stage-terminal-cache=True | candidate-isolation=True | friendly-rpc-alerts=True | low-balance-latch=True | per-mint-balance=True | stage-recovery=True | paid-hotfix=True | telegram-io-isolated=True | ui-rpc-isolated=True | telegram-inbound-self-heal=True | telegram-timeout-collision-fixed=True"
         )
         log.info(
             "Race signal coalescer ready | single-flight=True | stream-quiet=%.2fs | seadrop-quiet=%.2fs | unknown-quiet=%.2fs",
@@ -8452,7 +8457,7 @@ class Bot(OfferControllerMixin):
         )
         log.info("Collection Offers ready | isolated-executor=True | main-loop-polling=False | Race-hooks=0")
         self.notify_all(
-            "🟢 OpenSea Mint Guardian V4.14.7 Telegram Inbound Recovery يعمل الآن على Railway.\n"
+            "🟢 OpenSea Mint Guardian V4.14.8 Telegram Polling Fix يعمل الآن على Railway.\n"
             f"الاكتشاف التلقائي: {'مفعّل كل ' + format(self.auto_free_scan_seconds, 'g') + ' ثانية' if self.auto_free_enabled else 'متوقف'}.\n"
             f"OpenSea Stream: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} | REST Mint Events: {'مفعّل' if self.auto_event_fallback_enabled else 'متوقف'}.\n"
             f"التأهيل/المراقبة: تعمل بصمت وتظهر تفاصيلها عند فتح الأقسام.\n"

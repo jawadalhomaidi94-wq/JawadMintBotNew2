@@ -1,3 +1,15 @@
+# V4.14.8 — Telegram Polling Regression Fix
+
+- Fixed the production error `TelegramController._post_api() got multiple values for keyword argument 'timeout'`.
+- Root cause: V4.14.6/7 used `timeout` both for Telegram `getUpdates` form data and for the HTTP/socket timeout keyword passed to `_post_api`; polling therefore failed before contacting Telegram.
+- Renamed the HTTP/socket control to `request_timeout`, restoring the same separation used by the proven V4.13.1/V4.14.5 implementation.
+- Applied the non-conflicting timeout parameter to getUpdates, control calls, outbound sends/edits, callback ACKs, and webhook cleanup.
+- Preserved V4.14.7 polling self-heal and duplicate-token protection.
+- Preserved V4.14.6 responsive Telegram/UI I/O isolation.
+- Critical Race, Direct Fan-Out, Safe Protection, Qualification, Paid Mint, low-balance and Offers logic are unchanged.
+
+---
+
 # V4.14.7 — Telegram Inbound Recovery
 
 - Fixed a regression where Telegram could send the startup notification but never enter `getUpdates`, making `/start`, `/wallets`, and callbacks appear completely dead.
