@@ -1,3 +1,38 @@
+# OpenSea Mint Guardian V4.14.7 — Telegram Inbound Recovery
+
+V4.14.7 is a control-channel reliability hotfix over V4.14.6. It fixes the production case where the bot could send its startup message while `/start`, `/wallets`, and button callbacks were never received. The mint/Race engines were still alive; the failure was isolated to Telegram `getUpdates`.
+
+## What changed
+
+- Inbound `getUpdates` begins immediately. It no longer waits for `setMyCommands` or webhook cleanup.
+- `setMyCommands` runs on the existing outbound worker instead of blocking the listener.
+- Polling mode is ensured asynchronously with `deleteWebhook(drop_pending_updates=false)`, preserving queued user commands.
+- Telegram polling errors are no longer DEBUG-only. HTTP `409`, webhook conflicts, network failures, and repeated poll failures are visible in Railway logs.
+- `409`/repeated polling failures reset only the Telegram polling session and retry quickly; Race, Stream, discovery, and tenant execution remain untouched.
+- Long-poll defaults to 10 seconds with a bounded HTTP read timeout for faster stale-socket recovery.
+- Same-process duplicate Bot Tokens are prevented: a tenant cannot use the Admin Bot Token, and two active tenants cannot run the same token. Existing legacy duplicates are skipped instead of starting a second `getUpdates` consumer.
+
+Expected healthy startup markers:
+
+```text
+Mint Guardian V4.14.7 Telegram Inbound Recovery starting
+Telegram listener enabled
+Telegram polling mode ensured | webhook=off | pending-updates=preserved
+Telegram polling ready | mode=getUpdates | long-poll=10s | ... | self-heal=True
+```
+
+If another process or service is consuming the same Bot Token, Railway now shows the reason instead of silently appearing frozen:
+
+```text
+Telegram polling unavailable | status=409 | ...
+```
+
+## Mint behavior preserved
+
+V4.14.7 does not change the critical mint path. Direct Tenant Fan-Out, Paid confirmation, Stage Recovery, per-mint balance checks, Safe Protection, Qualification, Low-Balance Auto Resume, Offers, and gas policy remain as in V4.14.6/V4.14.5.
+
+---
+
 # OpenSea Mint Guardian V4.14.6 — Telegram I/O Isolation & Responsive UI
 
 V4.14.6 is a hotfix over V4.14.5. It keeps the paid-mint and Race behavior intact while removing Telegram and manual wallet-balance network I/O from the serialized command path. Button callbacks are queued before ACK, Telegram output is sent on dedicated workers, and wallet balance/detail reads run on isolated UI executors.

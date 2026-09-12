@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, sqlite3, threading, time
+import json, sqlite3, threading, time, os, logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,6 +36,9 @@ class UserRegistry:
     def add(self,username:str,telegram_id:str,bot_token:str,wallet_limit:int,permissions:set[str]|None=None)->int:
         username=username.strip(); telegram_id=str(telegram_id).strip(); bot_token=bot_token.strip()
         if not username or not telegram_id or ':' not in bot_token: raise ValueError('بيانات المستخدم أو Bot Token غير صحيحة.')
+        admin_token=os.getenv('TELEGRAM_BOT_TOKEN','').strip()
+        if admin_token and bot_token == admin_token:
+            raise ValueError('لا يمكن استخدام Bot Token الخاص بالأدمن لحساب مستخدم؛ يجب أن يكون لكل مستخدم بوت مستقل.')
         for existing in self.list(False):
             if existing.bot_token == bot_token: raise ValueError('Bot Token مستخدم لمستخدم آخر.')
         if wallet_limit<0: raise ValueError('حد المحافظ يجب أن يكون 0 أو أكثر.')
@@ -99,6 +102,22 @@ class TenantSupervisor:
             if uid in self.bots:return self.bots[uid]
             t=self.registry.get(uid)
             if not t or not t.active:return None
+            admin_token=str(getattr(getattr(self.admin_bot,'telegram',None),'token','') or '').strip()
+            if admin_token and t.bot_token.strip() == admin_token:
+                logging.getLogger('opensea-mint-guardian').error(
+                    'Tenant Telegram listener skipped | tenant=%s | reason=bot-token-duplicates-admin', t.username
+                )
+                self.registry.audit('system','tenant.telegram_token_conflict',uid,'duplicates-admin-token')
+                return None
+            for existing_uid, existing_bot in self.bots.items():
+                existing_token=str(getattr(getattr(existing_bot,'telegram',None),'token','') or '').strip()
+                if existing_token and existing_token == t.bot_token.strip():
+                    logging.getLogger('opensea-mint-guardian').error(
+                        'Tenant Telegram listener skipped | tenant=%s | reason=bot-token-duplicates-tenant-%s',
+                        t.username, existing_uid
+                    )
+                    self.registry.audit('system','tenant.telegram_token_conflict',uid,f'duplicates-tenant-{existing_uid}')
+                    return None
             rt=TenantRuntime(t)
             db=str(self.data_dir/f'tenant_{uid}.db')
             bot=self.bot_factory(tenant_runtime=rt,telegram_token=t.bot_token,telegram_chat_id=t.telegram_id,db_path_override=db,discovery_source=self.admin_bot,user_registry=self.registry,tenant_supervisor=self)

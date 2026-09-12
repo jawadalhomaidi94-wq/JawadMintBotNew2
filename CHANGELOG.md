@@ -1,3 +1,16 @@
+# V4.14.7 — Telegram Inbound Recovery
+
+- Fixed a regression where Telegram could send the startup notification but never enter `getUpdates`, making `/start`, `/wallets`, and callbacks appear completely dead.
+- Removed synchronous `setMyCommands` from the listener startup path.
+- Added asynchronous polling-mode enforcement with `deleteWebhook(drop_pending_updates=false)`.
+- Added visible WARN diagnostics for Telegram polling failures, especially HTTP 409 conflicts.
+- Added poll-session reset/retry after 409 and repeated network errors.
+- Added duplicate Bot Token protection between Admin and tenants and between tenant bots.
+- Kept the V4.14.6 responsive outbound/ACK/UI-RPC isolation.
+- Critical Race, Direct Fan-Out, Safe Protection, Qualification, and Paid Mint functions are unchanged from V4.14.6.
+
+---
+
 # Mint Guardian V4.14.6 — Telegram I/O Isolation & Responsive UI
 
 ## Fixed

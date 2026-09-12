@@ -1073,6 +1073,18 @@ class TelegramController(threading.Thread):
         self.outbound_thread: threading.Thread | None = None
         self.ack_thread: threading.Thread | None = None
         self._io_lock = threading.Lock()
+        # V4.14.7: inbound Telegram recovery. The UI must stay usable even if
+        # Telegram leaves a webhook configured, a prior Railway deployment is
+        # still draining, or a long-poll TCP session goes stale.
+        self.poll_timeout_seconds = max(5, min(env_int("TELEGRAM_POLL_TIMEOUT_SECONDS", 10), 25))
+        self.poll_retry_seconds = max(0.25, env_float("TELEGRAM_POLL_RETRY_SECONDS", 1.0))
+        self.poll_session_generation = 1
+        self.poll_ready_logged = False
+        self.poll_last_success = 0.0
+        self.poll_last_error_log = 0.0
+        self.poll_consecutive_errors = 0
+        self._poll_setup_lock = threading.Lock()
+        self._poll_setup_done = False
 
     @property
     def enabled(self) -> bool:
@@ -1099,7 +1111,13 @@ class TelegramController(threading.Thread):
         # Direct calls are reserved for long polling/setup only. User-facing
         # output uses the dedicated outbound workers below.
         if method == "getUpdates":
-            return self._post_api(self.poll_session, method, timeout=(5.0, 35.0), **data)
+            # Keep the HTTP read timeout only slightly above Telegram's own
+            # long-poll timeout so a dead socket cannot freeze inbound control
+            # for tens of seconds/minutes.
+            return self._post_api(
+                self.poll_session, method,
+                timeout=(4.0, float(self.poll_timeout_seconds) + 5.0), **data
+            )
         return self._post_api(self.control_session, method, timeout=(5.0, 10.0), **data)
 
     def _ensure_io_workers(self) -> None:
@@ -1219,23 +1237,123 @@ class TelegramController(threading.Thread):
             {"command": "pause", "description": "إيقاف تنفيذ المعاملات مع استمرار المراقبة"},
             {"command": "resume", "description": "استئناف تنفيذ المعاملات"},
         ]
+        # Never block the inbound getUpdates listener on Telegram control I/O.
+        self._queue_outbound("setMyCommands", {
+            "commands": json.dumps(commands, ensure_ascii=False)
+        })
+
+    def _reset_poll_session(self, reason: str = "") -> None:
+        old = self.poll_session
+        self.poll_session = requests.Session()
+        self.poll_session_generation += 1
         try:
-            self.api("setMyCommands", commands=json.dumps(commands, ensure_ascii=False))
-        except Exception as exc:
-            log.debug("Telegram setMyCommands failed: %s", exc)
+            old.close()
+        except Exception:
+            pass
+        if reason:
+            log.info(
+                "Telegram poll session reset | generation=%s | reason=%s",
+                self.poll_session_generation, reason[:120],
+            )
+
+    @staticmethod
+    def _poll_error_text(exc: Exception) -> tuple[int | None, str]:
+        status = None
+        detail = str(exc)
+        response = getattr(exc, "response", None)
+        if response is not None:
+            try:
+                status = int(response.status_code)
+            except Exception:
+                status = None
+            try:
+                payload = response.json()
+                if isinstance(payload, dict):
+                    detail = str(payload.get("description") or payload.get("error_code") or detail)
+                else:
+                    detail = str(getattr(response, "text", "") or detail)
+            except Exception:
+                detail = str(getattr(response, "text", "") or detail)
+        # Never let Telegram return HTML/huge provider bodies into Railway logs.
+        detail = re.sub(r"\s+", " ", detail).strip()[:240]
+        return status, detail
+
+    def _force_polling_mode(self, reason: str = "startup") -> None:
+        # getUpdates cannot coexist with a Telegram webhook. deleteWebhook is
+        # idempotent and drop_pending_updates=false preserves user commands.
+        with self._poll_setup_lock:
+            try:
+                payload = self._post_api(
+                    self.control_session, "deleteWebhook", timeout=(4.0, 8.0),
+                    drop_pending_updates="false",
+                )
+                if payload.get("ok", True):
+                    if not self._poll_setup_done:
+                        log.info("Telegram polling mode ensured | webhook=off | pending-updates=preserved")
+                    self._poll_setup_done = True
+            except Exception as exc:
+                status, detail = self._poll_error_text(exc)
+                log.warning(
+                    "Telegram deleteWebhook failed | status=%s | reason=%s | trigger=%s",
+                    status if status is not None else "network", detail or "unknown", reason,
+                )
+
+    def _async_poll_setup(self) -> None:
+        def worker() -> None:
+            self._force_polling_mode("startup")
+            self.setup_commands()
+        threading.Thread(target=worker, name="telegram-poll-setup", daemon=True).start()
+
+    def _handle_poll_error(self, exc: Exception) -> None:
+        self.poll_consecutive_errors += 1
+        status, detail = self._poll_error_text(exc)
+        lowered = detail.lower()
+        now = time.time()
+        # 409 is the key failure that was invisible in V4.14.6 because polling
+        # errors were DEBUG-only. It means webhook mode or another getUpdates
+        # consumer is using the same token.
+        if status == 409:
+            if "webhook" in lowered:
+                self._force_polling_mode("409-webhook")
+            # A second getUpdates consumer can occur during Railway rollout or
+            # from a duplicated bot token. Reset this socket and retry quickly;
+            # the tenant supervisor also blocks same-process duplicate tokens.
+            self._reset_poll_session("409-conflict")
+        elif self.poll_consecutive_errors >= 2:
+            self._reset_poll_session(f"poll-error-{status or 'network'}")
+
+        if now - self.poll_last_error_log >= 10.0 or self.poll_consecutive_errors <= 2:
+            log.warning(
+                "Telegram polling unavailable | status=%s | errors=%s | reason=%s | retry=%.2fs",
+                status if status is not None else "network", self.poll_consecutive_errors,
+                detail or "unknown", self.poll_retry_seconds,
+            )
+            self.poll_last_error_log = now
 
     def run(self) -> None:
         log.info("Telegram listener enabled")
         self._ensure_io_workers()
-        self.setup_commands()
+        # Setup runs independently. Inbound polling starts immediately instead
+        # of waiting for setMyCommands/deleteWebhook network round-trips.
+        self._async_poll_setup()
         while not STOP:
             try:
                 payload = self.api(
                     "getUpdates",
                     offset=self.offset,
-                    timeout=25,
+                    timeout=self.poll_timeout_seconds,
                     allowed_updates='["message","callback_query"]',
                 )
+                if not isinstance(payload, dict) or payload.get("ok") is False:
+                    raise RuntimeError(str(payload.get("description") if isinstance(payload, dict) else payload))
+                self.poll_last_success = time.time()
+                self.poll_consecutive_errors = 0
+                if not self.poll_ready_logged:
+                    self.poll_ready_logged = True
+                    log.info(
+                        "Telegram polling ready | mode=getUpdates | long-poll=%ss | session=%s | self-heal=True",
+                        self.poll_timeout_seconds, self.poll_session_generation,
+                    )
                 for update in payload.get("result", []):
                     if not isinstance(update, dict):
                         continue
@@ -1248,9 +1366,6 @@ class TelegramController(threading.Thread):
                         if not chat_id or not self.authorized(chat_id):
                             continue
                         log.info("Telegram callback received | chat_id=%s | data=%s", chat_id, str(cb.get("data", ""))[:80])
-                        # V4.14.6: queue the action FIRST, then ACK on a dedicated
-                        # Telegram I/O lane. Neither the long-poll listener nor the
-                        # command worker waits for Telegram network latency.
                         callback_id = str(cb.get("id", ""))
                         self.bot.command_queue.put({
                             "type": "callback",
@@ -1273,9 +1388,6 @@ class TelegramController(threading.Thread):
                     if not self.authorized(chat_id):
                         self.send(chat_id, f"⛔ هذه المحادثة غير مصرح لها بالتحكم في البوت.\nمعرّف المحادثة: {chat_id}")
                         continue
-                    # Never log raw Telegram input: wallet private keys and other
-                    # secrets are entered through this same channel. Only slash
-                    # commands are safe/useful to identify in operational logs.
                     command_label = text.split(None, 1)[0] if text.startswith("/") else "<private-input>"
                     log.info("Telegram message received | chat_id=%s | input=%s | len=%s", chat_id, command_label, len(text))
                     self.bot.command_queue.put({
@@ -1286,8 +1398,12 @@ class TelegramController(threading.Thread):
                         "text": text,
                     })
             except Exception as exc:
-                log.debug("Telegram polling error: %s", exc)
-                time.sleep(2)
+                self._handle_poll_error(exc)
+                # Short, bounded retry. Race/Stream/tenant work is completely
+                # independent from this control-channel recovery.
+                deadline = time.time() + self.poll_retry_seconds
+                while not STOP and time.time() < deadline:
+                    time.sleep(min(0.10, max(0.0, deadline - time.time())))
 
 
 class Bot(OfferControllerMixin):
@@ -6379,7 +6495,7 @@ class Bot(OfferControllerMixin):
         total = len(self.store.list_wallets(enabled_only=False))
         self.telegram.send(
             chat_id,
-            "🤖 OpenSea Mint Guardian V4.14.6 Telegram I/O Isolation\n\n"
+            "🤖 OpenSea Mint Guardian V4.14.7 Telegram Inbound Recovery\n\n"
             "🆓 الاكتشاف المجاني: Stream لحظي + SeaDrop مباشر + REST احتياطي\n"
             f"⚡ الاستعداد للـPublic: آخر {self.public_preopen_window_seconds:g} ثوانٍ\n"
             f"📦 سياسة الكمية: حد المنت ≤100 يؤخذ كما هو، وإذا كان >100/غير محدود فالهدف {self.auto_stage_high_limit_quantity}\n"
@@ -8281,7 +8397,7 @@ class Bot(OfferControllerMixin):
     def run(self) -> None:
         if self.is_admin:
             start_health_server()
-        log.info("Mint Guardian V4.14.6 Telegram I/O Isolation starting")
+        log.info("Mint Guardian V4.14.7 Telegram Inbound Recovery starting")
         log.info("Chains: %s", ", ".join(self.enabled_chains))
         log.info("Wallets: %s | paid=%s | native gas cap=%s | USD gas cap=$%s | mint price cap=%s",
                  len(self.wallets), self.allow_paid_default, self.max_gas_native, self.max_gas_usd, self.max_mint_price_default)
@@ -8318,11 +8434,11 @@ class Bot(OfferControllerMixin):
             self.seadrop_wss_enabled, self.race_fee_refresh_seconds, self.race_gas_strategy,
         )
         log.info(
-            "ULTRA RACE V4.14.6 ready | prewarm=%.2fs | fee-refresh=%.2fs | low-balance-recheck=%.2fs | live-fee-retry=True | history=24h",
+            "ULTRA RACE V4.14.7 ready | prewarm=%.2fs | fee-refresh=%.2fs | low-balance-recheck=%.2fs | live-fee-retry=True | history=24h",
             self.race_prewarm_seconds, self.race_fee_refresh_seconds, self.low_balance_recheck_seconds,
         )
         log.info(
-            "V4.14.6 guards ready | stored-wallet-compat=True | same-stage-terminal-cache=True | candidate-isolation=True | friendly-rpc-alerts=True | low-balance-latch=True | per-mint-balance=True | stage-recovery=True | paid-hotfix=True | telegram-io-isolated=True | ui-rpc-isolated=True"
+            "V4.14.7 guards ready | stored-wallet-compat=True | same-stage-terminal-cache=True | candidate-isolation=True | friendly-rpc-alerts=True | low-balance-latch=True | per-mint-balance=True | stage-recovery=True | paid-hotfix=True | telegram-io-isolated=True | ui-rpc-isolated=True | telegram-inbound-self-heal=True"
         )
         log.info(
             "Race signal coalescer ready | single-flight=True | stream-quiet=%.2fs | seadrop-quiet=%.2fs | unknown-quiet=%.2fs",
@@ -8336,7 +8452,7 @@ class Bot(OfferControllerMixin):
         )
         log.info("Collection Offers ready | isolated-executor=True | main-loop-polling=False | Race-hooks=0")
         self.notify_all(
-            "🟢 OpenSea Mint Guardian V4.14.6 Telegram I/O Isolation يعمل الآن على Railway.\n"
+            "🟢 OpenSea Mint Guardian V4.14.7 Telegram Inbound Recovery يعمل الآن على Railway.\n"
             f"الاكتشاف التلقائي: {'مفعّل كل ' + format(self.auto_free_scan_seconds, 'g') + ' ثانية' if self.auto_free_enabled else 'متوقف'}.\n"
             f"OpenSea Stream: {'مفعّل' if self.auto_stream_enabled else 'متوقف'} | REST Mint Events: {'مفعّل' if self.auto_event_fallback_enabled else 'متوقف'}.\n"
             f"التأهيل/المراقبة: تعمل بصمت وتظهر تفاصيلها عند فتح الأقسام.\n"
